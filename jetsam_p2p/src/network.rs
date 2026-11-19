@@ -1447,6 +1447,22 @@ impl AutomaticPeerState {
         });
     }
 
+    fn register_explicit_bootstrap(&mut self, _addr: Multiaddr) {
+        todo!("P2PFIX-C3")
+    }
+
+    fn desired_seed_connections(&self, _now: Instant) -> usize {
+        todo!("P2PFIX-C3")
+    }
+
+    fn seed_is_releasable(&self, _peer: PeerId) -> bool {
+        todo!("P2PFIX-C3")
+    }
+
+    fn prefer_explicit_seeds(&self, _due: &mut Vec<(Multiaddr, Option<PeerId>)>) {
+        todo!("P2PFIX-C3")
+    }
+
     /// Which peer addresses the manager keeps (onion, D60).
     fn with_address_policy(mut self, address_policy: crate::onion::policy::AddressPolicy) -> Self {
         self.address_policy = address_policy;
@@ -2381,6 +2397,21 @@ impl From<&request_response::OutboundFailure> for RequestFailureKind {
             }
             request_response::OutboundFailure::Io(_) => Self::Io,
         }
+    }
+}
+
+#[derive(Default)]
+struct HeaderTimeoutStrikes {
+    consecutive: std::collections::HashMap<PeerId, u8>,
+}
+
+impl HeaderTimeoutStrikes {
+    fn note_timeout(&mut self, _peer: PeerId) -> bool {
+        todo!("P2PFIX-C1")
+    }
+
+    fn note_success(&mut self, _peer: PeerId) {
+        todo!("P2PFIX-C1")
     }
 }
 
@@ -3806,6 +3837,10 @@ impl P2PNetwork {
 
     pub async fn dial(&self, addr: Multiaddr) {
         let _ = self.cmd_tx.send(NetworkCommand::Dial { addr }).await;
+    }
+
+    pub async fn dial_seed(&self, addr: Multiaddr) {
+        self.dial(addr).await;
     }
 
     pub async fn mark_bootstrap_complete(&self) {
@@ -11765,6 +11800,190 @@ mod tests {
         );
         assert_eq!(bootstrap_probe_capacity(2, 0, 4, 8, 8), 0);
         assert_eq!(bootstrap_probe_capacity(2, 2, 0, 8, 8), 0);
+    }
+
+    fn lan_seed(index: usize) -> Multiaddr {
+        format!("/ip4/192.168.1.{}/tcp/9700", index + 1)
+            .parse()
+            .unwrap()
+    }
+
+    fn dns_seed(index: usize) -> Multiaddr {
+        format!("/dns4/seed{index}.example/tcp/9700").parse().unwrap()
+    }
+
+    /// Ordinary neighbours selected long enough ago to count as stable.
+    fn add_stable_neighbours(state: &mut AutomaticPeerState, count: usize) {
+        let since = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        for _ in 0..count {
+            state
+                .selected_identified_since
+                .insert(PeerId::random(), since);
+        }
+    }
+
+    /// Seen on the test chain (2026-11-19): every node is on a private LAN,
+    /// where discovered peers are never dialled, and its operator lists the
+    /// other nodes with --seed. The fanout of two seeds, one once a neighbour
+    /// is stable, left each node hanging on a single connection. Seeds given
+    /// explicitly are all kept, up to eight.
+    #[test]
+    fn explicit_seeds_are_all_kept_up_to_eight() {
+        let now = Instant::now();
+        for (explicit, kept) in [(1, 1), (3, 3), (8, 8), (12, 8)] {
+            let mut state = AutomaticPeerState::new(PeerId::random());
+            for index in 0..explicit {
+                state.register_explicit_bootstrap(lan_seed(index));
+            }
+            assert_eq!(state.desired_seed_connections(now), kept, "explicit={explicit}");
+            state.bootstrap_complete = true;
+            add_stable_neighbours(&mut state, 3);
+            assert_eq!(
+                state.desired_seed_connections(now),
+                kept,
+                "explicit={explicit}, after bootstrap with stable neighbours"
+            );
+        }
+    }
+
+    /// DNS seeds (the embedded set) and nodes without --seed keep the
+    /// fanout: two seeds, then one once a neighbour is stable.
+    #[test]
+    fn dns_seeds_keep_the_bootstrap_fanout() {
+        let now = Instant::now();
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        for index in 0..4 {
+            state.register_bootstrap(dns_seed(index));
+        }
+        assert_eq!(state.desired_seed_connections(now), 2);
+        state.bootstrap_complete = true;
+        add_stable_neighbours(&mut state, 1);
+        assert_eq!(state.desired_seed_connections(now), 1);
+
+        // One explicit seed beside them: the fanout still decides.
+        state.register_explicit_bootstrap(lan_seed(0));
+        assert_eq!(state.desired_seed_connections(now), 1);
+        state.bootstrap_complete = false;
+        assert_eq!(state.desired_seed_connections(now), 2);
+    }
+
+    #[test]
+    fn a_seed_registered_both_ways_is_explicit() {
+        let now = Instant::now();
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.bootstrap_complete = true;
+        add_stable_neighbours(&mut state, 1);
+        for index in 0..3 {
+            state.register_bootstrap(lan_seed(index));
+            state.register_explicit_bootstrap(lan_seed(index));
+            state.register_bootstrap(lan_seed(index));
+        }
+        assert_eq!(state.desired_seed_connections(now), 3);
+    }
+
+    /// Explicit seeds go first; DNS seeds are dialled only when no explicit
+    /// seed is due (all connected, or all waiting for their retry).
+    #[test]
+    fn explicit_seeds_are_dialled_before_dns_seeds() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        for index in 0..2 {
+            state.register_explicit_bootstrap(lan_seed(index));
+            state.register_bootstrap(dns_seed(index));
+        }
+        let now = Instant::now();
+        let mut due = state.due_bootstrap_dials(now, |_| false);
+        assert_eq!(due.len(), 4);
+        state.prefer_explicit_seeds(&mut due);
+        let mut dialled = due.into_iter().map(|(addr, _)| addr).collect::<Vec<_>>();
+        dialled.sort();
+        let mut explicit = vec![lan_seed(0), lan_seed(1)];
+        explicit.sort();
+        assert_eq!(dialled, explicit);
+
+        let mut only_dns = vec![(dns_seed(0), None), (dns_seed(1), None)];
+        state.prefer_explicit_seeds(&mut only_dns);
+        assert_eq!(only_dns.len(), 2);
+    }
+
+    /// The fanout releases a DNS seed, never an explicit one while explicit
+    /// seeds are within their cap.
+    #[test]
+    fn the_fanout_releases_a_dns_seed_before_an_explicit_one() {
+        let now = Instant::now();
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.bootstrap_complete = true;
+        add_stable_neighbours(&mut state, 1);
+        let seeds = [
+            (lan_seed(0), true),
+            (lan_seed(1), true),
+            (dns_seed(0), false),
+        ]
+        .map(|(addr, explicit)| {
+            if explicit {
+                state.register_explicit_bootstrap(addr.clone());
+            } else {
+                state.register_bootstrap(addr.clone());
+            }
+            (addr, PeerId::random())
+        });
+        for (index, (addr, seed)) in seeds.iter().enumerate() {
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(470 + index);
+            state
+                .pending
+                .insert(connection_id, PendingAutomaticDial::Bootstrap(addr.clone()));
+            state.note_connection_established(connection_id, *seed, true);
+            state.note_identified(connection_id, *seed);
+        }
+        assert_eq!(state.connected_bootstrap_peer_ids().len(), 3);
+        assert_eq!(state.desired_seed_connections(now), 2);
+        assert!(state.seed_is_releasable(seeds[2].1));
+        assert!(!state.seed_is_releasable(seeds[0].1));
+        assert!(!state.seed_is_releasable(seeds[1].1));
+    }
+
+    /// Beyond the cap of eight, explicit seeds are released like any other.
+    #[test]
+    fn explicit_seeds_beyond_the_cap_are_releasable() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.bootstrap_complete = true;
+        let mut peers = Vec::new();
+        for index in 0..9 {
+            let addr = lan_seed(index);
+            state.register_explicit_bootstrap(addr.clone());
+            let seed = PeerId::random();
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(480 + index);
+            state
+                .pending
+                .insert(connection_id, PendingAutomaticDial::Bootstrap(addr));
+            state.note_connection_established(connection_id, seed, true);
+            state.note_identified(connection_id, seed);
+            peers.push(seed);
+        }
+        assert_eq!(state.desired_seed_connections(Instant::now()), 8);
+        assert!(peers.iter().all(|peer| state.seed_is_releasable(*peer)));
+    }
+
+    #[test]
+    fn three_consecutive_header_timeouts_from_one_peer_close_its_connection() {
+        let (peer, other) = (PeerId::random(), PeerId::random());
+        let mut strikes = HeaderTimeoutStrikes::default();
+        assert!(!strikes.note_timeout(peer));
+        assert!(!strikes.note_timeout(peer));
+        assert!(!strikes.note_timeout(other), "counted per peer");
+        assert!(strikes.note_timeout(peer), "the third in a row closes");
+        assert!(!strikes.note_timeout(peer), "the count starts again");
+    }
+
+    #[test]
+    fn a_header_response_resets_the_timeout_count() {
+        let peer = PeerId::random();
+        let mut strikes = HeaderTimeoutStrikes::default();
+        assert!(!strikes.note_timeout(peer));
+        assert!(!strikes.note_timeout(peer));
+        strikes.note_success(peer);
+        assert!(!strikes.note_timeout(peer));
+        assert!(!strikes.note_timeout(peer));
+        assert!(strikes.note_timeout(peer));
     }
 
     #[tokio::test]
