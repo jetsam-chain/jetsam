@@ -49,6 +49,8 @@ pub const SLOW_PER_DEPOSIT: u64 = 50_000_000_000;
 pub const MAX_FILL_FEE_BPS: u16 = 100;
 /// C-6 of the contract: it mints while `token().totalSupply() + amount ≤ OUTSTANDING_CEIL` (`OUTSTANDING_CEIL()`,
 /// µwJTM, = the nodes' V8 ceiling; read on the bridge at start). D123: 50 000 JTM, the operator's bond.
+/// FIXEXT-CAP: the bridges of before only (TN1's, BRIDGE2B's); a bridge without C-6 has neither the getter nor the
+/// ceiling ([`start_ceiling`], [`Caps::supply_ceiling`]).
 pub const OUTSTANDING_CEIL: u64 = 50_000_000_000;
 /// A-13, A-14: the contract's caps per advancer (D123: 50 000 JTM each; read on the bridge at start,
 /// [`check_bridge_caps`]).
@@ -770,6 +772,9 @@ pub struct Caps {
     pub tip_locked_height: Option<u64>,
     /// N9: [`locked_unminted`] under the tip (0 without a tip).
     pub locked_unminted: u64,
+    /// FIXEXT-CAP: the bridge's outstanding ceiling (C-6, [`OUTSTANDING_CEIL`]) as read at start, `None` for a
+    /// bridge without one ([`start_ceiling`]): then nothing waits for `SUPPLY_CEILING`.
+    pub supply_ceiling: Option<u64>,
 }
 
 /// N9: what the mints of the deposits the contract's tip already commits to (at or below its locked height) and not
@@ -893,7 +898,11 @@ pub fn plan(cands: &[Candidate], ledger: &Ledger, caps: Caps, guard: &Guard, now
     let mut stock = caps.stock;
     // A5-18: what the contract can still mint under its ceiling once the robot's pending advances are minted, and
     // (N9) the deposits its tip already commits to
-    let mut supply_room = OUTSTANDING_CEIL.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum()).saturating_sub(caps.locked_unminted);
+    // FIXEXT-CAP: no room to count under a bridge without one
+    let mut supply_room = match caps.supply_ceiling {
+        Some(ceil) => ceil.saturating_sub(caps.total_supply).saturating_sub(ledger.pending_sum()).saturating_sub(caps.locked_unminted),
+        None => u64::MAX,
+    };
     let outstanding_cap = p.outstanding_cap.min(ADVANCE_OUTSTANDING_CAP);
     let mut batch = 0usize;
     let mut per_recipient: HashMap<[u8; 20], u64> = HashMap::new();
@@ -1410,6 +1419,37 @@ impl Ledger {
         }
         n
     }
+}
+
+/// FIXEXT-CAP: the outstanding ceiling (C-6) of the bridge at `bridge` by this build's bridge table (the return's
+/// first `first`, its ceiling `first_ceil`, its later ones `rotations`): `Some(None)` when it has none (every bridge
+/// of a network whose first has none, the public network's), `Some(Some(_))` for a bridge of the table with one,
+/// `None` for a bridge the table does not know (its ceiling is read on it, as before).
+pub fn bridge_outstanding_ceil(
+    bridge: &[u8; 20],
+    first: Option<jetsam_chain::consensus::destination::l1_read::L1BridgeParams>,
+    first_ceil: Option<u64>,
+    rotations: &[jetsam_chain::consensus::destination::state::BridgeRotation],
+) -> Option<Option<u64>> {
+    if first_ceil.is_none() {
+        return Some(None);
+    }
+    if first.is_some_and(|b| b.address == *bridge) {
+        return Some(first_ceil);
+    }
+    rotations.iter().find(|r| r.bridge.address == *bridge).map(|r| r.outstanding_ceil)
+}
+
+/// FIXEXT-CAP: the ceiling the robot counts with, decided at start: none, without a read, for a bridge the table
+/// says has no C-6 (its code has no `OUTSTANDING_CEIL()`: the call would revert); else `read` (the bridge's
+/// `OUTSTANDING_CEIL()`) must answer [`OUTSTANDING_CEIL`] ([`check_ceiling`]; a failed read stops the start: never
+/// taken for "none").
+pub fn start_ceiling(known: Option<Option<u64>>, read: impl FnOnce() -> anyhow::Result<u64>) -> anyhow::Result<Option<u64>> {
+    if known == Some(None) {
+        return Ok(None);
+    }
+    check_ceiling(read()?)?;
+    Ok(Some(OUTSTANDING_CEIL))
 }
 
 /// A5-18: `OUTSTANDING_CEIL()` read on the bridge is the ceiling this robot counts with (D123: 50 000 JTM).

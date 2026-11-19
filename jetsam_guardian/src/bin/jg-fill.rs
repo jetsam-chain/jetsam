@@ -15,7 +15,7 @@
 //!   `state_dir` (`flock` on `<state_dir>/lock`); started by `ops/jg-start fill` (allow-list, PID file).
 //! * Start checks: the configuration (floors, two nodes, claim owner ≠ hot key, D123: `outstanding_cap ≤ max_stock`,
 //!   E-9: a daily gas budget of at least one transaction), this build's v1.7 clock, the L1 chain id, the bridge's
-//!   genesis, its `OUTSTANDING_CEIL()`, D123: its `SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()` and
+//!   genesis, its `OUTSTANDING_CEIL()` (FIXEXT-CAP: not asked of a bridge the build's table says has none), D123: its `SLOW_PER_DEPOSIT()`, `ADVANCE_OUTSTANDING_CAP()` and
 //!   `ADVANCE_CAP_24H()` (50 000 JTM each, the robot's mirrors), its `ADVANCE_MIN_AGE()` = 86 400 (A5-1), and the hot
 //!   key's stock ≤ `max_stock` (else no start).
 //! * E-7: a deposit is confirmed only on headers whose targets are ASERT's from genesis (`fill::targets_ok`, the proof
@@ -165,6 +165,8 @@ struct Robot {
     hot: [u8; 20],
     refund: [u8; 20],
     rules: VaultRules,
+    /// FIXEXT-CAP: the bridge's outstanding ceiling, decided at start (`fill::start_ceiling`).
+    supply_ceiling: Option<u64>,
     clients: Vec<NodeClient>,
     observers: Vec<Observer>,
     polled_at: Vec<u64>,
@@ -401,6 +403,7 @@ impl Robot {
             total_supply,
             tip_locked_height: tip_cp.map(|cp| cp.locked_height),
             locked_unminted,
+            supply_ceiling: self.supply_ceiling,
         };
         // N9: the stock is checked at every step (a refill above max_stock pauses, alerted once per crossing)
         let over = caps.stock > self.cfg.params.max_stock;
@@ -884,7 +887,23 @@ fn run() -> anyhow::Result<()> {
     let bridge = hex0x(&fill::parse20(&cfg.l1_bridge)?);
     let token = hex0x(&word_addr(&l1.call(&bridge, &l1::selector("token()"))?, 0));
     anyhow::ensure!(token != hex0x(&[0u8; 20]), "the bridge {bridge} answers no token: jg-fill does not start");
-    fill::check_ceiling(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("OUTSTANDING_CEIL()"))?, 0)))?;
+    // FIXEXT-CAP: a bridge whose code has no outstanding ceiling (C-6) is not asked for one
+    let supply_ceiling = {
+        use jetsam_chain::consensus::destination::state::{
+            BASE_RETURN_BRIDGE, BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS,
+        };
+        let known = fill::bridge_outstanding_ceil(
+            &fill::parse20(&cfg.l1_bridge)?,
+            BASE_RETURN_BRIDGE,
+            BASE_RETURN_BRIDGE_OUTSTANDING_CEIL,
+            BASE_RETURN_BRIDGE_ROTATIONS,
+        );
+        fill::start_ceiling(known, || Ok(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector("OUTSTANDING_CEIL()"))?, 0))))?
+    };
+    match supply_ceiling {
+        Some(ceil) => log(&format!("the bridge's outstanding ceiling (C-6): {ceil} µwJTM")),
+        None => log("the bridge has no outstanding ceiling (FIXEXT-CAP: no C-6, nothing waits for SUPPLY_CEILING)"),
+    }
     // D123: the bridge's per-deposit and advance caps are the robot's mirrors
     let cap = |sig: &str| -> anyhow::Result<u64> { Ok(fill::u64_saturating(&word(&l1.call(&bridge, &l1::selector(sig))?, 0))) };
     fill::check_bridge_caps(cap("SLOW_PER_DEPOSIT()")?, cap("ADVANCE_OUTSTANDING_CAP()")?, cap("ADVANCE_CAP_24H()")?)?;
@@ -984,6 +1003,7 @@ fn run() -> anyhow::Result<()> {
         hot,
         refund,
         rules,
+        supply_ceiling,
         clients,
         observers,
         polled_at: vec![0; n],

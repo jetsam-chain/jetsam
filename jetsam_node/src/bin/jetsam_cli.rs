@@ -3098,6 +3098,11 @@ fn deposit_preflight(
     }
     let next = state["tip_height"].as_u64().unwrap_or(0).saturating_add(1);
     jetsam_rpc::bridge::check_deposit(amount, recipient, next, rules).map_err(|e| e.to_string())?;
+    // FIXEXT-CAP: `null` once V8 no longer applies (the bridge in force has no
+    // outstanding ceiling): no room to check; absent (a node of before): none.
+    if state.get("room").is_some_and(Value::is_null) {
+        return Ok(next);
+    }
     let room = state["room"].as_u64().unwrap_or(0);
     if amount > room {
         return Err(format!(
@@ -3210,11 +3215,16 @@ async fn cmd_bridge_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         &height(state["deposits_from_height"].as_u64()),
     );
     kv("Locked", &coins(&state["bridge_locked"]));
-    kv2(
-        "Room",
-        &coins(&state["room"]),
-        &format!("(ceiling {})", coins(&state["ceiling"])),
-    );
+    if state["ceiling"].is_null() && state.get("ceiling").is_some() {
+        // FIXEXT-CAP: the bridge in force has no outstanding ceiling (V8 lifted)
+        kv("Room", "no ceiling (the bridge has no outstanding ceiling)");
+    } else {
+        kv2(
+            "Room",
+            &coins(&state["room"]),
+            &format!("(ceiling {})", coins(&state["ceiling"])),
+        );
+    }
     kv("Deposits", &deposits_line(&state));
     kv(
         "Releases paid",

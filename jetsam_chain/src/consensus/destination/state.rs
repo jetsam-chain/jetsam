@@ -80,7 +80,7 @@ use crate::consensus::params::{
 use crate::consensus::vault::{
     decode_bridge_account_proof, destination_marker_kind, validate_block_vault_with,
     DestinationMarkerKind, ReleasedSet, VaultContext, VaultEffect, VaultError, VaultRelease,
-    VaultRules, LIGHT_CLIENT_UPDATE_MARKER_TAG,
+    VaultRules, LIGHT_CLIENT_UPDATE_MARKER_TAG, VAULT_OUTSTANDING_CEIL_MICRO,
 };
 
 #[cfg(test)]
@@ -317,7 +317,79 @@ pub struct BridgeRotation {
     /// is ever another burn's. A release under this bridge of a lower `n` is
     /// refused.
     pub first_burn: u64,
+    /// FIXEXT-CAP (19/11): the contract's outstanding ceiling (C-6, µwJTM):
+    /// `Some(VAULT_OUTSTANDING_CEIL_MICRO)` for a bridge whose code has one
+    /// (every bridge of before: TN1's, BRIDGE2B's, code of `b54fa07`), `None`
+    /// for one whose code has none (`v3-fixext` from FIXEXT-CAP on). V8 is
+    /// applied while the bridge in force has one, never from the height of the
+    /// first that has none ([`outstanding_ceil_lifted_at`]).
+    pub outstanding_ceil: Option<u64>,
 }
+
+/// FIXEXT-CAP: the outstanding ceiling (C-6) of the return's first bridge on
+/// Base ([`BASE_RETURN_BRIDGE`]), as [`BridgeRotation::outstanding_ceil`]. The
+/// public network's has none: its bridge is the contract without C-6
+/// (`v3-fixext` from FIXEXT-CAP on; `jetsam_bridge_xtest` holds this constant
+/// to the contract's vector), so V8 never applies there.
+#[cfg(not(feature = "testnet"))]
+pub const BASE_RETURN_BRIDGE_OUTSTANDING_CEIL: Option<u64> = None;
+/// The test chain's (TN1's bridge, C-6 of 50 000 JTM) and the rehearsal's
+/// (V8 kept).
+#[cfg(feature = "testnet")]
+pub const BASE_RETURN_BRIDGE_OUTSTANDING_CEIL: Option<u64> = Some(VAULT_OUTSTANDING_CEIL_MICRO);
+
+/// FIXEXT-CAP: whether the ceilings of the return's first bridge (`first`)
+/// and of its table are each the contract's C-6 (D123: 50 000 JTM) or none,
+/// and none comes back after a bridge without one (once lifted, `bridge_locked`
+/// may hold more than any ceiling: V8 is lifted for good).
+pub const fn outstanding_ceils_are_valid(first: Option<u64>, rotations: &[BridgeRotation]) -> bool {
+    let mut lifted = false;
+    let mut i = 0;
+    while i <= rotations.len() {
+        let ceil = if i == 0 { first } else { rotations[i - 1].outstanding_ceil };
+        match ceil {
+            Some(c) => {
+                if lifted || c != VAULT_OUTSTANDING_CEIL_MICRO {
+                    return false;
+                }
+            }
+            None => lifted = true,
+        }
+        i += 1;
+    }
+    true
+}
+
+/// FIXEXT-CAP: the first height whose blocks V8 no longer constrains: `Some(0)`
+/// when the return's first bridge has no outstanding ceiling, else the height
+/// of the first bridge of the table without one, none while every bridge has
+/// one ([`crate::consensus::vault::VaultRules::outstanding_ceil_lifted_at`]).
+pub const fn outstanding_ceil_lifted_at(first: Option<u64>, rotations: &[BridgeRotation]) -> Option<u64> {
+    if first.is_none() {
+        return Some(0);
+    }
+    let mut i = 0;
+    while i < rotations.len() {
+        if rotations[i].outstanding_ceil.is_none() {
+            return Some(rotations[i].height);
+        }
+        i += 1;
+    }
+    None
+}
+
+const _: () = assert!(
+    outstanding_ceils_are_valid(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS),
+    "a bridge's outstanding ceiling is the contract's C-6 (VAULT_OUTSTANDING_CEIL_MICRO) or none, and none comes back after a bridge without one"
+);
+// FIXEXT-CAP: on the public network no bridge has C-6, so V8 never applies
+// there (jetsam_bridge_xtest holds the contract's mainnet vector to it).
+#[cfg(not(feature = "testnet"))]
+const _: () = assert!(
+    BASE_RETURN_BRIDGE_OUTSTANDING_CEIL.is_none()
+        && matches!(outstanding_ceil_lifted_at(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS), Some(0)),
+    "the public network's bridge has no outstanding ceiling (C-6): V8 never applies"
+);
 
 /// The test chain's second bridge (`v3-mn5-bridge2b`, profile
 /// `testnet-bridge2`: J 12 640, F 13 440, first burn 1 000 000, TN1's test
@@ -355,6 +427,16 @@ pub const BASE_RETURN_BRIDGE2: L1BridgeParams = L1BridgeParams {
 #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
 pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[];
 /// The test chain's: its second bridge from [`V1_7_BRIDGE2_HEIGHT`] on.
+///
+/// TODO(FIXEXT-CAP): the test chain's third bridge, the contract without C-6
+/// (`v3-fixext` from FIXEXT-CAP on), once deployed and its `initGenesis` made:
+/// a second entry `BridgeRotation { height: <its switch height, its F, above
+/// V1_7_BRIDGE2_HEIGHT>, bridge: BASE_RETURN_BRIDGE3 (its CREATE2 address, its
+/// runtime code hash read back on Base Sepolia, withdrawals_slot 9,
+/// genesis_id_slot 13, its genesisId() after initGenesis), first_burn: <its
+/// nextBurnIndex at deployment, ≥ 1 000 000>, outstanding_ceil: None }`, with
+/// its deployment vector in `jetsam_bridge_xtest` (which holds `None` to a
+/// code without `OUTSTANDING_CEIL()`). V8 is then lifted from that height on.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[BridgeRotation {
     height: match V1_7_BRIDGE2_HEIGHT {
@@ -363,6 +445,8 @@ pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[BridgeRotation {
     },
     bridge: BASE_RETURN_BRIDGE2,
     first_burn: 1_000_000,
+    // FIXEXT-CAP: BRIDGE2B's code (b54fa07) has C-6.
+    outstanding_ceil: Some(VAULT_OUTSTANDING_CEIL_MICRO),
 }];
 
 /// Whether a bridge table may sit beside the return's first bridge `first`,

@@ -139,6 +139,7 @@ impl Activations {
                     code_hash: hex(&r.bridge.code_hash),
                     genesis_id: hex(&r.bridge.genesis_id),
                     first_burn: r.first_burn,
+                    no_outstanding_ceil: r.outstanding_ceil.is_none(),
                 })
                 .collect(),
             guardian_height: guardian.activation_height,
@@ -184,6 +185,15 @@ pub struct BridgeRotationRecord {
     pub code_hash: String,
     pub genesis_id: String,
     pub first_burn: u64,
+    /// FIXEXT-CAP: `true` for a bridge whose contract has no outstanding
+    /// ceiling (C-6; V8 not applied from its height on); absent for one that
+    /// has (every bridge of before: their record is unchanged).
+    #[serde(skip_serializing_if = "is_false")]
+    pub no_outstanding_ceil: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// D123's caps height of `vault` ([`Activations::vault_caps_height`]).

@@ -148,10 +148,11 @@ pub struct VaultStateResponse {
     pub tip_height: u64,
     /// V8's `bridge_locked` (µJTM).
     pub bridge_locked: u64,
-    /// `VAULT_OUTSTANDING_CEIL` (µJTM).
-    pub ceiling: u64,
-    /// `ceiling − bridge_locked`, never negative.
-    pub room: u64,
+    /// `VAULT_OUTSTANDING_CEIL` (µJTM); FIXEXT-CAP: `null` once V8 no longer
+    /// applies (the bridge in force has no outstanding ceiling, C-6).
+    pub ceiling: Option<u64>,
+    /// `ceiling − bridge_locked`, never negative; `null` with the ceiling.
+    pub room: Option<u64>,
     /// `alloc_counter(J − 1)` (V1-b); 0 below J.
     pub floor: u64,
     /// `F`: deposits only in blocks above it.
@@ -204,8 +205,8 @@ pub fn vault_state(
         active: rules.active_at(next),
         tip_height,
         bridge_locked,
-        ceiling: vault.outstanding_ceil,
-        room: vault.outstanding_ceil.saturating_sub(bridge_locked),
+        ceiling: vault.v8_ceiling(),
+        room: vault.v8_ceiling().map(|ceil| ceil.saturating_sub(bridge_locked)),
         floor: state.map_or(0, |state| state.floor),
         deposits_from_height: vault.deposits_from_height,
         released_count: state.map_or(0, |state| state.released.len()),

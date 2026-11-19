@@ -44,6 +44,9 @@
 //!   deposit, in group order, where `bridge_locked` is the sum of the vault's
 //!   live slots created after the floor, not by a coinbase ([`bridge_locked_of`]).
 //!   Its relation with the contract's C-6 is [`VAULT_OUTSTANDING_CEIL_MICRO`]'s.
+//!   FIXEXT-CAP (19/11): only while the bridge in force has C-6
+//!   ([`VaultRules::v8_ceiling`]): a bridge whose contract has no outstanding
+//!   ceiling mints every deposit V4 accepts (its 24 h window only delays it).
 //!
 //! **No order** (porte R, D52): a release `n` is valid when no release marker
 //! of the branch carries `n`, nor an earlier release of the same block. The
@@ -303,6 +306,15 @@ pub struct VaultRules {
     pub window_cap: u64,
     /// V8.
     pub outstanding_ceil: u64,
+    /// FIXEXT-CAP (19/11): V8 constrains no block at or above this height:
+    /// the bridge in force there has no outstanding ceiling (its contract
+    /// has no C-6), from the first such bridge of the table on
+    /// (`destination::state::outstanding_ceil_lifted_at`); `Some(0)`: no
+    /// block (the network's bridge never had one, the public network's);
+    /// `None`: every block (each bridge has one, the test chain's today).
+    /// Read through [`VaultRules::v8_ceiling`] on the rules of one block
+    /// ([`VaultRules::at`]).
+    pub outstanding_ceil_lifted_at: Option<u64>,
     /// D123: the caps of before on a chain that ran v1.7 under them (the test
     /// chain, [`TESTNET_LEGACY_VAULT_CAPS`]); `None` elsewhere. `max_deposit`,
     /// `window_cap` and `outstanding_ceil` above are D123's: a block is judged
@@ -324,19 +336,40 @@ impl VaultRules {
     /// The rules of the block at `height`: D123's caps, or a chain's caps of
     /// before below its caps height. The result no longer depends on a height
     /// (`legacy` none): it is the rules of that block only.
+    ///
+    /// FIXEXT-CAP: and whether V8 constrains it: `outstanding_ceil_lifted_at`
+    /// becomes `Some(0)` (lifted at that height) or `None` (applied).
     pub const fn at(&self, height: u64) -> Self {
+        let outstanding_ceil_lifted_at = match self.outstanding_ceil_lifted_at {
+            Some(lift) if height >= lift => Some(0),
+            _ => None,
+        };
         match self.legacy {
             Some(legacy) if !jetsam_vault_rule::d123_caps_at(legacy.raised_at, height) => Self {
                 max_deposit: legacy.max_deposit,
                 window_cap: legacy.window_cap,
                 outstanding_ceil: legacy.outstanding_ceil,
+                outstanding_ceil_lifted_at,
                 legacy: None,
                 ..*self
             },
             _ => Self {
+                outstanding_ceil_lifted_at,
                 legacy: None,
                 ..*self
             },
+        }
+    }
+
+    /// FIXEXT-CAP: V8's ceiling under the rules of one block ([`Self::at`]
+    /// its height): none when the bridge in force has no outstanding ceiling
+    /// (C-6), and every deposit V4 accepts is minted (G6: the contract's 24 h
+    /// window C-5 only delays a mint). Rules not of one block (a lift height
+    /// above 0) give the ceiling: V8 applied, the prudent side.
+    pub const fn v8_ceiling(&self) -> Option<u64> {
+        match self.outstanding_ceil_lifted_at {
+            Some(0) => None,
+            _ => Some(self.outstanding_ceil),
         }
     }
 
@@ -352,6 +385,10 @@ impl VaultRules {
             window_blocks: VAULT_RELEASE_WINDOW_BLOCKS,
             window_cap: VAULT_RELEASE_WINDOW_CAP_MICRO,
             outstanding_ceil: VAULT_OUTSTANDING_CEIL_MICRO,
+            outstanding_ceil_lifted_at: crate::consensus::destination::state::outstanding_ceil_lifted_at(
+                crate::consensus::destination::state::BASE_RETURN_BRIDGE_OUTSTANDING_CEIL,
+                crate::consensus::destination::state::BASE_RETURN_BRIDGE_ROTATIONS,
+            ),
             legacy: if jetsam_vault_rule::TESTNET_PROFILE {
                 Some(TESTNET_LEGACY_VAULT_CAPS)
             } else {
@@ -780,14 +817,16 @@ pub fn validate_block_vault_with(
                 outputs: u64::from(group.spend.live_outputs),
             });
         } else if let GroupClass::Deposit { recipient, amount } = class {
-            // V8.
-            if locked.saturating_add(amount) > rules.outstanding_ceil {
-                return Err(VaultError::VaultCeilingReached {
-                    group: index,
-                    locked,
-                    amount,
-                    ceil: rules.outstanding_ceil,
-                });
+            // V8 (FIXEXT-CAP: under a bridge with an outstanding ceiling only).
+            if let Some(ceil) = rules.v8_ceiling() {
+                if locked.saturating_add(amount) > ceil {
+                    return Err(VaultError::VaultCeilingReached {
+                        group: index,
+                        locked,
+                        amount,
+                        ceil,
+                    });
+                }
             }
             locked += amount;
             deposits.push(VaultDeposit {
@@ -1296,12 +1335,16 @@ pub fn check_vault_deposit_room(
         .filter(|(owner, _)| *owner == rules.vault)
         .map(|(_, amount)| *amount)
         .sum();
-    if bridge_locked.saturating_add(amount) > rules.outstanding_ceil {
+    // FIXEXT-CAP: under a bridge with an outstanding ceiling only.
+    let Some(ceil) = rules.v8_ceiling() else {
+        return Ok(());
+    };
+    if bridge_locked.saturating_add(amount) > ceil {
         return Err(VaultError::VaultCeilingReached {
             group: 0,
             locked: bridge_locked,
             amount,
-            ceil: rules.outstanding_ceil,
+            ceil,
         });
     }
     Ok(())

@@ -565,8 +565,9 @@ pub fn deposits_within_ceiling<E>(
     for (_, _, effect) in placed {
         match effect {
             Effect::Release(outflow) => locked = locked.saturating_sub(outflow),
+            // FIXEXT-CAP: no ceiling under a bridge without C-6 (V8 lifted).
             Effect::Deposit(index, amount) => match locked.checked_add(amount) {
-                Some(after) if after <= rules.outstanding_ceil => locked = after,
+                Some(after) if rules.v8_ceiling().is_none_or(|ceil| after <= ceil) => locked = after,
                 _ => {
                     dropped.insert(index);
                 }
