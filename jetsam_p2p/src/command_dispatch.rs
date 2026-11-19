@@ -194,6 +194,7 @@ impl NetworkCommandReceiver {
 fn classify(command: &NetworkCommand) -> CommandClass {
     match command {
         Dial { .. }
+        | DialSeed { .. }
         | BootstrapComplete
         | RefusedBranchPeers { .. }
         | ProbingPeers { .. }

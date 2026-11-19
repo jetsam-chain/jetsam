@@ -3917,7 +3917,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(addr) => {
                 if registered_seed_addrs.insert(addr.clone()) {
                     tracing::debug!(addr = %addr, "dialing configured seed");
-                    p2p.dial(addr).await;
+                    p2p.dial_seed(addr).await;
                 }
             }
             Err(e) => {
@@ -17280,7 +17280,7 @@ async fn handle_p2p_events(
                         }
                     }
                 }
-                tracing::debug!(peer = %peer, "peer disconnected");
+                tracing::info!(peer = %peer, "peer disconnected");
                 let retry_terminal = snapshot_boundary_terminal_inflight
                     .as_mut()
                     .and_then(|pending| {

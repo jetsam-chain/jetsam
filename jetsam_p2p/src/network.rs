@@ -716,7 +716,13 @@ struct BootstrapCandidate {
     peer: Option<PeerId>,
     failures: u8,
     next_attempt: Instant,
+    /// Given by the operator (--seed, or the configuration's seeds), not
+    /// the embedded DNS set: kept connected beside the fanout.
+    explicit: bool,
 }
+
+/// Explicit seeds kept connected at most; the fanout applies to the others.
+const MAX_EXPLICIT_SEEDS: usize = 8;
 
 #[derive(Clone, Debug)]
 struct AutomaticPeerCandidate {
@@ -1482,23 +1488,68 @@ impl AutomaticPeerState {
             peer: None,
             failures: 0,
             next_attempt: Instant::now(),
+            explicit: false,
         });
     }
 
-    fn register_explicit_bootstrap(&mut self, _addr: Multiaddr) {
-        todo!("P2PFIX-C3")
+    /// A seed the operator gave: every one is kept connected, up to
+    /// [`MAX_EXPLICIT_SEEDS`], instead of the bootstrap fanout.
+    fn register_explicit_bootstrap(&mut self, addr: Multiaddr) {
+        self.register_bootstrap(addr.clone());
+        if let Some(candidate) = self.bootstrap.get_mut(&addr) {
+            candidate.explicit = true;
+        }
     }
 
-    fn desired_seed_connections(&self, _now: Instant) -> usize {
-        todo!("P2PFIX-C3")
+    fn explicit_seed_target(&self) -> usize {
+        self.bootstrap
+            .values()
+            .filter(|candidate| candidate.explicit)
+            .count()
+            .min(MAX_EXPLICIT_SEEDS)
     }
 
-    fn seed_is_releasable(&self, _peer: PeerId) -> bool {
-        todo!("P2PFIX-C3")
+    fn is_explicit_seed_peer(&self, peer: PeerId) -> bool {
+        self.bootstrap
+            .values()
+            .any(|candidate| candidate.explicit && candidate.peer == Some(peer))
     }
 
-    fn prefer_explicit_seeds(&self, _due: &mut Vec<(Multiaddr, Option<PeerId>)>) {
-        todo!("P2PFIX-C3")
+    fn connected_explicit_seed_count(&self) -> usize {
+        self.connected_bootstrap_peer_ids()
+            .into_iter()
+            .filter(|peer| self.is_explicit_seed_peer(*peer))
+            .count()
+    }
+
+    /// Seed connections to keep: the bootstrap fanout, or every explicit
+    /// seed up to the cap when there are more of them.
+    fn desired_seed_connections(&self, now: Instant) -> usize {
+        desired_bootstrap_connections(
+            self.bootstrap_complete,
+            self.stable_non_bootstrap_peer_count(now),
+            self.bootstrap.len(),
+        )
+        .max(self.explicit_seed_target())
+    }
+
+    /// A seed connection beyond the desired count may be released unless it
+    /// is an explicit seed within the cap.
+    fn seed_is_releasable(&self, peer: PeerId) -> bool {
+        !self.is_explicit_seed_peer(peer)
+            || self.connected_explicit_seed_count() > self.explicit_seed_target()
+    }
+
+    /// While an explicit seed is due, the DNS seeds wait.
+    fn prefer_explicit_seeds(&self, due: &mut Vec<(Multiaddr, Option<PeerId>)>) {
+        let explicit = |addr: &Multiaddr| {
+            self.bootstrap
+                .get(addr)
+                .is_some_and(|candidate| candidate.explicit)
+        };
+        if due.iter().any(|(addr, _)| explicit(addr)) {
+            due.retain(|(addr, _)| explicit(addr));
+        }
     }
 
     /// Which peer addresses the manager keeps (onion, D60).
@@ -2438,18 +2489,37 @@ impl From<&request_response::OutboundFailure> for RequestFailureKind {
     }
 }
 
+/// Header requests in a row that time out on one peer before the connection
+/// that carried the last of them is closed. Each waits 30 s for its answer.
+const MAX_CONSECUTIVE_HEADER_TIMEOUTS: u8 = 3;
+
+/// Consecutive outbound header-request timeouts, per peer.
 #[derive(Default)]
 struct HeaderTimeoutStrikes {
     consecutive: std::collections::HashMap<PeerId, u8>,
 }
 
 impl HeaderTimeoutStrikes {
-    fn note_timeout(&mut self, _peer: PeerId) -> bool {
-        todo!("P2PFIX-C1")
+    /// True on the [`MAX_CONSECUTIVE_HEADER_TIMEOUTS`]th timeout in a row:
+    /// the caller closes the connection and the count starts again.
+    fn note_timeout(&mut self, peer: PeerId) -> bool {
+        let count = self.consecutive.entry(peer).or_default();
+        *count = count.saturating_add(1);
+        if *count < MAX_CONSECUTIVE_HEADER_TIMEOUTS {
+            return false;
+        }
+        self.consecutive.remove(&peer);
+        true
     }
 
-    fn note_success(&mut self, _peer: PeerId) {
-        todo!("P2PFIX-C1")
+    /// A header response from the peer, whatever its content.
+    fn note_success(&mut self, peer: PeerId) {
+        self.consecutive.remove(&peer);
+    }
+
+    /// The peer's last connection is gone.
+    fn forget(&mut self, peer: PeerId) {
+        self.consecutive.remove(&peer);
     }
 }
 
@@ -3257,6 +3327,9 @@ pub enum NetworkCommand {
     },
     /// Register a bootstrap address with automatic retry and peer maintenance.
     Dial { addr: Multiaddr },
+    /// [`NetworkCommand::Dial`] for a seed the operator gave: every one is
+    /// kept connected, up to eight, instead of the bootstrap fanout.
+    DialSeed { addr: Multiaddr },
     /// Initial chain synchronization is complete; bootstrap connections may be
     /// released once enough ordinary outbound peers are available.
     BootstrapComplete,
@@ -3877,8 +3950,10 @@ impl P2PNetwork {
         let _ = self.cmd_tx.send(NetworkCommand::Dial { addr }).await;
     }
 
+    /// A seed the operator gave (--seed): kept connected beside the
+    /// bootstrap fanout, up to eight of them.
     pub async fn dial_seed(&self, addr: Multiaddr) {
-        self.dial(addr).await;
+        let _ = self.cmd_tx.send(NetworkCommand::DialSeed { addr }).await;
     }
 
     pub async fn mark_bootstrap_complete(&self) {
@@ -4283,6 +4358,7 @@ async fn run_swarm(
         BoundedPendingRequests::new(MAX_PENDING_HISTORY_STEP_REQUESTS);
     let mut peer_diversity = PeerDiversity::with_address_policy(address_policy);
     let mut sync_paths = PeerSyncPaths::default();
+    let mut header_timeouts = HeaderTimeoutStrikes::default();
     // A directly reachable public node is already discoverable and should
     // contribute bounded relay capacity, not build nested relay paths through
     // other public nodes. Private nodes reserve two diverse public paths.
@@ -4475,6 +4551,7 @@ async fn run_swarm(
                     &mut successful_peer_cache,
                     &mut observed_peer_versions,
                     &mut private_reachability_notice,
+                    &mut header_timeouts,
                 )
                 .await;
             }
@@ -5834,18 +5911,13 @@ fn maintain_automatic_outbound(
         }
         if swarm.close_connection(connection_id) {
             if automatic.is_bootstrap_peer(peer) {
-                tracing::debug!(peer = %peer, "released a seed on a refused branch");
+                tracing::info!(peer = %peer, "released a seed on a refused branch");
             } else {
                 tracing::debug!(peer = %peer, "released a neighbour on a refused branch");
             }
         }
     }
-    let stable_non_bootstrap = automatic.stable_non_bootstrap_peer_count(now);
-    let desired_bootstrap = desired_bootstrap_connections(
-        automatic.bootstrap_complete,
-        stable_non_bootstrap,
-        automatic.bootstrap.len(),
-    );
+    let desired_bootstrap = automatic.desired_seed_connections(now);
     let connected_bootstrap = automatic.connected_bootstrap_peer_ids();
     let bootstrap_peers = automatic.bootstrap_peer_ids();
 
@@ -5876,6 +5948,7 @@ fn maintain_automatic_outbound(
                 }
                 if release_seed {
                     bootstrap_peers.contains(&connection.peer)
+                        && automatic.seed_is_releasable(connection.peer)
                 } else {
                     matches!(connection.kind, ManagedOutboundKind::Peer)
                         && !bootstrap_peers.contains(&connection.peer)
@@ -5891,11 +5964,19 @@ fn maintain_automatic_outbound(
                 swarm.behaviour_mut().kad.remove_peer(&peer);
             }
             if swarm.close_connection(connection_id) {
-                tracing::debug!(
-                    peer = %peer,
-                    desired_bootstrap,
-                    "released replaced automatic outbound connection"
-                );
+                if release_seed {
+                    tracing::info!(
+                        peer = %peer,
+                        desired_bootstrap,
+                        "released a seed connection beyond the bootstrap fanout"
+                    );
+                } else {
+                    tracing::debug!(
+                        peer = %peer,
+                        desired_bootstrap,
+                        "released replaced automatic outbound connection"
+                    );
+                }
             }
             return;
         }
@@ -5918,6 +5999,11 @@ fn maintain_automatic_outbound(
         let occupied = automatic
             .outbound_peer_count()
             .saturating_add(automatic.pending.len());
+        // Explicit seeds sit beside the ordinary neighbours: a full
+        // neighbour table does not keep a lost one from being redialled.
+        let explicit_missing = automatic
+            .explicit_seed_target()
+            .saturating_sub(automatic.connected_explicit_seed_count());
         let available = bootstrap_probe_capacity(
             desired_bootstrap,
             connected_bootstrap.len(),
@@ -5925,9 +6011,11 @@ fn maintain_automatic_outbound(
             pending_capacity,
             AUTOMATIC_OUTBOUND_TARGET
                 .saturating_add(1)
-                .saturating_sub(occupied),
+                .saturating_sub(occupied)
+                .max(explicit_missing),
         );
         let mut due = automatic.due_bootstrap_dials(now, |peer| swarm.is_connected(peer));
+        automatic.prefer_explicit_seeds(&mut due);
         due.shuffle(&mut rand::thread_rng());
         let mut occupied_groups = connected_bootstrap
             .iter()
@@ -6478,6 +6566,10 @@ async fn handle_network_command(
         NetworkCommand::Dial { addr } => {
             tracing::debug!(address = %addr, "registered automatic bootstrap candidate");
             automatic_peers.register_bootstrap(addr);
+        }
+        NetworkCommand::DialSeed { addr } => {
+            tracing::debug!(address = %addr, "registered explicit seed");
+            automatic_peers.register_explicit_bootstrap(addr);
         }
         NetworkCommand::BootstrapComplete => {
             automatic_peers.bootstrap_complete = true;
@@ -7059,6 +7151,7 @@ async fn handle_swarm_event(
     successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
     observed_peer_versions: &mut crate::peer_versions::ObservedPeerVersions,
     private_reachability_notice: &mut PrivateReachabilityNotice,
+    header_timeouts: &mut HeaderTimeoutStrikes,
 ) {
     let implicit_bootstraps = stop_implicit_kad_bootstraps(swarm);
     if implicit_bootstraps > 0 {
@@ -8179,6 +8272,7 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
+            header_timeouts.note_success(peer);
             let Some(pending) = pending_header_requests.remove(&request_id) else {
                 tracing::debug!(
                     peer = %peer,
@@ -8313,11 +8407,26 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
             request_response::Event::OutboundFailure {
                 peer,
+                connection_id,
                 request_id,
                 error,
-                ..
             },
         )) => {
+            if matches!(error, request_response::OutboundFailure::Timeout)
+                && header_timeouts.note_timeout(peer)
+            {
+                // A connection that carries requests but no answers is as
+                // good as dead, whatever its pings say.
+                sync_paths.mark_closing(connection_id);
+                let closing = swarm.close_connection(connection_id);
+                tracing::info!(
+                    peer = %peer,
+                    connection = ?connection_id,
+                    timeouts = MAX_CONSECUTIVE_HEADER_TIMEOUTS,
+                    closing,
+                    "closing a connection whose header requests time out in a row"
+                );
+            }
             let kind = RequestFailureKind::from(&error);
             let Some(pending) = pending_header_requests.remove(&request_id) else {
                 tracing::debug!(
@@ -9772,6 +9881,13 @@ async fn handle_swarm_event(
             cause,
             ..
         } => {
+            tracing::info!(
+                peer = %peer_id,
+                connection = ?connection_id,
+                num_established,
+                cause = ?cause,
+                "connection closed"
+            );
             let removed_sync_path = sync_paths.remove(connection_id);
             if peer_diversity.remove(connection_id) {
                 automatic_peers.note_connection_closed(connection_id);
@@ -9903,6 +10019,7 @@ async fn handle_swarm_event(
                 tracing::debug!(peer = %peer_id, "peer sync protocols ready after duplicate path closed");
             }
             if num_established == 0 {
+                header_timeouts.forget(peer_id);
                 automatic_peers.clear_local_selection(peer_id);
                 relay_reservations.retire_peer(swarm, peer_id);
                 observed_peer_versions.disconnected(
