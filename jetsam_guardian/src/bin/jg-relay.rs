@@ -201,8 +201,14 @@ const REREAD_EVERY_SECS: u64 = 600;
 impl Relay {
     /// M-10 (external audit 2026-11-18): an alert, in the log and through the operator's `alert_command` (argv, no
     /// shell, run apart and bounded: the relayer never waits for it), the same event at most once an hour.
+    /// Its log line is the one the relayer wrote before (`ALERT <EVENT> <detail>`), which its tests and its operators read.
     fn alert(&mut self, event: &str, detail: &str) {
-        log(&format!("ALERT {event}: {detail}"));
+        self.alert_as(&format!("ALERT {event} {detail}"), event, detail);
+    }
+
+    /// An alert whose log line is `line` (a line older than the alert command kept as it was).
+    fn alert_as(&mut self, line: &str, event: &str, detail: &str) {
+        log(line);
         if self.cfg.alert_command.is_empty() {
             return;
         }
@@ -546,13 +552,11 @@ impl Relay {
                         } else {
                             "its body is unknown"
                         };
-                        self.alert(
-                            "MISSING_DEPOSIT_BODY",
-                            &format!(
-                                "{h} ({reason}): {what} and its header does not prove it holds no deposit ({outputs} outputs created, \
-                                 the coinbase's one among them): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"
-                            ),
+                        let detail = format!(
+                            "{h} ({reason}): {what} and its header does not prove it holds no deposit ({outputs} outputs created, \
+                             the coinbase's one among them): no point of this relayer locks it until a source serves it, an operator imports it or acknowledges it"
                         );
+                        self.alert_as(&format!("ALERT MISSING_DEPOSIT_BODY:{detail}"), "MISSING_DEPOSIT_BODY", &detail);
                         self.event(json!({"event": "missing_body", "height": h, "id": hex::encode(id), "reason": reason, "unreadable": kept}));
                     } else if kept && !unreadable {
                         log(&format!("block {h}: the bytes a source served for it are kept, unreadable by this build ({reason})"));
