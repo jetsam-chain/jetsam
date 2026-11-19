@@ -13,6 +13,7 @@
 //! instead of materializing `Vec<Block128>` when large state sizes make memcpy
 //! bandwidth relevant.
 
+pub mod db_maintenance;
 pub mod historical_state;
 pub mod mdbx_context;
 pub mod mdbx_store;
@@ -23,6 +24,9 @@ pub mod snapshot_annex;
 pub mod snapshot_generation;
 pub mod snapshot_staging;
 
+pub use db_maintenance::{
+    compact_database, remove_old_database, CompactError, CompactReport, DbHealth, HealthWarnings,
+};
 pub use historical_state::{
     reconstruct_historical_exact_state, CanonicalTipBinding, HistoricalExactStateView,
     HistoricalStateError,

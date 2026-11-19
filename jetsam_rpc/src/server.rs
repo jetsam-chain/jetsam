@@ -32,6 +32,7 @@ use jetsam_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 use jetsam_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 
 use crate::api::JetsamApiServer;
+use crate::types::StorageHealthInfo;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, BlockTransactionInfo,
     BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, FeeBreakdownInfo,
@@ -51,6 +52,9 @@ use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError}
 use crate::wallet_submit::{
     collect_empty_slot_hints, next_user_epoch_anchor, PendingAdmissionGuard, WalletOperationGate,
 };
+
+/// `getChainInfo.storage` is read again at most this often.
+const STORAGE_HEALTH_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// External workers receive only a short-lived capability for immutable
 /// node-owned material.  The server retains exactly one attempt across its
@@ -2180,6 +2184,12 @@ impl JetsamApiServer for RpcHandler {
             active_slot_count: tip.active_slot_count,
             log_slots: tip.log_slots,
             circulating_supply_micro_jtm: chain.state.circulating_supply_micro_jtm.to_string(),
+            // Read-only, at most once a minute whatever the callers do.
+            storage: chain
+                .store
+                .database_health_cached(STORAGE_HEALTH_MAX_AGE)
+                .ok()
+                .map(|health| StorageHealthInfo::from(&health)),
         })
     }
 
