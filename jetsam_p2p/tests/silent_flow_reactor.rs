@@ -168,7 +168,7 @@ async fn relay(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, flow: u64, forgo
                 // Neither a FIN nor an RST crosses a forgotten flow: both
                 // halves stay open for as long as the test runs.
                 let _hold = (from, to);
-                std::future::pending::<()>().await;
+                return std::future::pending::<()>().await;
             }
             continue;
         }
