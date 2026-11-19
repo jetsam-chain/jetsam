@@ -2670,14 +2670,44 @@ fn refuse_foreign_chain_data(data_dir: &Path) -> anyhow::Result<()> {
 
 /// `jetsam --compact-db`: compact the stopped database of `data_dir`.
 fn run_compact_db(data_dir: &Path) -> anyhow::Result<()> {
-    let _ = data_dir;
-    anyhow::bail!("not implemented")
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    println!("compacting the chain database in {}", data_dir.display());
+    let started = std::time::Instant::now();
+    let report = jetsam_chain::storage::compact_database(data_dir).map_err(|error| {
+        anyhow::anyhow!("--compact-db: {error}\nNothing was changed in {}.", data_dir.display())
+    })?;
+    println!(
+        "mdbx.dat: {} bytes ({:.1} MiB) -> {} bytes ({:.1} MiB), {} tables and {} entries \
+         identical, {:.1} s",
+        report.before_bytes,
+        mib(report.before_bytes),
+        report.after_bytes,
+        mib(report.after_bytes),
+        report.tables,
+        report.entries,
+        started.elapsed().as_secs_f64()
+    );
+    println!(
+        "the previous file is kept as {} ({:.1} MiB): start the node, check it follows the \
+         chain, then run `jetsam --compact-db-remove-old --data-dir {}` to free it",
+        report.old_file.display(),
+        mib(report.before_bytes),
+        data_dir.display()
+    );
+    Ok(())
 }
 
 /// `jetsam --compact-db-remove-old`: delete the file a compaction kept.
 fn run_compact_db_remove_old(data_dir: &Path) -> anyhow::Result<()> {
-    let _ = data_dir;
-    anyhow::bail!("not implemented")
+    let freed = jetsam_chain::storage::remove_old_database(data_dir)
+        .map_err(|error| anyhow::anyhow!("--compact-db-remove-old: {error}"))?;
+    println!(
+        "deleted the previous database file of {}: {} bytes ({:.1} MiB) freed",
+        data_dir.display(),
+        freed,
+        freed as f64 / (1024.0 * 1024.0)
+    );
+    Ok(())
 }
 
 /// How often the node reads its database health for the journal warning

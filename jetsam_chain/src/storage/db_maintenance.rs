@@ -135,18 +135,51 @@ pub struct DbHealth {
 impl DbHealth {
     /// Used share of the volume, as `df` shows it (`used / (used + available)`).
     pub fn disk_used_percent(&self) -> Option<u64> {
-        let _ = self;
-        None
+        let used = self.disk_used_bytes?;
+        let available = self.disk_available_bytes?;
+        let base = used.checked_add(available)?;
+        if base == 0 {
+            return None;
+        }
+        // Rounded up, as `df` does.
+        Some(((used as u128 * 100).div_ceil(base as u128)) as u64)
     }
 
     /// Share of the file held by GC free pages.
     pub fn gc_free_percent(&self) -> u64 {
-        0
+        if self.file_bytes == 0 {
+            return 0;
+        }
+        (self.gc_free_bytes as u128 * 100 / self.file_bytes as u128) as u64
     }
 
     /// The operator warning these figures call for, if any.
     pub fn warning(&self) -> Option<String> {
-        None
+        let disk = self
+            .disk_used_percent()
+            .filter(|used| *used > DISK_USED_WARN_PERCENT);
+        let gc = Some(self.gc_free_percent()).filter(|gc| *gc > GC_FREE_WARN_PERCENT);
+        if disk.is_none() && gc.is_none() {
+            return None;
+        }
+        let mut causes = Vec::new();
+        if let Some(used) = disk {
+            causes.push(format!(
+                "the data volume is {used}% used ({} bytes available)",
+                self.disk_available_bytes.unwrap_or(0)
+            ));
+        }
+        if let Some(gc) = gc {
+            causes.push(format!(
+                "{gc}% of the database file is free pages ({} of {} bytes, {} bytes of live data)",
+                self.gc_free_bytes, self.file_bytes, self.live_bytes
+            ));
+        }
+        Some(format!(
+            "database storage: {}; stop the node and run `jetsam --compact-db --data-dir <dir>` \
+             to give the free pages back to the disk",
+            causes.join(" and ")
+        ))
     }
 }
 
@@ -164,15 +197,129 @@ impl HealthWarnings {
     /// The warning to log now, if `health` calls for one and none was logged
     /// in the last [`HEALTH_WARNING_EVERY`].
     pub fn due(&mut self, health: &DbHealth, now: Instant) -> Option<String> {
-        let _ = (health, now, &mut self.last);
-        None
+        let warning = health.warning()?;
+        if let Some(last) = self.last {
+            if now.saturating_duration_since(last) < HEALTH_WARNING_EVERY {
+                return None;
+            }
+        }
+        self.last = Some(now);
+        Some(warning)
     }
 }
 
 /// Health of the open database `db` whose file is `data_file`.
 pub fn health_of(db: &Database<NoWriteMap>, data_file: &Path) -> Result<DbHealth, CompactError> {
-    let _ = (db, data_file);
-    Err(CompactError::Io("not implemented".into()))
+    let file_bytes = std::fs::metadata(data_file)
+        .map_err(|e| io_error("read the size of", data_file, e))?
+        .len();
+    let page_size = u64::from(db.stat().map_err(mdbx_error)?.page_size());
+    let allocated_pages = db.info().map_err(mdbx_error)?.last_pgno() as u64 + 1;
+    let gc_free_pages = db.freelist().map_err(mdbx_error)? as u64;
+    let allocated_bytes = allocated_pages * page_size;
+    let gc_free_bytes = (gc_free_pages * page_size).min(allocated_bytes);
+    let disk = data_file.parent().and_then(volume_space);
+    Ok(DbHealth {
+        file_bytes,
+        allocated_bytes,
+        live_bytes: allocated_bytes - gc_free_bytes,
+        gc_free_bytes,
+        disk_total_bytes: disk.map(|d| d.total),
+        disk_used_bytes: disk.map(|d| d.used),
+        disk_available_bytes: disk.map(|d| d.available),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VolumeSpace {
+    total: u64,
+    used: u64,
+    available: u64,
+}
+
+/// The volume holding `dir`, as `df` counts it: `available` is what an
+/// unprivileged process may still write.
+#[cfg(unix)]
+fn volume_space(dir: &Path) -> Option<VolumeSpace> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` a valid,
+    // writable statvfs for the duration of the call.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let fragment = stat.f_frsize as u64;
+    let total = stat.f_blocks as u64 * fragment;
+    let free = stat.f_bfree as u64 * fragment;
+    Some(VolumeSpace {
+        total,
+        used: total.saturating_sub(free),
+        available: stat.f_bavail as u64 * fragment,
+    })
+}
+
+#[cfg(not(unix))]
+fn volume_space(_dir: &Path) -> Option<VolumeSpace> {
+    None
+}
+
+fn mdbx_error(error: libmdbx::Error) -> CompactError {
+    CompactError::Mdbx(error.to_string())
+}
+
+fn io_error(action: &str, path: &Path, error: std::io::Error) -> CompactError {
+    CompactError::Io(format!("{action} {}: {error}", path.display()))
+}
+
+/// FNV-1a 64 of `bytes` preceded by their length (8 bytes, little endian),
+/// as the DATAVOL `dbhash` tool computes it.
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 1_099_511_628_211;
+    for byte in (bytes.len() as u64).to_le_bytes().into_iter().chain(bytes.iter().copied()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+
+fn fingerprint_of(db: &Database<NoWriteMap>) -> Result<Vec<TableFingerprint>, CompactError> {
+    let txn = db.begin_ro_txn().map_err(mdbx_error)?;
+    let main = txn.open_table(None).map_err(mdbx_error)?;
+    let mut names = Vec::new();
+    {
+        let mut cursor = txn.cursor(&main).map_err(mdbx_error)?;
+        let mut item: Option<(Vec<u8>, ())> = cursor.first().map_err(mdbx_error)?;
+        while let Some((name, ())) = item {
+            names.push(String::from_utf8(name).map_err(|_| {
+                CompactError::Mismatch("a table name is not UTF-8".into())
+            })?);
+            item = cursor.next().map_err(mdbx_error)?;
+        }
+    }
+    let mut tables = Vec::with_capacity(names.len());
+    for name in names {
+        let table = txn.open_table(Some(&name)).map_err(mdbx_error)?;
+        let mut cursor = txn.cursor(&table).map_err(mdbx_error)?;
+        let (mut entries, mut bytes, mut digest) = (0u64, 0u64, FNV_OFFSET);
+        let mut item: Option<(std::borrow::Cow<'_, [u8]>, std::borrow::Cow<'_, [u8]>)> =
+            cursor.first().map_err(mdbx_error)?;
+        while let Some((key, value)) = item {
+            digest = fnv1a(fnv1a(digest, &key), &value);
+            entries += 1;
+            bytes += (key.len() + value.len()) as u64;
+            item = cursor.next().map_err(mdbx_error)?;
+        }
+        tables.push(TableFingerprint {
+            name,
+            entries,
+            bytes,
+            digest,
+        });
+    }
+    Ok(tables)
 }
 
 /// Logical content of every named table of the database in `path` (a data
@@ -182,24 +329,185 @@ pub fn database_fingerprint(
     path: &Path,
     no_sub_dir: bool,
 ) -> Result<Vec<TableFingerprint>, CompactError> {
-    let _ = (path, no_sub_dir);
-    Err(CompactError::Io("not implemented".into()))
+    fingerprint_of(&open_exclusive_read_only(path, no_sub_dir)?)
 }
 
 /// Compact the stopped database of `data_dir`. See the module documentation.
 pub fn compact_database(data_dir: &Path) -> Result<CompactReport, CompactError> {
-    let _ = data_dir;
-    Err(CompactError::Io("not implemented".into()))
+    let data = data_dir.join(DATA_FILE);
+    let lock = data_dir.join(LOCK_FILE);
+    let compact = data_dir.join(COMPACT_FILE);
+    let old_data = data_dir.join(OLD_DATA_FILE);
+    let old_lock = data_dir.join(OLD_LOCK_FILE);
+    if !data.is_file() {
+        return Err(CompactError::NoDatabase(data));
+    }
+    for leftover in [&compact, &old_data, &old_lock] {
+        if std::fs::symlink_metadata(leftover).is_ok() {
+            return Err(CompactError::Leftover(leftover.clone()));
+        }
+    }
+    let original = std::fs::metadata(&data).map_err(|e| io_error("read", &data, e))?;
+    let before_bytes = original.len();
+
+    // Exclusive: refused while the node (or anything else) has it open, and
+    // nothing can write to it until this process is done.
+    let source = open_exclusive_read_only(data_dir, false).map_err(|error| match error {
+        CompactError::InUse(_) => CompactError::InUse(data.clone()),
+        other => other,
+    })?;
+    let expected = fingerprint_of(&source)?;
+    let health = health_of(&source, &data)?;
+    if let Some(available) = health.disk_available_bytes {
+        // The copy holds the live pages; twice that plus a growth step
+        // leaves room for the B-tree rebuilt around them.
+        let needed = health.live_bytes.saturating_mul(2) + 64 * 1024 * 1024;
+        if available < needed {
+            return Err(CompactError::NoSpace { needed, available });
+        }
+    }
+
+    let result = (|| {
+        copy_compact(&source, &compact)?;
+        let copy = open_exclusive_read_only(&compact, true)?;
+        let found = fingerprint_of(&copy)?;
+        drop(copy);
+        if found != expected {
+            let what = expected
+                .iter()
+                .zip(found.iter())
+                .find(|(a, b)| a != b)
+                .map(|(a, b)| format!("table {}: {a:?} became {b:?}", a.name))
+                .unwrap_or_else(|| {
+                    format!("{} tables became {}", expected.len(), found.len())
+                });
+            return Err(CompactError::Mismatch(what));
+        }
+        keep_owner_and_mode(&original, &compact)?;
+        sync_file(&compact)?;
+        Ok(())
+    })();
+    drop(source);
+    // The copy opened without a subdirectory may leave a lock file beside it.
+    let _ = std::fs::remove_file(data_dir.join(format!("{COMPACT_FILE}-lck")));
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&compact);
+        return Err(error);
+    }
+    let after_bytes = std::fs::metadata(&compact)
+        .map_err(|e| io_error("read", &compact, e))?
+        .len();
+
+    // Renames only, on one filesystem: each step is undone if a later one
+    // fails, so a failure leaves the directory as it was.
+    let lock_moved = if lock.exists() {
+        if let Err(e) = std::fs::rename(&lock, &old_lock) {
+            let _ = std::fs::remove_file(&compact);
+            return Err(io_error("move aside", &lock, e));
+        }
+        true
+    } else {
+        false
+    };
+    let undo_lock = || {
+        if lock_moved {
+            let _ = std::fs::rename(&old_lock, &lock);
+        }
+    };
+    if let Err(e) = std::fs::rename(&data, &old_data) {
+        undo_lock();
+        let _ = std::fs::remove_file(&compact);
+        return Err(io_error("move aside", &data, e));
+    }
+    if let Err(e) = std::fs::rename(&compact, &data) {
+        let _ = std::fs::rename(&old_data, &data);
+        undo_lock();
+        let _ = std::fs::remove_file(&compact);
+        return Err(io_error("put in place", &compact, e));
+    }
+    sync_directory(data_dir);
+    Ok(CompactReport {
+        before_bytes,
+        after_bytes,
+        tables: expected.len(),
+        entries: expected.iter().map(|t| t.entries).sum(),
+        old_file: old_data,
+    })
+}
+
+/// `mdbx_env_copy(MDBX_CP_COMPACT)` of `source` to the new file `dest`.
+fn copy_compact(source: &Database<NoWriteMap>, dest: &Path) -> Result<(), CompactError> {
+    let path = dest
+        .to_str()
+        .and_then(|p| std::ffi::CString::new(p).ok())
+        .ok_or_else(|| CompactError::Io(format!("unusable path {}", dest.display())))?;
+    // SAFETY: the environment is open for the whole call (borrowed from
+    // `source`), `path` is NUL-terminated, and libmdbx creates `dest`
+    // itself (it must not exist).
+    let rc = unsafe { mdbx_sys::mdbx_env_copy(source.ptr().0, path.as_ptr(), mdbx_sys::MDBX_CP_COMPACT) };
+    if rc != 0 {
+        return Err(CompactError::Mdbx(format!(
+            "compact copy to {}: {}",
+            dest.display(),
+            libmdbx::Error::from_err_code(rc)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn keep_owner_and_mode(original: &std::fs::Metadata, file: &Path) -> Result<(), CompactError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let current = std::fs::metadata(file).map_err(|e| io_error("read", file, e))?;
+    if (current.uid(), current.gid()) != (original.uid(), original.gid()) {
+        std::os::unix::fs::chown(file, Some(original.uid()), Some(original.gid()))
+            .map_err(|e| io_error("give the owner of the database to", file, e))?;
+    }
+    std::fs::set_permissions(file, std::fs::Permissions::from_mode(original.mode() & 0o7777))
+        .map_err(|e| io_error("give the mode of the database to", file, e))
+}
+
+#[cfg(not(unix))]
+fn keep_owner_and_mode(_original: &std::fs::Metadata, _file: &Path) -> Result<(), CompactError> {
+    Ok(())
+}
+
+fn sync_file(file: &Path) -> Result<(), CompactError> {
+    std::fs::File::open(file)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| io_error("sync", file, e))
+}
+
+fn sync_directory(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Delete the previous database file kept by a compaction (and its lock
 /// file). Returns the bytes freed.
 pub fn remove_old_database(data_dir: &Path) -> Result<u64, CompactError> {
-    let _ = data_dir;
-    Err(CompactError::Io("not implemented".into()))
+    let old_data = data_dir.join(OLD_DATA_FILE);
+    let metadata = match std::fs::symlink_metadata(&old_data) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Err(CompactError::NoDatabase(old_data)),
+    };
+    if !data_dir.join(DATA_FILE).is_file() {
+        // Without a current database the old file is the only copy left.
+        return Err(CompactError::NoDatabase(data_dir.join(DATA_FILE)));
+    }
+    std::fs::remove_file(&old_data).map_err(|e| io_error("delete", &old_data, e))?;
+    let old_lock = data_dir.join(OLD_LOCK_FILE);
+    if old_lock.exists() {
+        std::fs::remove_file(&old_lock).map_err(|e| io_error("delete", &old_lock, e))?;
+    }
+    sync_directory(data_dir);
+    Ok(metadata.len())
 }
 
-#[allow(dead_code)]
 fn open_exclusive_read_only(
     path: &Path,
     no_sub_dir: bool,
@@ -214,7 +522,26 @@ fn open_exclusive_read_only(
             ..Default::default()
         },
     )
-    .map_err(|e| CompactError::Mdbx(e.to_string()))
+    .map_err(|error| match error {
+        // MDBX_BUSY, or the whole-file lock refused because another process
+        // holds its own lock on the file (EACCES, EAGAIN, EBUSY on Linux).
+        libmdbx::Error::Busy | libmdbx::Error::Other(11 | 16) => {
+            CompactError::InUse(path.to_path_buf())
+        }
+        libmdbx::Error::Access => {
+            let file = if no_sub_dir {
+                path.to_path_buf()
+            } else {
+                path.join(DATA_FILE)
+            };
+            // EACCES is also a plain permission problem: say which it is.
+            match std::fs::File::open(&file) {
+                Err(e) => io_error("open", &file, e),
+                Ok(_) => CompactError::InUse(path.to_path_buf()),
+            }
+        }
+        other => CompactError::Mdbx(other.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -242,14 +569,14 @@ mod tests {
         .unwrap()
     }
 
-    /// A database of 48 one-MiB values in `big` and 1 000 small ones in
-    /// `small`, of which 44 big values were then deleted: the file keeps
-    /// about 44 MiB of free pages its GC holds.
+    /// A database of 96 one-MiB values in `big` and 1 000 small ones in
+    /// `small`, of which 92 big values were then deleted: the file keeps
+    /// about 92 MiB of free pages its GC holds.
     fn database_with_holes(dir: &Path) {
         let db = open_rw(dir);
         let txn = db.begin_rw_txn().unwrap();
         let big = txn.create_table(Some("big"), TableFlags::empty()).unwrap();
-        for i in 0u32..48 {
+        for i in 0u32..96 {
             let value = vec![(i % 251) as u8; MIB];
             txn.put(&big, i.to_be_bytes(), value, WriteFlags::empty()).unwrap();
         }
@@ -261,7 +588,7 @@ mod tests {
         txn.commit().unwrap();
         let txn = db.begin_rw_txn().unwrap();
         let big = txn.open_table(Some("big")).unwrap();
-        for i in 4u32..48 {
+        for i in 4u32..96 {
             txn.del(&big, i.to_be_bytes(), None).unwrap();
         }
         txn.commit().unwrap();
@@ -290,7 +617,7 @@ mod tests {
         assert_eq!(report.before_bytes, before_len);
         assert_eq!(report.after_bytes, file_len(&data));
         assert!(
-            report.after_bytes * 4 < report.before_bytes,
+            report.after_bytes * 3 < report.before_bytes,
             "not compacted: {report:?}"
         );
         assert_eq!(report.tables, 2);

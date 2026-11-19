@@ -1899,7 +1899,11 @@ impl MdbxStore {
     /// Size of the database file, the data it holds, the free pages its GC
     /// keeps and the room left on its volume. Read-only.
     pub fn database_health(&self) -> Result<DbHealth, CompactError> {
-        Err(CompactError::Io("not implemented".into()))
+        let health = crate::storage::db_maintenance::health_of(&self.db, &self.data_file)?;
+        if let Ok(mut cache) = self.health_cache.lock() {
+            *cache = Some((std::time::Instant::now(), health));
+        }
+        Ok(health)
     }
 
     /// [`Self::database_health`], reused while younger than `max_age`.
@@ -1907,8 +1911,14 @@ impl MdbxStore {
         &self,
         max_age: std::time::Duration,
     ) -> Result<DbHealth, CompactError> {
-        let _ = max_age;
-        Err(CompactError::Io("not implemented".into()))
+        if let Ok(cache) = self.health_cache.lock() {
+            if let Some((taken, health)) = *cache {
+                if taken.elapsed() < max_age {
+                    return Ok(health);
+                }
+            }
+        }
+        self.database_health()
     }
 
     // -----------------------------------------------------------------------
