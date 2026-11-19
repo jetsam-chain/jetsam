@@ -2085,8 +2085,9 @@ impl RelayConfig {
             "alert_command is required on {profile}: its alerts (a halt, a refused reorganization, nodes that disagree, steps that fail) must leave the logs"
         );
         // F-3 (decision D-1): a local signer always has a daily gas budget (above an honest relayer's day) and Base's
-        // fee cap, unless its `[signer]` names others (the rehearsal's endpoint account: unchanged)
-        if c.signer.holds_hot_key(profile) {
+        // fee cap, unless its `[signer]` names others (no `[signer]`, the rehearsal's endpoint account: unchanged, its
+        // derived default's fields are not the serde defaults, R3-5)
+        if c.signer != crate::l1tx::SignerConfig::default() && c.signer.holds_hot_key(profile) {
             let budget = relay_default_gas_budget(c.cadence_secs, c.signer.max_gas, c.claim_direct_daily_gas);
             c.signer.daily_gas_budget.get_or_insert(budget);
             if c.signer.max_fee_per_gas_wei == crate::l1tx::FeePolicy::default().max_fee_per_gas as u64 {
