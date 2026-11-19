@@ -286,6 +286,7 @@ mod tests {
                 genesis_id: [0x44; 32],
             },
             first_burn: 1_000_000,
+            outstanding_ceil: Some(crate::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO),
         }];
         let a = Activations::of(&d, &c, &g, [0; 32]);
         // The bridge of `H` stays the first one; the second is in the table.
@@ -298,11 +299,54 @@ mod tests {
                 code_hash: "33".repeat(32),
                 genesis_id: "44".repeat(32),
                 first_burn: 1_000_000,
+                no_outstanding_ceil: false,
             }]
         );
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["base_return_bridge_rotations"][0]["height"], serde_json::json!(2_000));
         assert_eq!(v["base_return_bridge_rotations"][0]["first_burn"], serde_json::json!(1_000_000));
+    }
+
+    /// FIXEXT-CAP: a bridge with C-6 (every bridge of before) is published with exactly the five fields of
+    /// before (the record, and its digest, unchanged); one without is published with
+    /// `"no_outstanding_ceil": true` (V8 not applied from its height on).
+    #[test]
+    fn fixextcap_a_bridge_without_a_ceiling_says_so_one_with_is_published_as_before() {
+        use crate::consensus::destination::state::BridgeRotation;
+        let (c, g) = (ClientObjectRules::CONSENSUS, GuardianRules::consensus());
+        let mut d = DestinationRules::CONSENSUS;
+        d.base_return.activation_height = Some(1_000);
+        let bridge = |byte| L1BridgeParams {
+            address: [byte; 20],
+            code_hash: [0; 32],
+            withdrawals_slot: 9,
+            genesis_id_slot: 13,
+            genesis_id: [0; 32],
+        };
+        d.base_return.bridge = Some(bridge(0x11));
+        d.base_return.bridge_rotations = Box::leak(Box::new([
+            BridgeRotation {
+                height: 2_000,
+                bridge: L1BridgeParams { address: [0x22; 20], ..bridge(0) },
+                first_burn: 1_000_000,
+                outstanding_ceil: Some(crate::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO),
+            },
+            BridgeRotation {
+                height: 3_000,
+                bridge: L1BridgeParams { address: [0x33; 20], ..bridge(0) },
+                first_burn: 2_000_000,
+                outstanding_ceil: None,
+            },
+        ]));
+        let v = serde_json::to_value(Activations::of(&d, &c, &g, [0; 32])).unwrap();
+        let keys = |i: usize| -> Vec<String> {
+            let mut k: Vec<String> = v["base_return_bridge_rotations"][i].as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(0), ["address", "code_hash", "first_burn", "genesis_id", "height"]);
+        assert_eq!(keys(1), ["address", "code_hash", "first_burn", "genesis_id", "height", "no_outstanding_ceil"]);
+        assert_eq!(v["base_return_bridge_rotations"][1]["no_outstanding_ceil"], serde_json::json!(true));
     }
 
     /// Rules a test installs on its thread (other heights, keys, bridge) are
@@ -479,6 +523,14 @@ mod tests {
         assert_eq!(second.address, hex_of(&pinned.address));
         assert_eq!(second.code_hash, hex_of(&pinned.code_hash));
         assert_eq!(second.genesis_id, hex_of(&pinned.genesis_id));
+        // FIXEXT-CAP: BRIDGE2B keeps C-6, its record is the one of before (digest f12009771c unchanged): the
+        // five fields of before, nothing else anywhere in the record about the ceiling.
+        assert!(!second.no_outstanding_ceil);
+        let v = serde_json::to_value(&a).unwrap();
+        let mut keys: Vec<&String> = v["base_return_bridge_rotations"][0].as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["address", "code_hash", "first_burn", "genesis_id", "height"]);
+        assert!(!serde_json::to_string(&v).unwrap().contains("outstanding"));
     }
 
     /// The public network's record: its genesis, v1.7 dormant (no `J`, `F`,

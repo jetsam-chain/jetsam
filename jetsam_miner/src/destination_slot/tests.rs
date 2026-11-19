@@ -144,6 +144,8 @@ fn rules() -> DestinationRules {
     rules.vault.deposits_from_height = Some(J + 8);
     // D123's caps on every profile (the test chain's caps of before: `d123_*`)
     rules.vault.legacy = None;
+    // FIXEXT-CAP: V8 applied (a bridge with C-6) on every profile; lifted: `fixextcap_*`
+    rules.vault.outstanding_ceil_lifted_at = None;
     rules
 }
 
@@ -558,6 +560,39 @@ fn template_drops_deposit_over_ceiling_in_block_order() {
         J + 1,
     );
     assert_eq!(kept, vec![first]);
+}
+
+/// FIXEXT-CAP: from the height of the first bridge without an outstanding ceiling (C-6) on, the template
+/// leaves no deposit out for V8, however full the vault; below it, the deposit over the ceiling stays out.
+#[test]
+fn fixextcap_template_keeps_every_deposit_once_v8_is_lifted() {
+    let deposit = |slot: u32, amount: u64, fee: u64| {
+        page(
+            Address([0x51; 32]),
+            slot,
+            &[(VAULT_ADDRESS, amount), (deposit_marker(&[7; 20]), 0)],
+            fee,
+        )
+    };
+    let lift = J + 100;
+    let mut vault = rules().vault;
+    vault.outstanding_ceil_lifted_at = Some(lift);
+    let ceil = VAULT_OUTSTANDING_CEIL_MICRO;
+    let first = deposit(10, 8 * MICRO_PER_JTM, 90_000);
+    let second = deposit(20, 8 * MICRO_PER_JTM, 80_000);
+    let at = |height, locked| {
+        deposits_within_ceiling(
+            vec![second.clone(), first.clone()],
+            |p: &PagedSpendIntent| p.pages.as_slice(),
+            &DestinationOffer::default(),
+            locked,
+            &vault,
+            height,
+        )
+    };
+    assert_eq!(at(lift - 1, ceil - 10 * MICRO_PER_JTM), vec![first.clone()]);
+    assert_eq!(at(lift, ceil - 10 * MICRO_PER_JTM).len(), 2);
+    assert_eq!(at(lift + 1_000, 30 * ceil).len(), 2);
 }
 
 /// A block the destination rules refuse is built again without the objects

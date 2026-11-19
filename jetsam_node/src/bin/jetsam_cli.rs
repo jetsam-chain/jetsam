@@ -4380,6 +4380,26 @@ mod bridge_tests {
         assert!(closed.is_err());
     }
 
+    /// FIXEXT-CAP: a node whose next block is under a bridge without an outstanding ceiling (C-6) reports
+    /// `"room": null`: no room check, the deposit is planned (its other limits stay); a node of before that
+    /// says nothing of the room (no field) is still read as no room.
+    #[test]
+    fn fixextcap_a_null_room_is_no_ceiling_an_absent_one_no_room() {
+        let rules = armed(9_600);
+        let f = rules.deposits_from_height.unwrap();
+        let mut lifted = state(true, f + 3, Some(f), 0);
+        lifted["room"] = serde_json::Value::Null;
+        lifted["ceiling"] = serde_json::Value::Null;
+        lifted["bridge_locked"] = json!(200_000 * ONE);
+        assert_eq!(deposit_preflight(&lifted, MAX_DEPOSIT_MICRO, &RECIPIENT, &rules), Ok(f + 4));
+        let large = deposit_preflight(&lifted, MAX_DEPOSIT_MICRO + 1, &RECIPIENT, &rules).unwrap_err();
+        assert!(large.contains("maximum"), "{large}");
+        let mut older = state(true, f + 3, Some(f), 0);
+        older.as_object_mut().unwrap().remove("room");
+        let refused = deposit_preflight(&older, 5 * ONE, &RECIPIENT, &rules).unwrap_err();
+        assert!(refused.contains("room"), "{refused}");
+    }
+
     /// `bridge status` counts the deposits of the heights the node still
     /// retains, and says how many it no longer does (the rehearsal's node
     /// counted 0 over 1 024 blocks with 308 locked: 845 heights unread).

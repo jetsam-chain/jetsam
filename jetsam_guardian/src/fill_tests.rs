@@ -44,7 +44,14 @@ const FEE: u64 = 47_200;
 
 /// The test clock (J = 69 120, F = J + 1 440) with D123's caps on every profile (the G6 vectors' clock).
 pub(crate) fn rules() -> VaultRules {
-    VaultRules { activation_height: Some(J), deposits_from_height: Some(F), legacy: None, ..VaultRules::current() }
+    // FIXEXT-CAP: V8 applied (a bridge with C-6) on every profile
+    VaultRules {
+        activation_height: Some(J),
+        deposits_from_height: Some(F),
+        legacy: None,
+        outstanding_ceil_lifted_at: None,
+        ..VaultRules::current()
+    }
 }
 
 fn bheader(height: u64, tx_root: [u8; 32]) -> BlockHeader {
@@ -508,7 +515,7 @@ fn cand(height: u64, group: u32, recipient: u8, amount: u64) -> Candidate {
 }
 
 fn caps() -> Caps {
-    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0, tip_locked_height: Some(0), locked_unminted: 0 }
+    Caps { outstanding: 0, spent24h: 0, stock: 3_000 * JTM, total_supply: 0, tip_locked_height: Some(0), locked_unminted: 0, supply_ceiling: Some(OUTSTANDING_CEIL) }
 }
 
 fn open() -> Guard {
@@ -2406,4 +2413,54 @@ fn i3_jg_fill_reads_its_words_saturated() {
     let robot = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/jg-fill.rs")).unwrap();
     let body = robot.split("fn word_u64(").nth(1).unwrap().split("\n}").next().unwrap();
     assert!(body.contains("u64_saturating"), "{body}");
+}
+
+// ---------------------------------------------------------------- FIXEXT-CAP (19/11): a bridge without C-6
+
+/// Under a bridge without an outstanding ceiling (`supply_ceiling: None`) a supply above the former 50 000 wJTM
+/// never makes an advance wait (`SUPPLY_CEILING`); under one with it, as before.
+#[test]
+fn fixextcap_no_supply_ceiling_no_supply_wait() {
+    let c = cand(10, 1, 2, 200 * JTM);
+    let l = ledger_with(&[(1, 300 * JTM, NOW - 100_000)]);
+    let at = |supply_ceiling, total_supply| Caps { supply_ceiling, total_supply, locked_unminted: 40_000 * JTM, ..caps() };
+    assert_eq!(run(&[c.clone()], &l, at(Some(OUTSTANDING_CEIL), 49_500 * JTM)), vec![Verdict::Wait("SUPPLY_CEILING")]);
+    assert_eq!(run(&[c.clone()], &l, at(None, 49_500 * JTM)), vec![Verdict::Advance]);
+    assert_eq!(run(&[c.clone()], &l, at(None, 900_000 * JTM)), vec![Verdict::Advance]);
+    assert_eq!(run(&[c], &l, at(None, u64::MAX)), vec![Verdict::Advance]);
+}
+
+/// The ceiling of the configured bridge, from this build's bridge table: none on a network whose bridges have no
+/// C-6 (the public one), the table's for a bridge it pins, unknown (`None`: read on the bridge, as before) else.
+#[test]
+fn fixextcap_the_configured_bridges_ceiling_is_the_tables() {
+    use jetsam_chain::consensus::destination::l1_read::L1BridgeParams;
+    use jetsam_chain::consensus::destination::state::BridgeRotation;
+    use jetsam_chain::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO;
+    let b = |byte: u8| L1BridgeParams { address: [byte; 20], code_hash: [0; 32], withdrawals_slot: 9, genesis_id_slot: 13, genesis_id: [0; 32] };
+    let c = Some(VAULT_OUTSTANDING_CEIL_MICRO);
+    let table = [
+        BridgeRotation { height: 900, bridge: b(2), first_burn: 10, outstanding_ceil: c },
+        BridgeRotation { height: 950, bridge: b(3), first_burn: 20, outstanding_ceil: None },
+    ];
+    assert_eq!(bridge_outstanding_ceil(&[1; 20], Some(b(1)), c, &table), Some(c));
+    assert_eq!(bridge_outstanding_ceil(&[2; 20], Some(b(1)), c, &table), Some(c));
+    assert_eq!(bridge_outstanding_ceil(&[3; 20], Some(b(1)), c, &table), Some(None));
+    assert_eq!(bridge_outstanding_ceil(&[9; 20], Some(b(1)), c, &table), None, "unknown: read on the bridge");
+    assert_eq!(bridge_outstanding_ceil(&[9; 20], None, None, &[]), Some(None), "no bridge of this network has C-6");
+}
+
+/// At start: a bridge the table says has no C-6 is not asked `OUTSTANDING_CEIL()` (its code has none: the call
+/// would revert) and the robot counts no ceiling; any other is read and must answer 50 000 JTM, as before.
+#[test]
+fn fixextcap_the_start_reads_the_ceiling_only_of_a_bridge_that_has_one() {
+    use jetsam_chain::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO;
+    let never = || -> anyhow::Result<u64> { panic!("OUTSTANDING_CEIL() asked of a bridge without one") };
+    assert_eq!(start_ceiling(Some(None), never).unwrap(), None);
+    let c = Some(VAULT_OUTSTANDING_CEIL_MICRO);
+    for known in [Some(c), None] {
+        assert_eq!(start_ceiling(known, || Ok(50_000 * JTM)).unwrap(), Some(OUTSTANDING_CEIL));
+        assert!(start_ceiling(known, || Ok(10_000 * JTM)).unwrap_err().to_string().contains("does not start"));
+        assert!(start_ceiling(known, || anyhow::bail!("execution reverted")).is_err(), "a revert is not read as none");
+    }
 }

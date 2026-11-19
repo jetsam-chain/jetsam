@@ -3368,6 +3368,8 @@ mod tests {
             deposits_from_height: Some(CROSSING_J + 8),
             // D123's caps on every profile (the test chain's caps of before: `d123_*`)
             legacy: None,
+            // FIXEXT-CAP: V8 applied (a bridge with C-6) on every profile; lifted: `fixextcap_*`
+            outstanding_ceil_lifted_at: None,
             ..jetsam_chain::consensus::vault::VaultRules::current()
         }
     }
@@ -3664,6 +3666,45 @@ mod tests {
         let big = ReleaseCase::new(c - 1, 4, 3_000 * MICRO_PER_JTM, 0);
         let from = pool_with_vault_rules(big.view_at(c - 1, &[]), raising_vault_rules(c));
         assert!(!shape(big.submit(&from).await), "a payable shape from c on");
+    }
+
+    /// FIXEXT-CAP: from the height of the first bridge without an outstanding ceiling (C-6) on, V8 no longer
+    /// refuses a deposit at admission, however full the vault: refused while the next block is below it,
+    /// admitted from it on (the rules of the next block).
+    #[tokio::test]
+    async fn fixextcap_admission_lifts_v8_from_the_bridge_without_a_ceiling() {
+        use jetsam_chain::consensus::params::MICRO_PER_JTM;
+        use jetsam_chain::consensus::vault::{deposit_marker, VaultError, VAULT_ADDRESS, VAULT_OUTSTANDING_CEIL_MICRO};
+        let lift = CROSSING_J + 40;
+        let rules = jetsam_chain::consensus::vault::VaultRules {
+            outstanding_ceil_lifted_at: Some(lift),
+            ..armed_vault_rules()
+        };
+        let locked = VAULT_OUTSTANDING_CEIL_MICRO;
+        let deposit = |tip| {
+            VaultCase::new(
+                tip,
+                Address([0xA5; 32]),
+                &[(VAULT_ADDRESS, 3 * MICRO_PER_JTM), (deposit_marker(&[0x42; 20]), 0)],
+            )
+        };
+        let below = deposit(lift - 2);
+        let before = pool_with_vault_rules(below.view_at(lift - 2, locked), rules);
+        assert_eq!(
+            vault_error(below.submit(&before).await),
+            Some(VaultError::VaultCeilingReached {
+                group: 0,
+                locked,
+                amount: 3 * MICRO_PER_JTM,
+                ceil: VAULT_OUTSTANDING_CEIL_MICRO
+            })
+        );
+        let at = deposit(lift - 1);
+        let from = pool_with_vault_rules(at.view_at(lift - 1, locked), rules);
+        assert!(at.submit(&from).await.is_ok());
+        let far = deposit(lift + 100);
+        let full = pool_with_vault_rules(far.view_at(lift + 100, 10 * locked), rules);
+        assert!(far.submit(&full).await.is_ok());
     }
 
     /// The floor of the release tests: `alloc_counter(J − 1)`.

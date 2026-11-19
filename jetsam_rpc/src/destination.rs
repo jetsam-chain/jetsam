@@ -305,6 +305,8 @@ mod tests {
         rules.vault.deposits_from_height = Some(970);
         // D123's caps on every profile (the test chain's caps of before: `d123_*`)
         rules.vault.legacy = None;
+        // FIXEXT-CAP: V8 applied (a bridge with C-6) on every profile; lifted: `fixextcap_*`
+        rules.vault.outstanding_ceil_lifted_at = None;
         rules
     }
 
@@ -330,8 +332,8 @@ mod tests {
         let reply = vault_state(Some(&state), 1_500, &rules(), &deposits, 3);
         assert!(reply.active);
         assert_eq!(reply.bridge_locked, 9_000 * MICRO_PER_JTM);
-        assert_eq!(reply.ceiling, VAULT_OUTSTANDING_CEIL_MICRO);
-        assert_eq!(reply.room, VAULT_OUTSTANDING_CEIL_MICRO - 9_000 * MICRO_PER_JTM);
+        assert_eq!(reply.ceiling, Some(VAULT_OUTSTANDING_CEIL_MICRO));
+        assert_eq!(reply.room, Some(VAULT_OUTSTANDING_CEIL_MICRO - 9_000 * MICRO_PER_JTM));
         assert_eq!(reply.floor, 77);
         assert_eq!(reply.deposits_from_height, Some(970));
         assert_eq!(reply.released_count, 2);
@@ -344,12 +346,33 @@ mod tests {
         assert_eq!(reply.deposits_last_1024, 3);
         // Full vault: no room, never negative.
         state.bridge_locked = VAULT_OUTSTANDING_CEIL_MICRO;
-        assert_eq!(vault_state(Some(&state), 1_500, &rules(), &[], 0).room, 0);
+        assert_eq!(vault_state(Some(&state), 1_500, &rules(), &[], 0).room, Some(0));
         // Below J: inactive, nothing locked.
         let below = vault_state(None, 900, &rules(), &[], 0);
         assert!(!below.active);
         assert_eq!(below.bridge_locked, 0);
-        assert_eq!(below.room, VAULT_OUTSTANDING_CEIL_MICRO);
+        assert_eq!(below.room, Some(VAULT_OUTSTANDING_CEIL_MICRO));
+    }
+
+    /// FIXEXT-CAP: under a bridge without an outstanding ceiling (C-6) from the next block on, no ceiling and
+    /// no room are reported (`null` on the wire: nothing bounds `bridge_locked`); while V8 applies, numbers as
+    /// before (the reply of a node of the test chain today is unchanged).
+    #[test]
+    fn fixextcap_get_vault_state_reports_no_ceiling_once_v8_is_lifted() {
+        let mut lifted = rules();
+        lifted.vault.outstanding_ceil_lifted_at = Some(1_600);
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.bridge_locked = 90_000 * MICRO_PER_JTM;
+        let before = vault_state(Some(&state), 1_598, &lifted, &[], 0);
+        assert_eq!((before.ceiling, before.room), (Some(VAULT_OUTSTANDING_CEIL_MICRO), Some(0)));
+        let json = serde_json::to_value(&before).unwrap();
+        assert_eq!(json["ceiling"], serde_json::json!(VAULT_OUTSTANDING_CEIL_MICRO));
+        let from = vault_state(Some(&state), 1_599, &lifted, &[], 0);
+        assert_eq!((from.ceiling, from.room), (None, None));
+        assert_eq!(from.bridge_locked, 90_000 * MICRO_PER_JTM);
+        let json = serde_json::to_value(&from).unwrap();
+        assert!(json["ceiling"].is_null() && json["room"].is_null());
+        assert_eq!(json.as_object().unwrap().get("room"), Some(&serde_json::Value::Null), "present, null");
     }
 
     /// D123: `getVaultState` reports the caps of the next block: on a chain
@@ -370,13 +393,13 @@ mod tests {
         let before = vault_state(Some(&state), c - 2, &raising, &[], 0);
         assert_eq!(
             (before.ceiling, before.room, before.window_cap),
-            (10_000 * MICRO_PER_JTM, 1_000 * MICRO_PER_JTM, 2_500 * MICRO_PER_JTM)
+            (Some(10_000 * MICRO_PER_JTM), Some(1_000 * MICRO_PER_JTM), 2_500 * MICRO_PER_JTM)
         );
         state.tip = c - 1;
         let from = vault_state(Some(&state), c - 1, &raising, &[], 0);
         assert_eq!(
             (from.ceiling, from.room, from.window_cap),
-            (50_000 * MICRO_PER_JTM, 41_000 * MICRO_PER_JTM, 50_000 * MICRO_PER_JTM)
+            (Some(50_000 * MICRO_PER_JTM), Some(41_000 * MICRO_PER_JTM), 50_000 * MICRO_PER_JTM)
         );
     }
 

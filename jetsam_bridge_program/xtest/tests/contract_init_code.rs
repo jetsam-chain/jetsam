@@ -22,6 +22,7 @@ use jetsam_chain::consensus::guardian::{network_id, GUARDIAN_L1_BRIDGE};
 use jetsam_chain::consensus::params::{
     v1_7_schedule_is_valid_on, V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_ALIGNMENT, V1_7_ACTIVATION_HEIGHT,
 };
+use jetsam_chain::consensus::destination::state::BASE_RETURN_BRIDGE_OUTSTANDING_CEIL;
 use jetsam_chain::consensus::vault::{
     bridge_deposits_from_height, MAX_DEPOSIT_MICRO, RELEASE_FEE_MICRO, VAULT_ADDRESS,
     VAULT_OUTSTANDING_CEIL_MICRO, VAULT_RELEASE_WINDOW_CAP_MICRO,
@@ -169,9 +170,17 @@ fn bridge_constants_match_contract_init_code() {
     assert_eq!(c["minBurnAmount"].as_u64(), Some(RELEASE_FEE_MICRO));
     assert_eq!(c["nextBurnIndex"].as_u64(), Some(1));
     assert_eq!(bytes(&c["jetsamNetwork"]), network_id());
-    // C-4 = MAX_DEPOSIT (D28), C-6 = VAULT_OUTSTANDING_CEIL (D45, V8), B-2 = MAX_DEPOSIT (D54).
+    // C-4 = MAX_DEPOSIT (D28), B-2 = MAX_DEPOSIT (D54).
     assert_eq!(c["SLOW_PER_DEPOSIT"].as_u64(), Some(MAX_DEPOSIT_MICRO));
-    assert_eq!(c["OUTSTANDING_CEIL"].as_u64(), Some(VAULT_OUTSTANDING_CEIL_MICRO));
+    // FIXEXT-CAP: C-6 = VAULT_OUTSTANDING_CEIL (D45, V8) where the contract has it, and the node's ceiling of this
+    // network's first bridge says whether it has: the public network's (no C-6, V8 never applied) cannot be built
+    // beside a vector with C-6, nor the test chain's (TN1's C-6) beside one without.
+    assert_eq!(
+        has_outstanding_ceil(&v, &init),
+        BASE_RETURN_BRIDGE_OUTSTANDING_CEIL.map(|_| VAULT_OUTSTANDING_CEIL_MICRO),
+        "the contract's C-6 is the node's ceiling of this network's first bridge ({})",
+        p.name
+    );
     assert_eq!(c["MAX_BURN_AMOUNT"].as_u64(), Some(MAX_DEPOSIT_MICRO));
     // D123: all three are the bond, 50 000 JTM; B-2, the largest burn within V6 (inclusive): a release of it is payable.
     assert_eq!(c["SLOW_PER_DEPOSIT"].as_u64(), Some(50_000_000_000));
@@ -267,4 +276,39 @@ fn bridge2_the_second_test_bridge_deployed_is_the_one_the_nodes_pin() {
     assert_eq!(hex(&as_address(word(config, 7))), "60d2f7093181e1a47f54d0b4b30efedc5505eaea", "TN1's pause key");
     assert_eq!(as_u64(word(config, 8)), second.first_burn, "the table's first burn index");
     assert_eq!(Some(second.height), V1_7_BRIDGE2_HEIGHT);
+    // FIXEXT-CAP: BRIDGE2B's code has C-6 (its getter in the dispatcher), and the table says so.
+    assert!(code_has_selector(&init, "OUTSTANDING_CEIL()"));
+    assert_eq!(second.outstanding_ceil, Some(VAULT_OUTSTANDING_CEIL_MICRO), "the table's ceiling is the code's");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// FIXEXT-CAP (19/11): whether a bridge's code has an outstanding ceiling (C-6)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The dispatcher of a contract with a public getter `sig` holds its selector as a `PUSH4`.
+fn code_has_selector(code: &[u8], sig: &str) -> bool {
+    let s = keccak256(sig.as_bytes());
+    code.windows(5).any(|w| w[0] == 0x63 && w[1..] == s[..4])
+}
+
+/// A vector's ceiling: its constant `OUTSTANDING_CEIL` (read back on the deployed code) when its code has the getter,
+/// none when it has neither; both or neither, never one alone.
+fn has_outstanding_ceil(v: &Value, init: &[u8]) -> Option<u64> {
+    let constant = v["constants"].get("OUTSTANDING_CEIL").map(|c| c.as_u64().expect("a uint64"));
+    assert_eq!(constant.is_some(), code_has_selector(init, "OUTSTANDING_CEIL()"), "constant and getter together");
+    constant
+}
+
+/// Checked whatever the profile: the public network's vector (the contract of v3-fixext from FIXEXT-CAP on) has no
+/// C-6; the test chain's first bridge (TN1's) and its second (BRIDGE2B's, b54fa07), deployed, keep theirs.
+#[test]
+fn fixextcap_the_public_networks_vector_has_no_ceiling_the_test_chains_bridges_keep_theirs() {
+    let [m, t] = PROFILES.map(|p| serde_json::from_str::<Value>(p.vector).unwrap());
+    let init = |v: &Value| bytes(&v["bridge"]["initCode"]);
+    assert_eq!(has_outstanding_ceil(&m, &init(&m)), None, "mainnet");
+    assert_eq!(has_outstanding_ceil(&t, &init(&t)), Some(VAULT_OUTSTANDING_CEIL_MICRO), "testnet");
+    let b2: Value = serde_json::from_str(include_str!("fixtures/bridge_init_code_testnet_bridge2.json")).unwrap();
+    assert_eq!(has_outstanding_ceil(&b2, &init(&b2)), Some(VAULT_OUTSTANDING_CEIL_MICRO), "testnet-bridge2");
+    let deployed: Value = serde_json::from_str(include_str!("fixtures/bridge2_deployment_testnet.json")).unwrap();
+    assert!(code_has_selector(&bytes(&deployed["initCode"]), "OUTSTANDING_CEIL()"), "BRIDGE2B as deployed");
 }

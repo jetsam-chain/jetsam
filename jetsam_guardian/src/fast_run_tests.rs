@@ -1367,7 +1367,7 @@ fn bridge2_a_run_of_the_second_bridge_leaves_the_first_bridges_records() {
     d.base_return.activation_height = Some(8_982);
     d.base_return.bridge = Some(first);
     d.base_return.bridge_rotations = &[];
-    let table: &'static [BridgeRotation] = Box::leak(Box::new([BridgeRotation { height: 12_480, bridge: second, first_burn: 1_000_000 }]));
+    let table: &'static [BridgeRotation] = Box::leak(Box::new([BridgeRotation { height: 12_480, bridge: second, first_burn: 1_000_000, outstanding_ceil: Some(jetsam_chain::consensus::vault::VAULT_OUTSTANDING_CEIL_MICRO) }]));
     let paid = |n: u64, height: u64| FastPaid { n, owner: Address([0xa1; 32]), amount: 5_000_000, l2_block: B, height, contradicted: false };
     let records = vec![paid(1, 9_043), paid(2, 9_060), paid(3, 9_155), paid(1_000_000, 12_500)];
     // a run of the second bridge (this build's last: `effective_at(u64::MAX)`)

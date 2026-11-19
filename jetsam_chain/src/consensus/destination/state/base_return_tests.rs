@@ -30,7 +30,7 @@ use crate::consensus::params::MICRO_PER_JTM;
 use crate::consensus::vault::tests::{
     block_at, logical, release, ALICE, BOB, FEE, HEIGHT, PAYER, RF,
 };
-use crate::consensus::vault::{VAULT_ADDRESS, VAULT_RELEASE_WINDOW_BLOCKS};
+use crate::consensus::vault::{VAULT_ADDRESS, VAULT_OUTSTANDING_CEIL_MICRO, VAULT_RELEASE_WINDOW_BLOCKS};
 use jetsam_tx::wire::WireError;
 
 pub(super) const JTM: u64 = MICRO_PER_JTM;
@@ -2006,6 +2006,7 @@ pub(super) fn switched(rules: DestinationRules, h2: u64) -> DestinationRules {
         height: h2,
         bridge: second_bridge(),
         first_burn: SECOND_FIRST_BURN,
+        outstanding_ceil: Some(VAULT_OUTSTANDING_CEIL_MICRO),
     }]));
     DestinationRules {
         base_return: BaseReturnRules {
@@ -2184,6 +2185,7 @@ fn bridge2_the_bridge_table_sits_only_beside_its_height() {
         height,
         bridge,
         first_burn,
+        outstanding_ceil: Some(VAULT_OUTSTANDING_CEIL_MICRO),
     };
     let ok = [rotation(900, second_bridge(), 1_000_000)];
     assert!(bridge_rotations_are_valid(&[], first, Some(800), None));
@@ -2267,6 +2269,9 @@ fn bridge2_the_profiles_bridge_table() {
         assert!(h2 >= 12_623 + 480);
         // The test chain's first bridge gave n = 1, 2, 3 (nextBurnIndex 4).
         assert!(second.first_burn > 3);
+        // FIXEXT-CAP: TN1's bridge and BRIDGE2B's (code of b54fa07) keep their C-6 of 50 000 JTM.
+        assert_eq!(second.outstanding_ceil, Some(VAULT_OUTSTANDING_CEIL_MICRO));
+        assert_eq!(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, Some(VAULT_OUTSTANDING_CEIL_MICRO));
     }
     #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
     {
@@ -2392,4 +2397,69 @@ fn fixext_the_public_network_never_arms_v1_7_without_its_return() {
         crate::consensus::destination::fast::FAST_RELEASE_KEY.is_some(),
         crate::consensus::destination::fast::FAST_REVOKE_KEY.is_some(),
     ));
+}
+
+// ---------------------------------------------------------------------------
+// FIXEXT-CAP (19/11): the outstanding ceiling is the bridge's
+// ---------------------------------------------------------------------------
+
+fn capped(height: u64, first_burn: u64, outstanding_ceil: Option<u64>) -> BridgeRotation {
+    BridgeRotation {
+        height,
+        bridge: L1BridgeParams {
+            address: [(height % 251) as u8; 20],
+            ..second_bridge()
+        },
+        first_burn,
+        outstanding_ceil,
+    }
+}
+
+/// The ceilings of a table: each the contract's C-6 of 50 000 JTM (D123) or none, and once a bridge has none
+/// no later one has one again (V8 lifted for good: the vault may by then hold more than any ceiling).
+#[test]
+fn fixextcap_a_tables_ceilings_are_c6_or_none_and_never_come_back() {
+    const C: Option<u64> = Some(VAULT_OUTSTANDING_CEIL_MICRO);
+    assert!(outstanding_ceils_are_valid(C, &[]));
+    assert!(outstanding_ceils_are_valid(None, &[]));
+    assert!(outstanding_ceils_are_valid(C, &[capped(900, 10, C), capped(950, 20, None)]));
+    assert!(outstanding_ceils_are_valid(C, &[capped(900, 10, None), capped(950, 20, None)]));
+    assert!(outstanding_ceils_are_valid(None, &[capped(900, 10, None)]));
+    assert!(!outstanding_ceils_are_valid(None, &[capped(900, 10, C)]));
+    assert!(!outstanding_ceils_are_valid(C, &[capped(900, 10, None), capped(950, 20, C)]));
+    assert!(!outstanding_ceils_are_valid(Some(10_000 * MICRO_PER_JTM), &[]));
+    assert!(!outstanding_ceils_are_valid(C, &[capped(900, 10, Some(1))]));
+}
+
+/// V8 is lifted from the height of the first bridge without C-6: `Some(0)` when the network's first has none,
+/// none while every bridge has one.
+#[test]
+fn fixextcap_v8_is_lifted_at_the_first_bridge_without_a_ceiling() {
+    const C: Option<u64> = Some(VAULT_OUTSTANDING_CEIL_MICRO);
+    assert_eq!(outstanding_ceil_lifted_at(C, &[]), None);
+    assert_eq!(outstanding_ceil_lifted_at(None, &[]), Some(0));
+    assert_eq!(outstanding_ceil_lifted_at(None, &[capped(900, 10, None)]), Some(0));
+    assert_eq!(outstanding_ceil_lifted_at(C, &[capped(900, 10, C)]), None);
+    assert_eq!(outstanding_ceil_lifted_at(C, &[capped(900, 10, C), capped(950, 20, None)]), Some(950));
+    assert_eq!(outstanding_ceil_lifted_at(C, &[capped(900, 10, None), capped(950, 20, None)]), Some(900));
+}
+
+/// Each profile: the public network's bridge has no C-6 (the contract of v3-fixext from FIXEXT-CAP on, the one
+/// its vector in jetsam_bridge_xtest is), the test chain's bridges keep theirs (TN1's, BRIDGE2B's) until a
+/// bridge without one is added to its table, the rehearsal keeps V8.
+#[test]
+fn fixextcap_each_profiles_ceilings() {
+    #[cfg(not(feature = "testnet"))]
+    {
+        assert_eq!(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, None);
+        assert!(BASE_RETURN_BRIDGE_ROTATIONS.iter().all(|r| r.outstanding_ceil.is_none()));
+    }
+    #[cfg(feature = "testnet")]
+    assert_eq!(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, Some(VAULT_OUTSTANDING_CEIL_MICRO));
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    assert!(
+        BASE_RETURN_BRIDGE_ROTATIONS.iter().all(|r| r.outstanding_ceil.is_some()),
+        "TODO(FIXEXT-CAP): the test chain's bridge without C-6 is not in its table yet"
+    );
+    assert!(outstanding_ceils_are_valid(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS));
 }

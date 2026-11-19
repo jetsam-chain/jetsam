@@ -27,11 +27,15 @@ pub(crate) const FEE: u64 = 47_200;
 
 /// The rules of the test clock, with D123's caps on every profile (the test chain's caps of before D123 and
 /// their height are tested on their own: `d123_*`).
+///
+/// FIXEXT-CAP: V8 applied (a bridge with an outstanding ceiling, the contract's C-6) on every profile; the rules
+/// of a bridge without one are tested on their own (`fixextcap_*`).
 pub(crate) fn rules() -> VaultRules {
     VaultRules {
         activation_height: Some(J),
         deposits_from_height: Some(F),
         legacy: None,
+        outstanding_ceil_lifted_at: None,
         ..VaultRules::current()
     }
 }
@@ -269,6 +273,12 @@ fn bridge_opening_follows_the_v1_7_clock() {
         bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT)
     );
     assert_eq!(current.outstanding_ceil, 50_000 * MICRO_PER_JTM);
+    // FIXEXT-CAP: V8 applies only on the test chain (its bridges have C-6), never on the public network (its
+    // bridge has none)
+    #[cfg(feature = "testnet")]
+    assert_eq!(current.v8_ceiling(), Some(50_000 * MICRO_PER_JTM));
+    #[cfg(not(feature = "testnet"))]
+    assert_eq!(current.v8_ceiling(), None);
     assert_eq!(current.release_fee, RF);
     assert_eq!(current.release_fee_for(1, 3), RF);
     assert_eq!(current.release_fee_for(929, 3), RF);
@@ -1213,6 +1223,9 @@ fn vault_ceiling_is_the_contracts_outstanding_ceil() {
         VaultRules::current().outstanding_ceil,
         CONTRACT_OUTSTANDING_CEIL
     );
+    // FIXEXT-CAP: applied only under a bridge whose code has C-6 (the test chain's)
+    #[cfg(feature = "testnet")]
+    assert_eq!(VaultRules::current().v8_ceiling(), Some(CONTRACT_OUTSTANDING_CEIL));
     // Inclusive, at the block gate and at admission alike.
     let d = deposit(200, [7; 20], MICRO_PER_JTM);
     let at = |bridge_locked| VaultContext {
@@ -2980,4 +2993,132 @@ fn d123_the_caps_of_each_profile() {
         let (max_deposit, window_cap, ceil) = caps;
         assert!(MIN_DEPOSIT_MICRO <= max_deposit && max_deposit <= window_cap && max_deposit <= ceil, "{caps:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// FIXEXT-CAP (19/11): V8 only under a bridge whose contract has an outstanding ceiling (C-6)
+// ---------------------------------------------------------------------------
+
+/// The test rules with V8 lifted from `lift` on (a later bridge without C-6 from that height).
+fn lifted(lift: Option<u64>) -> VaultRules {
+    VaultRules {
+        outstanding_ceil_lifted_at: lift,
+        ..rules()
+    }
+}
+
+/// Below the lift height V8 refuses a deposit over the ceiling; from it on the same block passes and
+/// `bridge_locked` keeps counting past the former ceiling. The rules of one block no longer depend on a
+/// height (`at`), at the block gate and at admission alike.
+#[test]
+fn fixextcap_v8_applies_below_the_lift_height_and_not_from_it() {
+    let r = lifted(Some(HEIGHT));
+    assert_eq!(r.at(HEIGHT - 1).v8_ceiling(), Some(CEIL));
+    assert_eq!(r.at(HEIGHT).v8_ceiling(), None);
+    assert_eq!(r.at(HEIGHT + 10_000).v8_ceiling(), None);
+    for h in [HEIGHT - 1, HEIGHT, HEIGHT + 1] {
+        assert_eq!(r.at(h).at(h + 7), r.at(h), "{h}");
+        assert_eq!(r.at(h).at(0), r.at(h), "{h}");
+    }
+    let amount = 5 * MICRO_PER_JTM;
+    let full = VaultContext {
+        bridge_locked: CEIL,
+        ..ctx()
+    };
+    let gate = |h| {
+        validate_block_vault(&block_at(h, vec![deposit(200, [7; 20], amount)], &[]), &full, &r, &mut proven)
+    };
+    assert_eq!(
+        gate(HEIGHT - 1),
+        Err(VaultError::VaultCeilingReached {
+            group: 0,
+            locked: CEIL,
+            amount,
+            ceil: CEIL
+        })
+    );
+    assert_eq!(gate(HEIGHT).map(|e| e.bridge_locked_after), Ok(CEIL + amount));
+    let d = pages(deposit(200, [7; 20], amount));
+    assert!(check_vault_deposit_room(&d, CEIL, &r.at(HEIGHT - 1)).is_err());
+    assert_eq!(check_vault_deposit_room(&d, CEIL, &r.at(HEIGHT)), Ok(()));
+}
+
+/// A network whose bridge never had C-6 (`Some(0)`): no deposit is refused by V8 at any height, however much
+/// the vault holds; the other caps stay (V4-c: 50 000 JTM a deposit) and so does V8's balance (a release still
+/// takes from it, and cannot take more than it holds).
+#[test]
+fn fixextcap_without_a_ceiling_v8_refuses_nothing_and_the_balance_still_counts() {
+    let r = lifted(Some(0));
+    assert_eq!(r.v8_ceiling(), None);
+    let huge = VaultContext {
+        bridge_locked: 20 * CEIL,
+        ..ctx()
+    };
+    let two = block(
+        vec![deposit(200, [7; 20], MAX_DEPOSIT_MICRO), deposit(300, [8; 20], MAX_DEPOSIT_MICRO)],
+        &[],
+    );
+    assert_eq!(
+        validate_block_vault(&two, &huge, &r, &mut proven).map(|e| e.bridge_locked_after),
+        Ok(22 * CEIL)
+    );
+    assert!(check_vault_deposit_room(&pages(deposit(200, [7; 20], MAX_DEPOSIT_MICRO)), u64::MAX - 1, &r).is_ok());
+    // V4-c still bounds one deposit
+    let over = block(vec![deposit(200, [7; 20], MAX_DEPOSIT_MICRO + 1)], &[]);
+    assert_eq!(
+        validate_block_vault(&over, &huge, &r, &mut proven),
+        Err(VaultError::DepositAmount {
+            group: 0,
+            amount: MAX_DEPOSIT_MICRO + 1
+        })
+    );
+    // the balance still counts releases: one taking more than the vault holds is refused
+    let rel = release(1, ALICE, 10 * MICRO_PER_JTM);
+    let b = block(vec![release_group(100, &rel, 0, FEE)], std::slice::from_ref(&rel));
+    let empty = VaultContext {
+        bridge_locked: 0,
+        ..ctx()
+    };
+    assert!(matches!(
+        validate_block_vault(&b, &empty, &r, &mut proven),
+        Err(VaultError::VaultBalanceUnderflow { .. })
+    ));
+}
+
+/// The test chain's caps of before (10 000 JTM below its caps height) give way to the lift as D123's do.
+#[test]
+fn fixextcap_the_lift_overrides_the_caps_of_before() {
+    let c = HEIGHT + 32;
+    let r = VaultRules {
+        outstanding_ceil_lifted_at: Some(c + 100),
+        ..raising(Some(c))
+    };
+    assert_eq!(r.at(c - 1).v8_ceiling(), Some(10_000 * MICRO_PER_JTM));
+    assert_eq!(r.at(c).v8_ceiling(), Some(BOND));
+    assert_eq!(r.at(c + 100).v8_ceiling(), None);
+    // the other caps of that height are unchanged by the lift
+    assert_eq!((r.at(c + 100).max_deposit, r.at(c + 100).window_cap), (BOND, BOND));
+}
+
+/// This build's lift height is its bridge table's: the first bridge without C-6 (`Some(0)`: the network's
+/// first), none while every bridge has C-6 (the test chain today: TN1's bridge and BRIDGE2B's).
+#[test]
+fn fixextcap_this_builds_lift_height_is_its_bridge_tables() {
+    use crate::consensus::destination::state::{
+        outstanding_ceil_lifted_at, BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS,
+    };
+    let current = VaultRules::current();
+    assert_eq!(
+        current.outstanding_ceil_lifted_at,
+        outstanding_ceil_lifted_at(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS)
+    );
+    #[cfg(not(feature = "testnet"))]
+    assert_eq!(current.outstanding_ceil_lifted_at, Some(0), "the public network's bridge has no C-6");
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    assert_eq!(
+        current.outstanding_ceil_lifted_at, None,
+        "TODO(FIXEXT-CAP): the test chain's bridge without C-6 is not in its table yet"
+    );
+    #[cfg(feature = "rehearsal-v1-7")]
+    assert_eq!(current.outstanding_ceil_lifted_at, None, "the rehearsal keeps V8");
 }
