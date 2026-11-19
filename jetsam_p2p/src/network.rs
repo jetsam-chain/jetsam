@@ -8,7 +8,7 @@
 //! - GossipSub: receiving blocks and txs from peers, broadcasting our blocks/txs
 //! - Request-Response: serving headers, accepted-block bundles, and HistoryStep terminals
 //! - Identify: maintaining peer address books
-//! - Ping: pruning stale connections
+//! - Ping: closing a connection whose pings fail (a flow dropped in silence)
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -5589,6 +5589,12 @@ fn report_gossip_validation(
     }
 }
 
+/// A ping timeout or a broken ping stream says the connection is dead. A peer
+/// that does not speak the ping protocol says nothing about it.
+fn ping_failure_closes_connection(failure: &libp2p::ping::Failure) -> bool {
+    !matches!(failure, libp2p::ping::Failure::Unsupported)
+}
+
 fn is_routable_identify_addr(addr: &Multiaddr) -> bool {
     // DNS names advertised by an untrusted peer are cheap aliases around one
     // attacker-controlled host and bypass IP-group diversity. Explicit DNS
@@ -9617,6 +9623,33 @@ async fn handle_swarm_event(
             }
         }
 
+        // --- Ping: liveness of each connection ---
+        //
+        // yamux and libp2p-tcp keep no keepalive, and libp2p-ping leaves the
+        // policy to us: without this arm a flow dropped in silence by a NAT
+        // stayed open until the kernel gave up (tcp_retries2, ~16 min).
+        // libp2p-ping reports the second failure in a row, so a dead
+        // connection is closed 35 to 50 s after it died.
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Ping(libp2p::ping::Event {
+            peer,
+            connection,
+            result: Err(error),
+        })) => {
+            if ping_failure_closes_connection(&error) {
+                sync_paths.mark_closing(connection);
+                let closing = swarm.close_connection(connection);
+                tracing::info!(
+                    peer = %peer,
+                    connection = ?connection,
+                    error = %error,
+                    closing,
+                    "closing a connection whose pings fail"
+                );
+            } else {
+                tracing::debug!(peer = %peer, connection = ?connection, error = %error, "peer does not answer pings");
+            }
+        }
+
         // --- Connection events ---
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -11800,6 +11833,32 @@ mod tests {
         );
         assert_eq!(bootstrap_probe_capacity(2, 0, 4, 8, 8), 0);
         assert_eq!(bootstrap_probe_capacity(2, 2, 0, 8, 8), 0);
+    }
+
+    #[test]
+    fn a_failed_ping_closes_the_connection_unless_the_peer_lacks_the_protocol() {
+        assert!(ping_failure_closes_connection(
+            &libp2p::ping::Failure::Timeout
+        ));
+        assert!(ping_failure_closes_connection(
+            &libp2p::ping::Failure::Other {
+                error: Box::new(std::io::Error::other("stream reset")),
+            }
+        ));
+        assert!(!ping_failure_closes_connection(
+            &libp2p::ping::Failure::Unsupported
+        ));
+    }
+
+    /// libp2p-ping reports the second failure in a row: a connection that
+    /// died right after an answered ping is closed after two intervals and
+    /// two timeouts.
+    #[test]
+    fn a_dead_connection_is_closed_within_fifty_seconds() {
+        use crate::behaviour::{PING_INTERVAL, PING_TIMEOUT};
+        assert_eq!(PING_INTERVAL, Duration::from_secs(15));
+        assert_eq!(PING_TIMEOUT, Duration::from_secs(10));
+        assert!(2 * (PING_INTERVAL + PING_TIMEOUT) <= Duration::from_secs(50));
     }
 
     fn lan_seed(index: usize) -> Multiaddr {

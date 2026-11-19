@@ -40,6 +40,13 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"JETSAM_P2P_GOSSIPSUB_MESSAGE_ID";
 
+/// Period of the outbound ping on every connection. yamux and libp2p-tcp
+/// have no keepalive of their own: a flow dropped in silence by a NAT is
+/// noticed only through these pings.
+pub const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// An unanswered ping fails after this long.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(10);
+
 use crate::availability_codec::AvailabilityCodec;
 use crate::client_object_codec::ClientObjectCodec;
 use crate::header_protocol::MAX_HEADER_ANNOUNCE_BYTES;
@@ -594,7 +601,13 @@ impl NodeBehaviour {
                 .with_hide_listen_addrs(onion_only),
         );
 
-        let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30)));
+        // Liveness of every connection: the network closes a connection whose
+        // pings fail (libp2p-ping reports the second failure in a row).
+        let ping = ping::Behaviour::new(
+            ping::Config::new()
+                .with_interval(PING_INTERVAL)
+                .with_timeout(PING_TIMEOUT),
+        );
 
         // ----------------------------------------------------------------
         // NAT traversal: relay client + DCUtR
