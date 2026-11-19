@@ -872,7 +872,8 @@ fn run() -> anyhow::Result<()> {
     }
     let egress = cfg.egress()?;
     log(&format!("egress {egress:?} ({}), {} nodes, dry_run {}", cfg.profile()?, cfg.nodes.len(), cfg.dry_run));
-    std::fs::create_dir_all(&cfg.state_dir)?;
+    // F-7 (decision D-3): created 0700; on the public networks one others may read or write does not start it
+    jetsam_guardian::private_state_dir(&cfg.state_dir, cfg.profile()?.strict()).map_err(|e| anyhow::anyhow!("{e:#}: jg-fill does not start"))?;
     // A5-15: one robot per state_dir, held until the end
     let _lock = fill::lock_state_dir(&cfg.state_dir)?;
     // A5-14: a state.json present but unreadable stops the start here, before any socket

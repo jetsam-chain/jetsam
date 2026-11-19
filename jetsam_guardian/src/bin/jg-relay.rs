@@ -140,7 +140,7 @@ struct State {
     /// M5-2 (audit n°2): the seconds from the last plan to its proof ready (MN-5 is judged at now + this + inclusion).
     #[serde(default)]
     proof_secs: Option<u64>,
-    /// M-3 (external audit 2026-11-18): the host times of its own transactions' reverts in the last 24 h, raced or not.
+    /// M-3 (external audit 2026-11-18), D-0: the host times of its own transactions' reverts in the last `D_SLOW`, raced or not.
     #[serde(default)]
     revert_times: Vec<u64>,
 }
@@ -232,13 +232,11 @@ impl Relay {
     }
 
     fn event(&self, mut v: Value) {
-        use std::io::Write;
         if let Some(o) = v.as_object_mut() {
             o.insert("t".into(), json!(now_unix()));
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.events) {
-            let _ = writeln!(f, "{v}");
-        }
+        // I-2 (decision D-7): rolled over past EVENTS_MAX_BYTES
+        let _ = relayer::append_event(&self.events, &v.to_string(), relayer::EVENTS_MAX_BYTES);
     }
 
     fn view(&self, sig: &str, args: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -257,20 +255,19 @@ impl Relay {
     /// `<state_dir>/HALT`: it then sends nothing until an operator removes the file (D41).
     /// True when the halt is reached now (the caller sends nothing more).
     fn receipt_seen(&mut self, label: &str, status: bool, raced: bool) -> bool {
-        let (n, mut halt) = relayer::after_own_receipt(self.state.reverts, status, raced);
-        self.state.reverts = n;
+        // M-3, D-0: every revert counts toward a bound over D_SLOW of the host's clock, raced or not, above every point
+        // an honest relayer plans there
+        let cap = relayer::max_reverts(self.cfg.cadence_secs);
+        let halt = relayer::after_own_revert_receipt(&mut self.state.reverts, &mut self.state.revert_times, status, raced, now_unix(), cap);
         if !status {
+            let n = self.state.reverts;
             log(&format!("{label} reverted ({}; {n} unexplained in a row)", if raced { "another transaction landed first" } else { "unexplained" }));
-            // M-3: every revert counts toward a daily bound of the host's clock, raced or not
-            if let Some(code) = relayer::revert_budget(&mut self.state.revert_times, now_unix()) {
-                halt = halt.or(Some(code));
-            }
         }
         let Some(code) = halt else { return false };
         let why = if code == relayer::HALT_REVERT_BUDGET {
             // counted afresh once an operator removes the halt
             self.state.revert_times.clear();
-            format!("{} of its transactions reverted in 24 h, races included", relayer::MAX_REVERTS_PER_DAY)
+            format!("{cap} of its transactions reverted in {} s, races included", relayer::D_SLOW)
         } else {
             format!("{} of its transactions reverted in a row", jetsam_guardian::fill::MAX_CONSECUTIVE_REVERTS)
         };
@@ -1334,7 +1331,8 @@ fn run() -> anyhow::Result<()> {
         format!("STANDBY standby_after_secs {s}: a point only once the contract's newest point is {s} s old on the L1 clock")
     });
     log(&format!("config sha256 {digest}, {profile}, egress {egress:?}, {} nodes, cadence {} s, prover {}, {standby}", cfg.nodes.len(), cfg.cadence_secs, cfg.prover.mode));
-    std::fs::create_dir_all(&cfg.state_dir)?;
+    // F-7 (decision D-3): created 0700; on the public networks one others may read or write does not start it
+    jetsam_guardian::private_state_dir(&cfg.state_dir, profile.strict()).map_err(|e| anyhow::anyhow!("{e:#}: jg-relay does not start"))?;
     std::fs::create_dir_all(&cfg.publish_dir)?;
     // T7.7 (A3): the state directory is this process's for the whole run (an operator's acknowledge or import-block
     // meanwhile is refused instead of written over), taken before any socket

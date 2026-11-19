@@ -1046,18 +1046,61 @@ pub fn chain_from_bytes(genesis: crate::chain::HeaderInfo, bytes: &[u8]) -> anyh
     Ok(c)
 }
 
-/// M-3 (external audit 2026-11-18): reverts of the relayer's own transactions in 24 h of the host's clock at most,
-/// raced or not (a provider that explains each revert by a race no longer burns its key's gas without end).
-pub const MAX_REVERTS_PER_DAY: u32 = 6;
-/// M-3: the halt latched on reaching [`MAX_REVERTS_PER_DAY`].
+/// M-3 (external audit 2026-11-18) with A-2 (decision D-0): the reverts of the relayer's own transactions beyond the
+/// points an honest relayer plans, over any `D_SLOW` of the host's clock, raced or not (a provider that explains each
+/// revert by a race no longer burns its key's gas without end; two honest relayers racing for every point never halt).
+pub const REVERT_SLACK: u32 = 6;
+/// M-3: the halt latched on reaching [`max_reverts`].
 pub const HALT_REVERT_BUDGET: &str = "HALT_REVERT_BUDGET";
 
-/// M-3: one more revert at host time `now` (`times`: the earlier ones, kept 24 h): the halt when the day's count
-/// reaches [`MAX_REVERTS_PER_DAY`].
-pub fn revert_budget(times: &mut Vec<u64>, now: u64) -> Option<&'static str> {
-    times.retain(|t| t.saturating_add(86_400) > now);
+/// D-0: the reverts, races included, that halt the relayer over any `D_SLOW` of the host's clock: every point an
+/// honest relayer of cadence `cadence_secs` plans there (one per cadence, at most one per [`MN5_MIN_ELAPSED`]: each
+/// of them lost to a rival), plus [`REVERT_SLACK`]. 54 over 24 h on the mainnet (6 600 s), 8 over 1 h on the test chain.
+pub fn max_reverts(cadence_secs: u64) -> u32 {
+    let points = D_SLOW.div_ceil(cadence_secs.clamp(1, MN5_MIN_ELAPSED));
+    u32::try_from(points).unwrap_or(u32::MAX).saturating_add(REVERT_SLACK)
+}
+
+/// I-2 (external audit of the robots, decision D-7): the relayer's `events.jsonl` at most this long; past it, it
+/// becomes `events.jsonl.1` (the one before dropped) and a new one starts.
+pub const EVENTS_MAX_BYTES: u64 = 64 << 20;
+
+/// D-7: `line` appended to the event file `path` (a line of its own), the file first rolled over to `<path>.1` when
+/// the line would take it past `max_bytes`.
+pub fn append_event(path: &Path, line: &str, max_bytes: u64) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len > 0 && len.saturating_add(line.len() as u64 + 1) > max_bytes {
+        let mut old = path.as_os_str().to_os_string();
+        old.push(".1");
+        std::fs::rename(path, old)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
+/// F-3 (decision D-1): the daily gas budget of a relayer's local signer when its `[signer]` names none: every point an
+/// honest relayer of cadence `cadence_secs` sends in 24 h (one per cadence, at most one per [`MN5_MIN_ELAPSED`]) and
+/// [`REVERT_SLACK`] more, each at `max_gas`, plus its claim-direct budget (`claim_direct_daily_gas`). 172 M gas on the
+/// mainnet's defaults (54 × 3 M + 10 M): ≈ 0.018 ETH at Base's fees of 10/11/2026, 1.7 ETH at the 10 gwei cap.
+pub fn relay_default_gas_budget(cadence_secs: u64, max_gas: u64, claim_direct_daily_gas: u64) -> u64 {
+    let points = 86_400u64.div_ceil(cadence_secs.clamp(1, MN5_MIN_ELAPSED));
+    points.saturating_add(u64::from(REVERT_SLACK)).saturating_mul(max_gas).saturating_add(claim_direct_daily_gas)
+}
+
+/// M-3, D-0: the receipt of one of the relayer's own transactions at host time `now`: `reverts` (unexplained in a row,
+/// [`after_own_receipt`]) and `times` (every revert of the last `D_SLOW`, raced or not) updated; the halt, if one is
+/// reached (`cap`: [`max_reverts`]).
+pub fn after_own_revert_receipt(reverts: &mut u32, times: &mut Vec<u64>, status: bool, raced: bool, now: u64, cap: u32) -> Option<&'static str> {
+    let (n, halt) = after_own_receipt(*reverts, status, raced);
+    *reverts = n;
+    if status {
+        return halt;
+    }
+    times.retain(|t| t.saturating_add(D_SLOW) > now);
     times.push(now);
-    (times.len() >= MAX_REVERTS_PER_DAY as usize).then_some(HALT_REVERT_BUDGET)
+    halt.or((times.len() >= cap as usize).then_some(HALT_REVERT_BUDGET))
 }
 
 /// The relayer's latched halt (`<state_dir>/HALT`, its reasons, one a line), if any: while it is there, the relayer
@@ -1983,7 +2026,7 @@ fn default_claim_direct_daily_gas() -> u64 {
 impl RelayConfig {
     /// Parse and check; an error means jg-relay does not start.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let c: Self = toml::from_str(text)?;
+        let mut c: Self = toml::from_str(text)?;
         let profile = c.profile()?;
         let rehearsal = profile == crate::Profile::PrivateRehearsal;
         crate::relay::check_cadence(c.cadence_secs)?;
@@ -2041,6 +2084,15 @@ impl RelayConfig {
             profile != crate::Profile::Mainnet || c.alert_command.first().is_some_and(|p| !p.is_empty()),
             "alert_command is required on {profile}: its alerts (a halt, a refused reorganization, nodes that disagree, steps that fail) must leave the logs"
         );
+        // F-3 (decision D-1): a local signer always has a daily gas budget (above an honest relayer's day) and Base's
+        // fee cap, unless its `[signer]` names others (the rehearsal's endpoint account: unchanged)
+        if c.signer.holds_hot_key(profile) {
+            let budget = relay_default_gas_budget(c.cadence_secs, c.signer.max_gas, c.claim_direct_daily_gas);
+            c.signer.daily_gas_budget.get_or_insert(budget);
+            if c.signer.max_fee_per_gas_wei == crate::l1tx::FeePolicy::default().max_fee_per_gas as u64 {
+                c.signer.max_fee_per_gas_wei = crate::fill::BASE_MAX_FEE_PER_GAS;
+            }
+        }
         Ok(c)
     }
 

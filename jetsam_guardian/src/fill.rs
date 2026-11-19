@@ -1048,6 +1048,10 @@ pub struct KeptBodies {
     dir: PathBuf,
 }
 
+/// I-2 (external audit of the robots, decision D-7): the copies kept of one block at most (a few sources, each under
+/// [`crate::relayer::UNREADABLE_COPY_MAX_BYTES`]; a node serving endless variants fills no disk).
+pub const MAX_KEPT_COPIES: usize = 8;
+
 impl KeptBodies {
     /// The kept bodies of the state directory `state_dir`.
     pub fn open(state_dir: &Path) -> anyhow::Result<Self> {
@@ -1085,7 +1089,12 @@ impl KeptBodies {
     /// Keep each of `served` (source, bytes) that carries the header of block `id`, not kept yet: how many now.
     pub fn keep(&self, height: u64, id: &[u8; 32], served: &[(String, Vec<u8>)]) -> anyhow::Result<usize> {
         let mut kept = 0;
+        // I-2 (decision D-7): at most MAX_KEPT_COPIES copies a block, whatever its sources serve
+        let mut held = self.files(height, id).len();
         for (_, raw) in served {
+            if held >= MAX_KEPT_COPIES {
+                break;
+            }
             if raw.len() > crate::relayer::UNREADABLE_COPY_MAX_BYTES || crate::relayer::served_block_id(raw) != Some(*id) {
                 continue;
             }
@@ -1096,6 +1105,7 @@ impl KeptBodies {
             std::fs::create_dir_all(&self.dir)?;
             crate::write_atomic(&path, raw)?;
             kept += 1;
+            held += 1;
         }
         Ok(kept)
     }

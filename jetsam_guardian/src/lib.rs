@@ -200,6 +200,32 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// F-7 (external audit of the robots, decision D-3): a robot's state directory, created 0700 when it is missing; with
+/// `required` (the public networks) an existing one must be a directory (not a symbolic link) of this process's user
+/// that no one else may read, write or enter (whoever writes there may remove `HALT` or `gas.json`). An error: no start.
+pub fn private_state_dir(dir: &std::path::Path, required: bool) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if std::fs::symlink_metadata(dir).is_err() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| anyhow::anyhow!("state_dir {}: {e}", dir.display()))?;
+    }
+    if !required {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| anyhow::anyhow!("state_dir {}: {e}", dir.display()))?;
+    anyhow::ensure!(!meta.file_type().is_symlink(), "state_dir {}: a symbolic link: name the directory itself", dir.display());
+    anyhow::ensure!(meta.is_dir(), "state_dir {}: not a directory", dir.display());
+    // SAFETY: geteuid has no precondition
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(meta.uid() == euid, "state_dir {}: owned by uid {}, not this process's {euid}", dir.display(), meta.uid());
+    anyhow::ensure!(
+        meta.mode() & 0o077 == 0,
+        "state_dir {}: mode {:o}, it must be private to its owner (0700): chmod 700 it",
+        dir.display(),
+        meta.mode() & 0o777
+    );
+    Ok(())
+}
+
 /// A5-14: write `bytes` to `path` so that a stop or a power cut leaves either the previous file or the new one,
 /// whole: a temporary beside it under its own name (`<file name>.tmp`, replaced if a crash left one), synced
 /// (`sync_all`), renamed over `path`, then its directory synced (the rename itself is on disk when it returns).

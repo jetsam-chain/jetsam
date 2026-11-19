@@ -83,6 +83,12 @@ thiserror   = "1"
 lto = "thin"
 codegen-units = 1
 
+# I-3 (external audit of the robots, decision D-8): the robots (jetsam_guardian's library and its jg-* binaries)
+# check their arithmetic in release builds too: an overflow stops a robot instead of wrapping a balance, a cap or a
+# count. The node does not depend on jetsam_guardian: its builds are unchanged.
+[profile.release.package.jetsam_guardian]
+overflow-checks = true
+
 [profile.bench]
 lto = "thin"
 codegen-units = 1
