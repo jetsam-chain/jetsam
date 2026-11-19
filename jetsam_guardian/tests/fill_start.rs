@@ -119,6 +119,24 @@ fn a5_14_write_atomic_syncs_the_file_then_renames_it_then_syncs_the_directory() 
     assert!(f < r && r < d, "the file synced, then renamed, then the directory synced:\n{text}");
 }
 
+/// F-7 (external audit of the robots): a `<name>.tmp` planted as a symbolic link by whoever may write the state
+/// directory is never written through: the file it names stays as it was, and the state written is a file of its own.
+#[test]
+fn f7_write_atomic_never_writes_through_a_planted_tmp_link() {
+    if std::env::var_os("JG_WRITE_ATOMIC_CHILD").is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, b"untouched").unwrap();
+    let target = dir.path().join("state.json");
+    std::os::unix::fs::symlink(&victim, dir.path().join("state.json.tmp")).unwrap();
+    jetsam_guardian::write_atomic(&target, b"{\"new\":1}").unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched", "the planted link's target is never written");
+    assert!(!std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink(), "the state is a file, not the planted link");
+    assert_eq!(std::fs::read(&target).unwrap(), b"{\"new\":1}");
+}
+
 #[test]
 fn a5_14_write_atomic_child() {
     let Some(target) = std::env::var_os("JG_WRITE_ATOMIC_CHILD") else { return };

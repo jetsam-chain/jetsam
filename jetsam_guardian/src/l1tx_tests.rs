@@ -109,6 +109,21 @@ fn a_key_file_is_read_only_when_it_is_private_to_its_owner() {
     }
 }
 
+/// F-7 (external audit of the robots): a hot key is read from the file itself, never through a symbolic link (its mode
+/// and owner are those of the descriptor read, no window between the check and the read).
+#[test]
+fn f7_a_hot_key_behind_a_symbolic_link_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    let p = write_key(dir.path(), k, 0o600);
+    let link = dir.path().join("link.key");
+    std::os::unix::fs::symlink(&p, &link).unwrap();
+    let e = HotKey::load(&link).err().expect("a hot key behind a link is refused").to_string();
+    assert!(e.contains("symbolic link"), "{e}");
+    assert!(!e.contains(k), "the error never shows the key");
+    assert!(HotKey::load(&p).is_ok(), "the file itself is read");
+}
+
 #[test]
 fn a_hot_key_never_prints_its_secret() {
     let k = crate::parse32("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
