@@ -217,3 +217,49 @@ async fn a_connection_that_dies_in_silence_is_closed_and_the_seed_dialled_again(
         "the seed is dialled again through a new flow"
     );
 }
+
+/// Seen on the test chain (2026-11-19): a node restarted while the router
+/// had forgotten its flow to the seed. The seed still held the dead
+/// connection, already identified, and refused the restarted node's new one
+/// (same identity, same direction) until the dead one was gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_peer_is_accepted_while_its_old_connection_is_silent() {
+    let directories = [(); 3].map(|()| tempfile::tempdir().unwrap());
+    let seed_port = free_port();
+    let (seed, _seed_task) = start(directories[0].path(), seed_port).await;
+    drain(seed.subscribe());
+    let nat = Nat::spawn(seed_port).await;
+
+    let (node, node_task) = start(directories[1].path(), free_port()).await;
+    let mut events = node.subscribe();
+    node.dial(loopback(nat.port)).await;
+    let seed_peer = connected(&mut events, None, Duration::from_secs(120))
+        .await
+        .expect("the node reaches its seed through the router");
+
+    // The router forgets the flow, and the node restarts with its identity.
+    nat.forget_flows();
+    let forgotten_at = tokio::time::Instant::now();
+    node_task.abort();
+    drop((node, events));
+    std::fs::copy(
+        directories[1].path().join("p2p_identity.key"),
+        directories[2].path().join("p2p_identity.key"),
+    )
+    .unwrap();
+    let (restarted, _restarted_task) = start(directories[2].path(), free_port()).await;
+    let mut restarted_events = restarted.subscribe();
+
+    // The seed's last answered ping on the dead path came before the flow
+    // was forgotten: 30.5 s later that path has answered nothing for two
+    // 15 s ping intervals. libp2p-ping reports such a path failed only after
+    // two timed-out pings, at least 35 s after its last answer: the seed's
+    // choice is made here by the duplicate rule alone.
+    tokio::time::sleep_until(forgotten_at + Duration::from_millis(30_500)).await;
+    restarted.dial(loopback(nat.port)).await;
+    assert_eq!(
+        connected(&mut restarted_events, Some(seed_peer), Duration::from_secs(4)).await,
+        Some(seed_peer),
+        "the seed accepts the restarted peer instead of keeping the silent path"
+    );
+}

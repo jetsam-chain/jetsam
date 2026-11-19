@@ -1148,6 +1148,10 @@ impl PeerSyncPaths {
         }
     }
 
+    fn note_ping_success(&mut self, _connection_id: libp2p::swarm::ConnectionId, _at: Instant) {
+        todo!("P2PFIX-B")
+    }
+
     fn mark_availability_capable(&mut self, connection_id: libp2p::swarm::ConnectionId) {
         if let Some(path) = self.paths.get_mut(&connection_id) {
             path.availability_capable = true;
@@ -10847,6 +10851,99 @@ mod tests {
 
         assert_eq!(paths.remove(duplicate), Some(peer));
         assert!(paths.is_dispatchable(peer));
+    }
+
+    /// Moves the start of a path `ago` into the past.
+    fn age_path(
+        paths: &mut PeerSyncPaths,
+        connection: libp2p::swarm::ConnectionId,
+        ago: Duration,
+    ) {
+        paths.paths.get_mut(&connection).unwrap().established_at =
+            Instant::now().checked_sub(ago).unwrap();
+    }
+
+    /// Seen on the test chain (2026-11-19): the router on the LAN exit
+    /// silently dropped an established flow and the peer behind it
+    /// restarted. Its new connection came in the same direction as the dead
+    /// one, and was refused for about 16 minutes because the dead one was
+    /// already identified. A path that has answered no ping for two 15 s
+    /// intervals is the one to drop, on both ends of the duplicate.
+    #[test]
+    fn a_same_direction_duplicate_replaces_a_path_that_stopped_answering_pings() {
+        for dialer in [false, true] {
+            let local = PeerId::random();
+            let peer = PeerId::random();
+            let silent = libp2p::swarm::ConnectionId::new_unchecked(10_601);
+            let new = libp2p::swarm::ConnectionId::new_unchecked(10_602);
+            let mut paths = PeerSyncPaths::default();
+            paths.insert(silent, peer, true, dialer);
+            paths.mark_identified(silent);
+            paths.mark_profile_verified(peer);
+            assert!(paths.try_mark_announced(peer));
+            age_path(&mut paths, silent, Duration::from_secs(31));
+
+            paths.insert(new, peer, true, dialer);
+            assert_eq!(
+                paths.canonicalize_direct(local, peer, new),
+                vec![silent],
+                "dialer={dialer}"
+            );
+            assert!(paths.is_closing(silent));
+            assert!(!paths.is_closing(new));
+            assert_eq!(paths.remove(silent), Some(peer));
+            paths.mark_identified(new);
+            assert!(paths.is_dispatchable(peer), "dialer={dialer}");
+        }
+    }
+
+    /// Two healthy nodes, one dialling the other twice (a cached address and
+    /// a DNS seed resolving to the same node): the dialer and the listener
+    /// both keep the established path, so neither closes the one the other
+    /// keeps.
+    #[test]
+    fn a_same_direction_duplicate_keeps_a_path_that_answers_pings() {
+        for dialer in [false, true] {
+            let local = PeerId::random();
+            let peer = PeerId::random();
+            let alive = libp2p::swarm::ConnectionId::new_unchecked(10_701);
+            let new = libp2p::swarm::ConnectionId::new_unchecked(10_702);
+            let mut paths = PeerSyncPaths::default();
+            paths.insert(alive, peer, true, dialer);
+            paths.mark_identified(alive);
+            age_path(&mut paths, alive, Duration::from_secs(600));
+            paths.note_ping_success(
+                alive,
+                Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
+            );
+
+            paths.insert(new, peer, true, dialer);
+            assert_eq!(
+                paths.canonicalize_direct(local, peer, new),
+                vec![new],
+                "dialer={dialer}"
+            );
+            assert!(!paths.is_closing(alive));
+        }
+    }
+
+    /// Opposite-direction duplicates keep the PeerId rule, whatever the
+    /// pings say: both ends must pick the same physical path.
+    #[test]
+    fn cross_dials_keep_the_peer_id_rule_when_the_old_path_is_silent() {
+        let (lower, higher) = ordered_peer_ids();
+        let silent_outbound = libp2p::swarm::ConnectionId::new_unchecked(10_801);
+        let new_inbound = libp2p::swarm::ConnectionId::new_unchecked(10_802);
+        let mut paths = PeerSyncPaths::default();
+        paths.insert(silent_outbound, higher, true, true);
+        paths.mark_identified(silent_outbound);
+        age_path(&mut paths, silent_outbound, Duration::from_secs(600));
+        paths.insert(new_inbound, higher, true, false);
+        assert_eq!(
+            paths.canonicalize_direct(lower, higher, new_inbound),
+            vec![new_inbound],
+            "the lower PeerId keeps its outbound half"
+        );
     }
 
     #[test]
