@@ -436,6 +436,48 @@ fn the_relayer_refuses_to_start_with_a_mock_prover_an_endpoint_signer_or_a_caden
     assert!(RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}bogus = 1\n"))).is_err(), "unknown field");
 }
 
+/// I-2 (external audit of the robots, decision D-7): the relayer's `events.jsonl` never grows without end: past
+/// `EVENTS_MAX_BYTES` it becomes `events.jsonl.1` (the one before dropped) and a new one starts; no line is lost or cut.
+#[test]
+fn d7_the_relayers_events_roll_over_past_their_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let line = "x".repeat(99);
+    for _ in 0..25 {
+        append_event(&path, &line, 1_000).unwrap();
+    }
+    let now = std::fs::read_to_string(&path).unwrap();
+    let before = std::fs::read_to_string(dir.path().join("events.jsonl.1")).unwrap();
+    assert!(now.len() <= 1_000 && before.len() <= 1_000, "{} {}", now.len(), before.len());
+    assert!(now.lines().chain(before.lines()).all(|l| l == line), "whole lines only");
+    assert_eq!((before.lines().count(), now.lines().count()), (10, 5), "lines 11..=20 kept, 21..=25 in the new one");
+    assert_eq!(EVENTS_MAX_BYTES, 64 << 20);
+}
+
+/// F-3 (decision D-1): a local signer of jg-relay left without a daily gas budget gets one above everything an honest
+/// relayer sends in 24 h (one point per cadence, at most one per 1 800 s, each at `max_gas`, plus `REVERT_SLACK` lost
+/// ones, plus its claim-direct budget), and the generic fee cap (200 gwei) becomes Base's (10 gwei, as jg-fill's);
+/// a configured value is kept; the rehearsal's endpoint account is left as it was.
+#[test]
+fn d1_the_relayers_signer_has_a_daily_gas_budget_and_bases_fee_cap_by_default() {
+    let mainnet = hex::encode(crate::MAINNET_NETWORK);
+    let bridge = "0x1111111111111111111111111111111111111111";
+    let cmd = "[prover]\nmode = \"command\"\ncommand = [\"/bin/prove\", \"{input}\", \"{proof}\"]\n";
+    let signer = "[signer]\nkey_file = \"/k\"\npriority_fee_wei = 1000000\n";
+    assert_eq!(relay_default_gas_budget(6_600, 3_000_000, DEFAULT_CLAIM_DIRECT_DAILY_GAS), (48 + u64::from(REVERT_SLACK)) * 3_000_000 + 10_000_000);
+    assert_eq!(relay_default_gas_budget(2, 3_000_000, 0), (43_200 + u64::from(REVERT_SLACK)) * 3_000_000);
+    let c = RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}{signer}"))).unwrap();
+    assert_eq!(c.signer.daily_gas_budget, Some(172_000_000));
+    assert_eq!(c.signer.max_fee_per_gas_wei, crate::fill::BASE_MAX_FEE_PER_GAS);
+    let c = RelayConfig::parse(&relay_toml(&mainnet, 1, bridge, &format!("{cmd}{signer}daily_gas_budget = 5000000\nmax_fee_per_gas_wei = 50000000000\n"))).unwrap();
+    assert_eq!((c.signer.daily_gas_budget, c.signer.max_fee_per_gas_wei), (Some(5_000_000), 50_000_000_000), "configured: kept");
+    // the rehearsal's endpoint account (no [signer]): no budget, as before
+    let rehearsal = hex::encode(testkit::genesis().id);
+    if let Ok(c) = RelayConfig::parse(&relay_toml(&rehearsal, 31_337, bridge, "")) {
+        assert_eq!(c.signer, crate::l1tx::SignerConfig::default());
+    }
+}
+
 /// E-10 (audit 2026-11-10): the relayer reads the network's deposits with its build's v1.7 clock (`VaultRules::current`,
 /// as `jg-fill`'s `FillConfig::build_matches`): the configuration's F must be the build's; a stale build (D104,
 /// F moved from 9 600 to 8 704) or a build without v1.7 does not start.
@@ -1977,18 +2019,46 @@ fn m1_a_header_with_a_forged_target_or_no_proof_of_work_is_not_taken() {
     assert_eq!(admit_header(&anchored, &good, &s, &mut |_| true), Err("BAD_TARGET"), "no target known: never taken");
 }
 
-/// M-3 (relayer side): every revert counts toward a daily bound of its own (the host's clock), raced or not: a provider
-/// that explains each revert by a race no longer burns the key's gas without end.
+/// M-3 with A-2 (decision D-0): the bound on reverts, races included, sits above every point an honest relayer may
+/// plan over `D_SLOW` (one per cadence, at most one per `MN5_MIN_ELAPSED`), plus `REVERT_SLACK`: two honest relayers
+/// racing for every point never halt each other. 54 over 24 h on the mainnet (cadence 6 600 s), 8 over 1 h on the
+/// test chain; the rehearsal's cadence of 2 s gives a bound no race reaches.
 #[test]
-fn m3_reverts_explained_by_a_race_are_bounded_per_day_too() {
-    let mut times = Vec::new();
-    for i in 0..MAX_REVERTS_PER_DAY - 1 {
-        assert_eq!(revert_budget(&mut times, 1_000 + i as u64), None);
+fn d0_the_revert_bound_sits_above_every_point_an_honest_relayer_plans() {
+    assert_eq!(max_reverts(6_600), D_SLOW.div_ceil(MN5_MIN_ELAPSED) as u32 + REVERT_SLACK);
+    if jetsam_vault_rule::TESTNET_PROFILE {
+        assert_eq!(max_reverts(6_600), 8);
+    } else {
+        assert_eq!(max_reverts(6_600), 54);
     }
-    assert_eq!(revert_budget(&mut times, 2_000), Some(HALT_REVERT_BUDGET));
-    let mut times = vec![1_000; (MAX_REVERTS_PER_DAY - 1) as usize];
-    assert_eq!(revert_budget(&mut times, 1_000 + 86_400), None, "a day later: the old ones are forgotten");
+    assert_eq!(max_reverts(1_000), D_SLOW.div_ceil(1_000) as u32 + REVERT_SLACK, "a cadence below 1 800 s: one point per cadence");
+    assert_eq!(max_reverts(2), D_SLOW.div_ceil(2) as u32 + REVERT_SLACK);
+    assert_eq!(max_reverts(0), D_SLOW as u32 + REVERT_SLACK, "never a division by zero");
+}
+
+/// M-3 (relayer side, decision D-0): a provider that explains EVERY revert by a race (none counted in a row) still
+/// halts the relayer once the bound is reached over `D_SLOW` of the host's clock; a race one `D_SLOW` old is forgotten.
+#[test]
+fn d0_a_provider_that_calls_every_revert_a_race_is_halted_at_the_bound() {
+    let cap = max_reverts(6_600);
+    let (mut reverts, mut times) = (0, Vec::new());
+    for i in 0..cap - 1 {
+        let halt = after_own_revert_receipt(&mut reverts, &mut times, false, true, 1_000 + u64::from(i), cap);
+        assert_eq!((reverts, halt), (0, None), "race {i}: not counted in a row, below the bound");
+    }
+    assert_eq!(after_own_revert_receipt(&mut reverts, &mut times, false, true, 1_000 + u64::from(cap), cap), Some(HALT_REVERT_BUDGET), "the bound reached: halted");
+    let mut times = vec![1_000; (cap - 1) as usize];
+    assert_eq!(after_own_revert_receipt(&mut 0, &mut times, false, true, 1_000 + D_SLOW, cap), None, "one D_SLOW later: the old ones are forgotten");
     assert_eq!(times.len(), 1);
+    // the bound reached at once: the halt
+    let mut times = vec![5_000; (cap - 1) as usize];
+    assert_eq!(after_own_revert_receipt(&mut 0, &mut times, false, true, 5_001, cap), Some(HALT_REVERT_BUDGET));
+    // an unexplained revert still counts in a row too; a mined transaction counts nothing
+    let (mut reverts, mut times) = (0, Vec::new());
+    assert_eq!(after_own_revert_receipt(&mut reverts, &mut times, false, false, 10, cap), None);
+    assert_eq!((reverts, times.len()), (1, 1));
+    assert_eq!(after_own_revert_receipt(&mut reverts, &mut times, true, false, 11, cap), None);
+    assert_eq!((reverts, times.len()), (0, 1));
 }
 
 /// F-4: a HALT file that cannot be read (anything but "absent") halts: never "not halted" on an error.

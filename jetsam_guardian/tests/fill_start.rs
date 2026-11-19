@@ -137,6 +137,34 @@ fn f7_write_atomic_never_writes_through_a_planted_tmp_link() {
     assert_eq!(std::fs::read(&target).unwrap(), b"{\"new\":1}");
 }
 
+/// F-7 (decision D-3): the state directory of a robot holding a hot key (`jg-relay`, `jg-fill`) is created 0700; on
+/// the public networks one that others may read or write (or a symbolic link, or another user's) does not start it
+/// (whoever writes there may remove `HALT` or `gas.json`); on the private rehearsal it is not checked.
+#[test]
+fn d3_a_robots_state_dir_is_private_to_its_user_on_the_public_networks() {
+    if std::env::var_os("JG_WRITE_ATOMIC_CHILD").is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("a/state");
+    jetsam_guardian::private_state_dir(&fresh, true).unwrap();
+    assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o700, "created 0700");
+    jetsam_guardian::private_state_dir(&fresh, true).unwrap();
+    let open = dir.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    for mode in [0o755, 0o750, 0o711, 0o770, 0o707] {
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(mode)).unwrap();
+        let e = jetsam_guardian::private_state_dir(&open, true).unwrap_err().to_string();
+        assert!(e.contains("0700"), "{mode:o}: {e}");
+        assert!(jetsam_guardian::private_state_dir(&open, false).is_ok(), "{mode:o}: the rehearsal does not check it");
+    }
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&open, &link).unwrap();
+    let e = jetsam_guardian::private_state_dir(&link, true).unwrap_err().to_string();
+    assert!(e.contains("symbolic link"), "{e}");
+}
+
 #[test]
 fn a5_14_write_atomic_child() {
     let Some(target) = std::env::var_os("JG_WRITE_ATOMIC_CHILD") else { return };

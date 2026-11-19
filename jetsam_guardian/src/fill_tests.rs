@@ -2227,6 +2227,25 @@ fn relfix2_jg_fill_keeps_the_bytes_of_a_block_it_cannot_read_and_reads_them_agai
     assert_eq!(KeptBodies::open(dir.path()).unwrap().copies(F + 1, &id).len(), 1);
 }
 
+/// I-2 (external audit of the robots, decision D-7): a node that serves endless variants of one block's bytes (each
+/// with its header, each another keccak) never fills the disk: at most `MAX_KEPT_COPIES` copies a block are kept.
+#[test]
+fn d7_jg_fill_keeps_a_bounded_number_of_copies_of_one_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = KeptBodies::open(dir.path()).unwrap();
+    let (raw, id) = raw_and_id(&block_of(F + 1, vec![deposit_tx(100, rcpt(0xa1), 7 * JTM)]));
+    let served: Vec<(String, Vec<u8>)> = (0..20u8)
+        .map(|i| {
+            let mut r = raw.clone();
+            r.push(i);
+            (format!("n{i} getBlock"), r)
+        })
+        .collect();
+    assert_eq!(kept.keep(F + 1, &id, &served).unwrap(), MAX_KEPT_COPIES);
+    assert_eq!(kept.copies(F + 1, &id).len(), MAX_KEPT_COPIES);
+    assert_eq!(kept.keep(F + 1, &id, &[("n0 getBlock".into(), raw.clone())]).unwrap(), 0, "full: no more for this block");
+}
+
 
 // ---------------------------------------------------------------- external audit 2026-11-18 (jg-fill side)
 
