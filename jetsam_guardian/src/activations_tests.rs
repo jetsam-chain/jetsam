@@ -109,9 +109,12 @@ fn activ_every_field_that_differs_refuses_the_node_and_is_named() {
     let built = this_build();
     let keys: Vec<String> = built.as_object().unwrap().keys().cloned().collect();
     // 14 since FIXRC (`return_fix_height`): a program of before refuses a node of this build at its start; 15 on a
-    // build with a second bridge (BRIDGE2: `base_return_bridge_rotations`, the test chain's).
+    // build with a second bridge (BRIDGE2: `base_return_bridge_rotations`, the test chain's); one more on a build
+    // whose FIXEXT height is armed (BRIDGE3: `fixext_height`, the test chain's 13 500).
     let tables = usize::from(built.get("base_return_bridge_rotations").is_some());
-    assert_eq!(keys.len(), 14 + tables, "{keys:?}");
+    let fixext = usize::from(built.get("fixext_height").is_some());
+    assert_eq!(fixext, usize::from(jetsam_chain::consensus::params::V1_7_FIXEXT_HEIGHT.is_some()));
+    assert_eq!(keys.len(), 14 + tables + fixext, "{keys:?}");
     for key in &keys {
         let value = other(&built[key]);
         let published = with(key, Some(value.clone()));

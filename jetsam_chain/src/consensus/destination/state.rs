@@ -421,33 +421,63 @@ pub const BASE_RETURN_BRIDGE2: L1BridgeParams = L1BridgeParams {
     ],
 };
 
+/// The test chain's third bridge (`v3-fixext` 9aac4fc, profile
+/// `testnet-bridge3`: J 13 200, F 13 600, first burn 2 000 000, TN1's test
+/// verifier and adapters; no outstanding ceiling C-6): its CREATE2 address and
+/// runtime code hash with its immutables, read back on Base Sepolia after its
+/// deployment of 19/11 (block 60 843 869, tx 0x6f09a52b…22f0), `withdrawals` at
+/// slot 9 and `genesisId` at slot 13 (layout unchanged). `genesis_id` is its
+/// `genesisId()` read back after its `initGenesis` locked the locked block of
+/// BRIDGE2B's last point (no deposit BRIDGE2B could mint is in its tree).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const BASE_RETURN_BRIDGE3: L1BridgeParams = L1BridgeParams {
+    address: [
+        0x3b, 0x1c, 0x5c, 0x35, 0xc5, 0x2a, 0x8d, 0xab, 0xa3, 0xc6, 0xf8, 0xb7, 0x48, 0x1d, 0x2e,
+        0xe2, 0x5e, 0x27, 0xa4, 0xce,
+    ],
+    code_hash: [
+        0xca, 0xae, 0xae, 0x5c, 0x02, 0xd7, 0x7a, 0xd2, 0x6b, 0xa4, 0x9b, 0x7e, 0x2c, 0xe8, 0xd0,
+        0x26, 0xf0, 0x9a, 0xa0, 0x63, 0xa0, 0x62, 0x3e, 0x95, 0x01, 0x14, 0xaa, 0x73, 0xbe, 0xbe,
+        0xbc, 0xfe,
+    ],
+    withdrawals_slot: 9,
+    genesis_id_slot: 13,
+    genesis_id: [0x43, 0x68, 0x8e, 0x07, 0x1d, 0xf1, 0xfd, 0x20, 0x83, 0x85, 0x55, 0x7a, 0xc6, 0x6f, 0x83, 0x66, 0x40, 0x8a, 0xa3, 0xe8, 0x7c, 0x07, 0x57, 0x03, 0x39, 0xbb, 0x13, 0x51, 0x5e, 0x1b, 0x4c, 0xd0],
+};
+
 /// The bridges the return over Base reads after its first, each from its
 /// height on (BRIDGE2): empty on the public network and the private
 /// rehearsal.
 #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
 pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[];
-/// The test chain's: its second bridge from [`V1_7_BRIDGE2_HEIGHT`] on.
-///
-/// TODO(FIXEXT-CAP): the test chain's third bridge, the contract without C-6
-/// (`v3-fixext` from FIXEXT-CAP on), once deployed and its `initGenesis` made:
-/// a second entry `BridgeRotation { height: <its switch height, its F, above
-/// V1_7_BRIDGE2_HEIGHT>, bridge: BASE_RETURN_BRIDGE3 (its CREATE2 address, its
-/// runtime code hash read back on Base Sepolia, withdrawals_slot 9,
-/// genesis_id_slot 13, its genesisId() after initGenesis), first_burn: <its
-/// nextBurnIndex at deployment, ≥ 1 000 000>, outstanding_ceil: None }`, with
-/// its deployment vector in `jetsam_bridge_xtest` (which holds `None` to a
-/// code without `OUTSTANDING_CEIL()`). V8 is then lifted from that height on.
+/// The test chain's: its second bridge from [`V1_7_BRIDGE2_HEIGHT`] on, its
+/// third (BRIDGE3, the contract without C-6: V8 lifted) from
+/// [`V1_7_BRIDGE3_HEIGHT`] on (its deployment vector in `jetsam_bridge_xtest`
+/// holds `None` to a code without `OUTSTANDING_CEIL()`).
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[BridgeRotation {
-    height: match V1_7_BRIDGE2_HEIGHT {
-        Some(h) => h,
-        None => panic!("the test chain arms V1_7_BRIDGE2_HEIGHT with its second bridge"),
+pub const BASE_RETURN_BRIDGE_ROTATIONS: &[BridgeRotation] = &[
+    BridgeRotation {
+        height: match V1_7_BRIDGE2_HEIGHT {
+            Some(h) => h,
+            None => panic!("the test chain arms V1_7_BRIDGE2_HEIGHT with its second bridge"),
+        },
+        bridge: BASE_RETURN_BRIDGE2,
+        first_burn: 1_000_000,
+        // FIXEXT-CAP: BRIDGE2B's code (b54fa07) has C-6.
+        outstanding_ceil: Some(VAULT_OUTSTANDING_CEIL_MICRO),
     },
-    bridge: BASE_RETURN_BRIDGE2,
-    first_burn: 1_000_000,
-    // FIXEXT-CAP: BRIDGE2B's code (b54fa07) has C-6.
-    outstanding_ceil: Some(VAULT_OUTSTANDING_CEIL_MICRO),
-}];
+    BridgeRotation {
+        height: match crate::consensus::params::V1_7_BRIDGE3_HEIGHT {
+            Some(h) => h,
+            None => panic!("the test chain arms V1_7_BRIDGE3_HEIGHT with its third bridge"),
+        },
+        bridge: BASE_RETURN_BRIDGE3,
+        // above every n BRIDGE2B gives (from 1 000 000 on)
+        first_burn: 2_000_000,
+        // FIXEXT-CAP: the code of v3-fixext (9aac4fc) has no C-6.
+        outstanding_ceil: None,
+    },
+];
 
 /// Whether a bridge table may sit beside the return's first bridge `first`,
 /// its height `base_return` and the second-bridge height `bridge2`: empty

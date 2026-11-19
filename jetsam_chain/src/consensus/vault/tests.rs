@@ -3101,7 +3101,7 @@ fn fixextcap_the_lift_overrides_the_caps_of_before() {
 }
 
 /// This build's lift height is its bridge table's: the first bridge without C-6 (`Some(0)`: the network's
-/// first), none while every bridge has C-6 (the test chain today: TN1's bridge and BRIDGE2B's).
+/// first), none while every bridge has C-6 (the rehearsal); the test chain's: its third bridge's height (BRIDGE3).
 #[test]
 fn fixextcap_this_builds_lift_height_is_its_bridge_tables() {
     use crate::consensus::destination::state::{
@@ -3116,9 +3116,12 @@ fn fixextcap_this_builds_lift_height_is_its_bridge_tables() {
     assert_eq!(current.outstanding_ceil_lifted_at, Some(0), "the public network's bridge has no C-6");
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     assert_eq!(
-        current.outstanding_ceil_lifted_at, None,
-        "TODO(FIXEXT-CAP): the test chain's bridge without C-6 is not in its table yet"
+        current.outstanding_ceil_lifted_at,
+        crate::consensus::params::V1_7_BRIDGE3_HEIGHT,
+        "BRIDGE3: V8 lifted from the test chain's third bridge (no C-6) on"
     );
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    assert_eq!(current.outstanding_ceil_lifted_at, Some(13_600));
     #[cfg(feature = "rehearsal-v1-7")]
     assert_eq!(current.outstanding_ceil_lifted_at, None, "the rehearsal keeps V8");
 }

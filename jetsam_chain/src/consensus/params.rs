@@ -730,15 +730,19 @@ const _: () = assert!(
 ///
 /// **On the public network: the return-over-Base height itself** (its return
 /// is dormant: these rules are part of it from its first block, no height of
-/// their own: [`fixext_schedule_is_valid`] holds them equal). **`None` on the
-/// test chain** until the operator chooses a height above the tip of the day,
-/// every node redeployed before it (a node without it accepts a stale read
-/// the others refuse: a hard fork of the test chain at that height). **Easy
-/// to move: this constant only.**
+/// their own: [`fixext_schedule_is_valid`] holds them equal). **On the test
+/// chain: 13 500** (BRIDGE3, 19/11), a height the operator chose above the tip
+/// of the day, every node redeployed before it (a node without it accepts a
+/// stale read the others refuse: a hard fork of the test chain at that
+/// height), below its third bridge's height (13 600). **Easy to move: this
+/// constant only.**
 #[cfg(not(feature = "testnet"))]
 pub const V1_7_FIXEXT_HEIGHT: Option<u64> = V1_7_BASE_RETURN_HEIGHT;
-/// The test chain's: not chosen.
-#[cfg(feature = "testnet")]
+/// The test chain's (BRIDGE3: chosen, 13 500).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_FIXEXT_HEIGHT: Option<u64> = Some(13_500);
+/// The private rehearsal's: dormant (its return is).
+#[cfg(feature = "rehearsal-v1-7")]
 pub const V1_7_FIXEXT_HEIGHT: Option<u64> = None;
 
 /// FIXEXT E-1: the oldest L1 block (by its execution timestamp) a block may
@@ -818,6 +822,42 @@ pub const fn bridge2_schedule_is_valid(base_return_activation: Option<u64>, brid
 const _: () = assert!(
     bridge2_schedule_is_valid(V1_7_BASE_RETURN_HEIGHT, V1_7_BRIDGE2_HEIGHT),
     "V1_7_BRIDGE2_HEIGHT must be None, or strictly above an armed V1_7_BASE_RETURN_HEIGHT"
+);
+
+/// BRIDGE3 (19/11): from this height on, the return over Base reads the test
+/// chain's third bridge (`v3-fixext` 9aac4fc: the external audit's fixes, no
+/// outstanding ceiling C-6) instead of the second one (BRIDGE2B), abandoned:
+/// the second entry of the bridge table of `destination::state`
+/// (`BASE_RETURN_BRIDGE_ROTATIONS`), with V8 lifted from it on. Below it every
+/// block is judged exactly as before.
+///
+/// **`None` on the public network and the private rehearsal.** On the test
+/// chain: 13 600, the new bridge's `depositsFromHeight` (its genesis window
+/// [13 200 ; 13 600] ends at it: a constructor argument, hence its address),
+/// every node and every robot redeployed before it.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_BRIDGE3_HEIGHT: Option<u64> = None;
+/// The test chain's.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_BRIDGE3_HEIGHT: Option<u64> = Some(13_600);
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_BRIDGE3_HEIGHT: Option<u64> = None;
+
+/// Whether a third-bridge height may sit beside the second-bridge height:
+/// dormant, or strictly above an armed second bridge (the second bridge is
+/// read at least one block).
+pub const fn bridge3_schedule_is_valid(bridge2: Option<u64>, bridge3: Option<u64>) -> bool {
+    match (bridge2, bridge3) {
+        (_, None) => true,
+        (Some(h2), Some(h3)) => h3 > h2,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    bridge3_schedule_is_valid(V1_7_BRIDGE2_HEIGHT, V1_7_BRIDGE3_HEIGHT),
+    "V1_7_BRIDGE3_HEIGHT must be None, or strictly above an armed V1_7_BRIDGE2_HEIGHT"
 );
 
 /// Whether the return over Base governs the block at `height`.

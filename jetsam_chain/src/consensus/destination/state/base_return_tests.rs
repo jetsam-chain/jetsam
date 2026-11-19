@@ -210,10 +210,20 @@ fn the_return_over_base_reads_its_profiles_base_from_its_height() {
         // only from it on (`bridge2_the_profiles_bridge_table`).
         let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed on the test chain");
         assert_eq!(rules.effective_at(h2 - 1), at_h);
+        // BRIDGE3: the second bridge up to the third's height, the third from
+        // it on (`bridge3_the_profiles_bridge_table`).
+        let h3 = crate::consensus::params::V1_7_BRIDGE3_HEIGHT.expect("armed on the test chain");
+        assert_eq!(
+            rules.effective_at(h3 - 1),
+            DestinationRules {
+                bridge: Some(BASE_RETURN_BRIDGE2),
+                ..at_h
+            }
+        );
         assert_eq!(
             rules.effective_at(u64::MAX),
             DestinationRules {
-                bridge: Some(BASE_RETURN_BRIDGE2),
+                bridge: Some(BASE_RETURN_BRIDGE3),
                 ..at_h
             }
         );
@@ -2245,7 +2255,8 @@ fn bridge2_the_profiles_bridge_table() {
         };
         let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed");
         assert_eq!(h2, 13_440);
-        assert_eq!(BASE_RETURN_BRIDGE_ROTATIONS.len(), 1);
+        // BRIDGE3: the third bridge after it (`bridge3_the_profiles_bridge_table`).
+        assert_eq!(BASE_RETURN_BRIDGE_ROTATIONS.len(), 2);
         let second = BASE_RETURN_BRIDGE_ROTATIONS[0];
         assert_eq!((second.height, second.first_burn), (h2, 1_000_000));
         assert_eq!(second.bridge, BASE_RETURN_BRIDGE2);
@@ -2290,6 +2301,66 @@ const BRIDGE2_ADDRESS_HEX: &str = "7ba0229a5a04cfa5a827be3c749eaf442c1764d4";
 const BRIDGE2_CODE_HASH_HEX: &str = "baad551d9d3b7e2bd7dbde6f0748c13f2b6968dabeab0144c4088e1325c69c75";
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
 const BRIDGE2_GENESIS_ID_HEX: &str = "93f67b6955f7d4f184cb3333515ad9dfcaca57bb56ae81f62e792be5628a4c5b";
+
+/// BRIDGE3 (19/11): the test chain's third bridge (the contract without C-6,
+/// `v3-fixext` 9aac4fc, profile `testnet-bridge3`: J 13 200, F 13 600, first
+/// burn 2 000 000) from its height on, after BRIDGE2B; V8 lifted from it on
+/// (its pins written at the switch: a deliberate edit of the constant and of
+/// this test).
+#[test]
+fn bridge3_the_profiles_bridge_table() {
+    let consensus = DestinationRules::CONSENSUS;
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed");
+        let h3 = crate::consensus::params::V1_7_BRIDGE3_HEIGHT.expect("armed");
+        assert_eq!(h3, 13_600);
+        assert!(h3 > h2);
+        assert_eq!(BASE_RETURN_BRIDGE_ROTATIONS.len(), 2);
+        let (second, third) = (BASE_RETURN_BRIDGE_ROTATIONS[0], BASE_RETURN_BRIDGE_ROTATIONS[1]);
+        assert_eq!((third.height, third.first_burn), (h3, 2_000_000));
+        // above every n BRIDGE2B gives (from 1 000 000 on)
+        assert!(third.first_burn > second.first_burn);
+        assert_eq!(third.bridge, BASE_RETURN_BRIDGE3);
+        assert_eq!(BASE_RETURN_BRIDGE3.address.to_vec(), hex(BRIDGE3_ADDRESS_HEX));
+        assert_eq!(BASE_RETURN_BRIDGE3.code_hash.to_vec(), hex(BRIDGE3_CODE_HASH_HEX));
+        assert_eq!(BASE_RETURN_BRIDGE3.genesis_id.to_vec(), hex(BRIDGE3_GENESIS_ID_HEX));
+        assert_ne!(BASE_RETURN_BRIDGE3.genesis_id, [0; 32], "the genesis id read back after initGenesis");
+        assert_eq!((BASE_RETURN_BRIDGE3.withdrawals_slot, BASE_RETURN_BRIDGE3.genesis_id_slot), (9, 13));
+        assert_eq!(consensus.effective_at(h3 - 1).bridge, Some(BASE_RETURN_BRIDGE2));
+        assert_eq!(consensus.effective_at(h3 - 1).first_burn(), 1_000_000);
+        assert_eq!(consensus.effective_at(h3).bridge, Some(BASE_RETURN_BRIDGE3));
+        assert_eq!(consensus.effective_at(h3).first_burn(), 2_000_000);
+        // FIXEXT-CAP: its code has no C-6 (jetsam_bridge_xtest holds it to the deployment): V8 lifted from h3 on.
+        assert_eq!(third.outstanding_ceil, None);
+        assert_eq!(
+            outstanding_ceil_lifted_at(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS),
+            Some(h3)
+        );
+    }
+    #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+    {
+        assert!(consensus.base_return.bridge_rotations.is_empty());
+        assert_eq!(crate::consensus::params::V1_7_BRIDGE3_HEIGHT, None);
+    }
+}
+
+/// The pins of the test chain's third bridge: its address and code hash
+/// (CREATE2 of `v3-fixext` 9aac4fc, profile `testnet-bridge3`, deployed on Base
+/// Sepolia on 19/11, block 60 843 869, code hash read back), and its real
+/// genesis id (`initGenesis` read back on the contract).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const BRIDGE3_ADDRESS_HEX: &str = "3b1c5c35c52a8daba3c6f8b7481d2ee25e27a4ce";
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const BRIDGE3_CODE_HASH_HEX: &str = "caaeae5c02d77ad26ba49b7e2ce8d026f09aa063a0623e950114aa73bebebcfe";
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const BRIDGE3_GENESIS_ID_HEX: &str = "43688e071df1fd208385557ac66f8366408aa3e87c07570339bb13515e1b4cd0";
 
 // ---------------------------------------------------------------------------
 // FIXEXT E-1: Base is read under a recent L1 block
@@ -2357,10 +2428,15 @@ fn fixext_the_heights_of_each_profile() {
     assert!(fixext_schedule_is_valid(Some(5), Some(9), false));
     assert!(!fixext_schedule_is_valid(Some(5), Some(4), false));
     assert!(!fixext_schedule_is_valid(None, Some(5), false));
-    #[cfg(feature = "testnet")]
+    // BRIDGE3: the test chain arms it at 13 500 (above its return, 8 982, and
+    // below its third bridge, 13 600); the rehearsal keeps it dormant.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    assert_eq!(V1_7_FIXEXT_HEIGHT, Some(13_500));
+    #[cfg(feature = "rehearsal-v1-7")]
     assert_eq!(V1_7_FIXEXT_HEIGHT, None);
     #[cfg(not(feature = "testnet"))]
     assert_eq!(V1_7_FIXEXT_HEIGHT, V1_7_BASE_RETURN_HEIGHT);
+    assert!(fixext_schedule_is_valid(V1_7_BASE_RETURN_HEIGHT, V1_7_FIXEXT_HEIGHT, cfg!(not(feature = "testnet"))));
     assert_eq!(
         DestinationRules::CONSENSUS.base_return.fixext_height,
         V1_7_FIXEXT_HEIGHT
@@ -2456,10 +2532,13 @@ fn fixextcap_each_profiles_ceilings() {
     }
     #[cfg(feature = "testnet")]
     assert_eq!(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, Some(VAULT_OUTSTANDING_CEIL_MICRO));
+    // BRIDGE3: the test chain's third bridge (the contract without C-6) has none; BRIDGE2B keeps its own.
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
-    assert!(
-        BASE_RETURN_BRIDGE_ROTATIONS.iter().all(|r| r.outstanding_ceil.is_some()),
-        "TODO(FIXEXT-CAP): the test chain's bridge without C-6 is not in its table yet"
+    assert_eq!(
+        BASE_RETURN_BRIDGE_ROTATIONS.iter().map(|r| r.outstanding_ceil).collect::<Vec<_>>(),
+        [Some(VAULT_OUTSTANDING_CEIL_MICRO), None]
     );
+    #[cfg(feature = "rehearsal-v1-7")]
+    assert!(BASE_RETURN_BRIDGE_ROTATIONS.is_empty());
     assert!(outstanding_ceils_are_valid(BASE_RETURN_BRIDGE_OUTSTANDING_CEIL, BASE_RETURN_BRIDGE_ROTATIONS));
 }

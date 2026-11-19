@@ -523,7 +523,8 @@ mod tests {
             Some("5221245deb99771dd76ccf785fd39a5d4f692254")
         );
         let h2 = crate::consensus::params::V1_7_BRIDGE2_HEIGHT.expect("armed on the test chain");
-        assert_eq!(a.base_return_bridge_rotations.len(), 1);
+        // BRIDGE3: the third bridge after it.
+        assert_eq!(a.base_return_bridge_rotations.len(), 2);
         let second = &a.base_return_bridge_rotations[0];
         let pinned = crate::consensus::destination::state::BASE_RETURN_BRIDGE2;
         assert_eq!(
@@ -533,14 +534,27 @@ mod tests {
         assert_eq!(second.address, hex_of(&pinned.address));
         assert_eq!(second.code_hash, hex_of(&pinned.code_hash));
         assert_eq!(second.genesis_id, hex_of(&pinned.genesis_id));
-        // FIXEXT-CAP: BRIDGE2B keeps C-6, its record is the one of before (digest f12009771c unchanged): the
-        // five fields of before, nothing else anywhere in the record about the ceiling.
+        // FIXEXT-CAP: BRIDGE2B keeps C-6, its record is the one of before: the five fields of before.
         assert!(!second.no_outstanding_ceil);
         let v = serde_json::to_value(&a).unwrap();
         let mut keys: Vec<&String> = v["base_return_bridge_rotations"][0].as_object().unwrap().keys().collect();
         keys.sort();
         assert_eq!(keys, ["address", "code_hash", "first_burn", "genesis_id", "height"]);
-        assert!(!serde_json::to_string(&v).unwrap().contains("outstanding"));
+        // BRIDGE3: the third bridge (no C-6) from its height on, published with `no_outstanding_ceil: true` (the
+        // record, hence its digest, changes with it: wanted).
+        let h3 = crate::consensus::params::V1_7_BRIDGE3_HEIGHT.expect("armed on the test chain");
+        let third = &a.base_return_bridge_rotations[1];
+        let pinned3 = crate::consensus::destination::state::BASE_RETURN_BRIDGE3;
+        assert_eq!((third.height, third.first_burn), (h3, 2_000_000));
+        assert_eq!(third.address, "3b1c5c35c52a8daba3c6f8b7481d2ee25e27a4ce");
+        assert_eq!(third.address, hex_of(&pinned3.address));
+        assert_eq!(third.code_hash, hex_of(&pinned3.code_hash));
+        assert_eq!(third.genesis_id, hex_of(&pinned3.genesis_id));
+        assert!(third.no_outstanding_ceil);
+        assert_eq!(v["base_return_bridge_rotations"][1]["no_outstanding_ceil"], serde_json::json!(true));
+        // BRIDGE3: FIXEXT armed on the test chain at 13 500, published.
+        assert_eq!(a.fixext_height, Some(13_500));
+        assert_eq!(v["fixext_height"], serde_json::json!(13_500));
     }
 
     /// The public network's record: its genesis, v1.7 dormant (no `J`, `F`,
@@ -579,6 +593,8 @@ mod tests {
         d.base_return.fast.release_key = Some([0xab; 48]);
         // BRIDGE2: the test chain's table is published apart (its own test).
         d.base_return.bridge_rotations = &[];
+        // BRIDGE3: so is the test chain's FIXEXT height (absent while dormant).
+        d.base_return.fixext_height = None;
         let a = Activations::of(
             &d,
             &ClientObjectRules::CONSENSUS,

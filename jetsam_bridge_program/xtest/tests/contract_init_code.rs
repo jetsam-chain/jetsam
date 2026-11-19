@@ -281,6 +281,49 @@ fn bridge2_the_second_test_bridge_deployed_is_the_one_the_nodes_pin() {
     assert_eq!(second.outstanding_ceil, Some(VAULT_OUTSTANDING_CEIL_MICRO), "the table's ceiling is the code's");
 }
 
+/// BRIDGE3: the deployment of the test chain's third bridge (its factory call on Base Sepolia, tx 0x6f09a52b…22f0,
+/// block 60 843 869: the contract without C-6, TN1's test verifier and adapters, TN1's genesis and pause keys) is
+/// the bridge the nodes switch to after BRIDGE2B: its CREATE2 address and code hash are `BASE_RETURN_BRIDGE3`'s, its
+/// F is the nodes' third switch height, its first burn index the table's, its network this node's, and its code has
+/// no outstanding ceiling exactly as the table says (`outstanding_ceil: None`).
+/// (A build without a third bridge, the public network's, has nothing to hold: said, and nothing checked.)
+#[test]
+fn bridge3_the_third_test_bridge_deployed_is_the_one_the_nodes_pin() {
+    use jetsam_chain::consensus::destination::state::BASE_RETURN_BRIDGE_ROTATIONS;
+    use jetsam_chain::consensus::params::{V1_7_BRIDGE2_HEIGHT, V1_7_BRIDGE3_HEIGHT};
+    let Some(third) = BASE_RETURN_BRIDGE_ROTATIONS.get(1) else {
+        assert_eq!(V1_7_BRIDGE3_HEIGHT, None);
+        eprintln!("SKIPPED: this build has no third bridge");
+        return;
+    };
+    assert_eq!(hex(&network_id()), PROFILES[1].network, "only the test chain has a third bridge");
+    let v: Value = serde_json::from_str(include_str!("fixtures/bridge3_deployment_testnet.json")).unwrap();
+    let init = bytes(&v["initCode"]);
+    assert_eq!(hex(&bytes(&v["factory"])), FACTORY);
+    assert_eq!(bytes(&v["salt"]), keccak256(b"jetsam-bridge/v3"));
+    let address = create2(&bytes(&v["factory"]), &bytes(&v["salt"]), &init);
+    assert_eq!(address, bytes(&v["address"]));
+    assert_eq!(address, third.bridge.address.to_vec(), "the nodes' pinned address");
+    assert_eq!(bytes(&v["codeHash"]), third.bridge.code_hash.to_vec(), "the nodes' pinned code hash");
+    let config = &init[init.len() - 9 * 32..];
+    // TN1's adapters around TN1's relay-signed test verifier (TN1_READY_BRIDGE §3), as BRIDGE2B
+    assert_eq!(hex(&as_address(word(config, 0))), "86bdffedb6b4d709da6a463dcebde4b8e5c2647e");
+    assert_eq!(hex(&as_address(word(config, 1))), "bdcc740d18902103e1434d864a99dad3ca4db938");
+    assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
+    assert_eq!(as_u64(word(config, 3)), 13_200, "the genesis window opens above every deposit BRIDGE2B minted");
+    assert_eq!(Some(as_u64(word(config, 4))), V1_7_BRIDGE3_HEIGHT, "the genesis window ends at the switch height");
+    assert!(V1_7_BRIDGE3_HEIGHT > V1_7_BRIDGE2_HEIGHT);
+    assert_eq!(word(config, 5), &network_id()[..]);
+    assert_eq!(hex(&as_address(word(config, 6))), "fd9aec19a49b71bd38ecf03e4774afb1b0888317", "TN1's genesis key");
+    assert_eq!(hex(&as_address(word(config, 7))), "60d2f7093181e1a47f54d0b4b30efedc5505eaea", "TN1's pause key");
+    assert_eq!(as_u64(word(config, 8)), third.first_burn, "the table's first burn index");
+    assert_eq!(third.first_burn, 2_000_000);
+    assert_eq!(Some(third.height), V1_7_BRIDGE3_HEIGHT);
+    // FIXEXT-CAP: the third bridge's code has no C-6 (no getter in the dispatcher), and the table says so.
+    assert!(!code_has_selector(&init, "OUTSTANDING_CEIL()"));
+    assert_eq!(third.outstanding_ceil, None, "the table's ceiling is the code's: none");
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // FIXEXT-CAP (19/11): whether a bridge's code has an outstanding ceiling (C-6)
 // ---------------------------------------------------------------------------------------------------------------
