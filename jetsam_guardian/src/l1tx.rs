@@ -52,9 +52,18 @@ impl HotKey {
 
     /// From a file of 64 hex characters (an optional `0x`, surrounding white space allowed) that only its
     /// owner, this process's user, can read: mode 0600 or 0400.
+    /// F-7 (external audit of the robots): opened without following a symbolic link (`O_NOFOLLOW`), its mode and
+    /// owner read from the descriptor opened, then read from it: no window between the check and the read.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(path).map_err(|e| anyhow::anyhow!("hot key {}: {e}", path.display()))?;
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("hot key {}: {e} (a symbolic link is refused: name the file itself)", path.display()))?;
+        let meta = f.metadata().map_err(|e| anyhow::anyhow!("hot key {}: {e}", path.display()))?;
+        anyhow::ensure!(meta.is_file(), "hot key {}: not a regular file", path.display());
         anyhow::ensure!(
             meta.mode() & 0o077 == 0,
             "hot key {}: mode {:o}, it must be readable by its owner only (0600 or 0400)",
@@ -64,7 +73,8 @@ impl HotKey {
         // SAFETY: geteuid has no precondition.
         let euid = unsafe { libc::geteuid() };
         anyhow::ensure!(meta.uid() == euid, "hot key {}: owned by uid {}, not by this process's uid {euid}", path.display(), meta.uid());
-        let text = zeroize::Zeroizing::new(std::fs::read_to_string(path)?);
+        let mut text = zeroize::Zeroizing::new(String::new());
+        f.read_to_string(&mut text).map_err(|e| anyhow::anyhow!("hot key {}: {e}", path.display()))?;
         let body = text.trim().trim_start_matches("0x");
         anyhow::ensure!(body.len() == 64 && body.bytes().all(|b| b.is_ascii_hexdigit()), "hot key {}: not 32 bytes of hex", path.display());
         let mut secret = zeroize::Zeroizing::new([0u8; 32]);

@@ -213,7 +213,15 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> 
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => std::path::Path::new("."),
     };
-    let mut f = std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+    // F-7 (external audit of the robots): a temporary left there (a crash, or a symbolic link planted by whoever may
+    // write the directory) is removed, never written through; the new one is created afresh (O_EXCL: one planted
+    // again in between is refused, not followed)
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("{}: not removed: {e}", tmp.display()),
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
     f.write_all(bytes).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
     f.sync_all().map_err(|e| anyhow::anyhow!("{}: sync: {e}", tmp.display()))?;
     drop(f);
