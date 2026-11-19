@@ -32,6 +32,9 @@ jetsam_fri = { path = "../jetsam_fri" }
 jetsam_fri_binius = { path = "../jetsam_fri_binius" }
 rayon = "1.10"
 libmdbx = "0.6"
+# `jetsam --compact-db`: mdbx_env_copy (MDBX_CP_COMPACT), which the libmdbx
+# crate does not wrap. The exact version libmdbx 0.6.6 itself pins.
+mdbx-sys = "=13.11.0"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 # v1.7 destination module: the L1's sync-committee signatures (BLS12-381),
@@ -43,6 +46,11 @@ tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
 # A5-24: the salt of the segment tree cache's release oracle, drawn once per
 # process from the operating system (the version the workspace already locks).
 getrandom = "0.2"
+
+# Database health: free space of the data volume (statvfs) and the owner of
+# the database file kept across a compaction.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 serde_json = { workspace = true }

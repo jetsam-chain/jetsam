@@ -1804,6 +1804,23 @@ struct Cli {
     #[arg(long)]
     purge_state: bool,
 
+    /// Compact the chain database of the data directory, then exit. The node
+    /// must be stopped (refused while another process has the database open).
+    ///
+    /// A compact copy is written to `mdbx.dat.compact` in the same directory,
+    /// checked table by table against the database, then put in its place:
+    /// the previous file is kept as `mdbx.dat.old`, with the same owner and
+    /// mode as the new one. Any failure leaves the database as it was. Once
+    /// the node has restarted on the compacted database, free the room with
+    /// --compact-db-remove-old.
+    #[arg(long, conflicts_with = "compact_db_remove_old")]
+    compact_db: bool,
+
+    /// Delete `mdbx.dat.old` (and `mdbx.lck.old`) that --compact-db kept, then
+    /// exit. Run it only once the node works on the compacted database.
+    #[arg(long)]
+    compact_db_remove_old: bool,
+
     /// H-2: start a release that arms v1.7 without pinning its crossing on a
     /// stored chain already past J, accepting that crossing: the ids of blocks
     /// J − 1 and J (64 hex digits each). Refused unless they are the stored
@@ -2651,6 +2668,49 @@ fn refuse_foreign_chain_data(data_dir: &Path) -> anyhow::Result<()> {
 
 
 
+/// `jetsam --compact-db`: compact the stopped database of `data_dir`.
+fn run_compact_db(data_dir: &Path) -> anyhow::Result<()> {
+    let _ = data_dir;
+    anyhow::bail!("not implemented")
+}
+
+/// `jetsam --compact-db-remove-old`: delete the file a compaction kept.
+fn run_compact_db_remove_old(data_dir: &Path) -> anyhow::Result<()> {
+    let _ = data_dir;
+    anyhow::bail!("not implemented")
+}
+
+/// How often the node reads its database health for the journal warning
+/// (the warning itself is written at most once an hour).
+const DATABASE_HEALTH_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// C2 (DATAVOL, 2026-11-19): a WARN in the journal while the data volume is
+/// more than 80 % used or the database file mostly free pages, at most once
+/// an hour. On the mainnet seeds the file reached 11.6 GB for 95 MB of data
+/// and filled the disk with nothing in the journal before the node stopped.
+fn spawn_database_health_watch(store: MdbxStore) {
+    tokio::spawn(async move {
+        let mut warnings = jetsam_chain::storage::HealthWarnings::new();
+        let mut every = tokio::time::interval(DATABASE_HEALTH_CHECK_EVERY);
+        loop {
+            every.tick().await;
+            let reader = store.clone();
+            let health = match tokio::task::spawn_blocking(move || reader.database_health()).await
+            {
+                Ok(Ok(health)) => health,
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "database health unavailable");
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if let Some(warning) = warnings.due(&health, std::time::Instant::now()) {
+                tracing::warn!("{warning}");
+            }
+        }
+    });
+}
+
 fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
     let store = MdbxStore::open(data_dir).context("open MDBX for chain-data reset")?;
     let previous_height = store
@@ -3295,6 +3355,21 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("matrix preparation cannot be combined with node or mining actions");
     }
+    let db_maintenance = cli.compact_db || cli.compact_db_remove_old;
+    if db_maintenance
+        && (wallet_maintenance
+            || cli.import_spend_secret
+            || cli.prepare_history_step_cache.is_some()
+            || cli.mode != NodeMode::Node
+            || cli.genesis
+            || cli.purge_state
+            || cli.miner_address.is_some()
+            || cli.cpu_threads.is_some()
+            || cli.mining_key.is_some()
+            || cli.allow_custom_coinbase)
+    {
+        anyhow::bail!("database compaction cannot be combined with other actions");
+    }
     // --- Network ---
     let net = NetworkConfig::mainnet();
     tracing::debug!(network = %net.kind, "daemon starting");
@@ -3341,6 +3416,13 @@ async fn main() -> anyhow::Result<()> {
     // also left alone: the old branch threw it away on every first start, and
     // rewrote the default install's jetsam.toml to point at whichever data
     // directory happened to be starting.
+    // Before anything opens the database read-write.
+    if cli.compact_db {
+        return run_compact_db(&data_dir);
+    }
+    if cli.compact_db_remove_old {
+        return run_compact_db_remove_old(&data_dir);
+    }
     refuse_foreign_chain_data(&data_dir)?;
     record_network_storage_epoch(&data_dir)?;
     // CLI flags are authoritative after any first-mainnet reset.
@@ -3645,6 +3727,7 @@ async fn main() -> anyhow::Result<()> {
             }
             None => None,
         };
+    spawn_database_health_watch(ctx.store.clone());
     let chain = Arc::new(RwLock::new(ctx));
     let initial_canonical_tip = {
         let ctx = chain.read().await;
@@ -23141,5 +23224,49 @@ mod condemned_block_tests {
         )
         .unwrap_err();
         assert!(error.is_body_fault() && error.condemned_block().is_none(), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod compact_db_tests {
+    use super::{run_compact_db, run_compact_db_remove_old, Cli};
+    use clap::Parser;
+
+    #[test]
+    fn compact_db_flags_parse_and_exclude_each_other() {
+        let cli = Cli::try_parse_from(["jetsam", "--compact-db", "--data-dir", "/d"]).unwrap();
+        assert!(cli.compact_db && !cli.compact_db_remove_old);
+        let cli = Cli::try_parse_from(["jetsam", "--compact-db-remove-old"]).unwrap();
+        assert!(cli.compact_db_remove_old && !cli.compact_db);
+        assert!(Cli::try_parse_from(["jetsam", "--compact-db", "--compact-db-remove-old"]).is_err());
+    }
+
+    #[test]
+    fn compact_db_compacts_a_stopped_node_database_and_remove_old_frees_it() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap());
+        std::fs::write(directory.path().join("wallet.key"), b"key").unwrap();
+        run_compact_db(directory.path()).unwrap();
+        assert!(directory.path().join("mdbx.dat").exists());
+        assert!(directory.path().join("mdbx.dat.old").exists());
+        assert_eq!(std::fs::read(directory.path().join("wallet.key")).unwrap(), b"key");
+        // The node opens the compacted database.
+        drop(jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap());
+        // A second compaction is refused while the previous file is kept.
+        assert!(run_compact_db(directory.path()).is_err());
+        run_compact_db_remove_old(directory.path()).unwrap();
+        assert!(!directory.path().join("mdbx.dat.old").exists());
+        assert!(directory.path().join("mdbx.dat").exists());
+        assert!(run_compact_db_remove_old(directory.path()).is_err());
+    }
+
+    #[test]
+    fn compact_db_refuses_a_database_in_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let held = jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let error = run_compact_db(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("stop the node"), "{error}");
+        drop(held);
+        assert!(!directory.path().join("mdbx.dat.old").exists());
     }
 }

@@ -19,6 +19,41 @@ pub struct ChainInfo {
     /// Exact sum of all live UTXO values, encoded as a decimal string so the
     /// JSON boundary never loses precision.
     pub circulating_supply_micro_jtm: String,
+    /// Health of the chain database file and of its volume. Absent from
+    /// nodes before this field, and when the figures cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageHealthInfo>,
+}
+
+/// `getChainInfo.storage`: the chain database file and its volume, in bytes.
+/// `gc_free_bytes` are pages the file keeps free for reuse; when they are
+/// most of `file_bytes`, `jetsam --compact-db` (node stopped) gives them back
+/// to the disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageHealthInfo {
+    pub file_bytes: u64,
+    pub live_bytes: u64,
+    pub gc_free_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_available_bytes: Option<u64>,
+}
+
+impl From<&jetsam_chain::storage::DbHealth> for StorageHealthInfo {
+    fn from(health: &jetsam_chain::storage::DbHealth) -> Self {
+        let _ = health;
+        Self {
+            file_bytes: 0,
+            live_bytes: 0,
+            gc_free_bytes: 0,
+            disk_total_bytes: None,
+            disk_used_bytes: None,
+            disk_available_bytes: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -864,4 +899,45 @@ pub struct MempoolStats {
     pub intent_bytes: u64,
     pub max_intent_bytes: u64,
     pub fee_floor: u64,
+}
+
+#[cfg(test)]
+mod chain_info_storage_tests {
+    use super::*;
+
+    #[test]
+    fn chain_info_without_storage_still_parses_and_serializes_as_before() {
+        let before = r#"{"height":7,"best_hash":"ab","difficulty_target":"cd","active_slot_count":3,"log_slots":4,"circulating_supply_micro_jtm":"12"}"#;
+        let info: ChainInfo = serde_json::from_str(before).unwrap();
+        assert_eq!(info.storage, None);
+        assert_eq!(serde_json::to_string(&info).unwrap(), before);
+    }
+
+    #[test]
+    fn chain_info_carries_the_database_health() {
+        let health = jetsam_chain::storage::DbHealth {
+            file_bytes: 11_600_000_000,
+            allocated_bytes: 11_500_000_000,
+            live_bytes: 95_000_000,
+            gc_free_bytes: 11_405_000_000,
+            disk_total_bytes: Some(20_000_000_000),
+            disk_used_bytes: Some(19_000_000_000),
+            disk_available_bytes: Some(900_000_000),
+        };
+        let storage = StorageHealthInfo::from(&health);
+        assert_eq!(
+            storage,
+            StorageHealthInfo {
+                file_bytes: 11_600_000_000,
+                live_bytes: 95_000_000,
+                gc_free_bytes: 11_405_000_000,
+                disk_total_bytes: Some(20_000_000_000),
+                disk_used_bytes: Some(19_000_000_000),
+                disk_available_bytes: Some(900_000_000),
+            }
+        );
+        let json = serde_json::to_value(&storage).unwrap();
+        assert_eq!(json["gc_free_bytes"], 11_405_000_000u64);
+        assert_eq!(json["disk_available_bytes"], 900_000_000u64);
+    }
 }

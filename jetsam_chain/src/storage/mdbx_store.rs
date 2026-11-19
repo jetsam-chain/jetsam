@@ -33,6 +33,7 @@ use crate::header_anchor::{
 };
 use crate::segmented_state::SegmentColumns;
 use crate::state::{ChainState, StreamingSparseRoot};
+use crate::storage::db_maintenance::{CompactError, DbHealth, DATA_FILE};
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
     decode_chain_tip, decode_chain_work, decode_circulating_supply, decode_consensus_meta,
@@ -452,6 +453,11 @@ impl From<SnapshotStagingError> for StoreError {
 pub struct MdbxStore {
     db: Arc<Database<NoWriteMap>>,
     block_body_object_retention_floor: Arc<std::sync::atomic::AtomicU64>,
+    /// `mdbx.dat` of the data directory, for the health figures.
+    data_file: Arc<std::path::PathBuf>,
+    /// Last health figures and when they were taken: reading the GC is not
+    /// free on a large file, and `getChainInfo` is unauthenticated.
+    health_cache: Arc<std::sync::Mutex<Option<(std::time::Instant, DbHealth)>>>,
 }
 
 /// One owned, already native-validated header record from a sealed snapshot
@@ -1884,8 +1890,25 @@ impl MdbxStore {
         let store = Self {
             db: Arc::new(db),
             block_body_object_retention_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            data_file: Arc::new(path.join(DATA_FILE)),
+            health_cache: Arc::new(std::sync::Mutex::new(None)),
         };
         Ok(store)
+    }
+
+    /// Size of the database file, the data it holds, the free pages its GC
+    /// keeps and the room left on its volume. Read-only.
+    pub fn database_health(&self) -> Result<DbHealth, CompactError> {
+        Err(CompactError::Io("not implemented".into()))
+    }
+
+    /// [`Self::database_health`], reused while younger than `max_age`.
+    pub fn database_health_cached(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<DbHealth, CompactError> {
+        let _ = max_age;
+        Err(CompactError::Io("not implemented".into()))
     }
 
     // -----------------------------------------------------------------------
