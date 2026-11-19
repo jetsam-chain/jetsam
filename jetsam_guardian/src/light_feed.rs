@@ -537,10 +537,8 @@ impl FeedMemory {
             Some((FeedStep::Next { period }, at)) => json!({"step": "next", "period": period, "at": at}),
             _ => json!({}),
         };
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, v.to_string())?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        // F-4 (external audit of the robots): written and synced before its rename, its directory synced after
+        crate::write_atomic(path, v.to_string().as_bytes())
     }
 
     /// Whether `step` was posted less than [`REPOST_SECONDS`] before `now`.

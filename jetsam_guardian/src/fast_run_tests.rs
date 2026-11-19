@@ -566,11 +566,11 @@ fn a_five_minute_walk_misses_no_capture_the_captures_follow_bases_head_in_their_
     l1.delay = Duration::from_millis(MS);
     let ticks = std::sync::atomic::AtomicUsize::new(0);
     let tick = || {
-        capture_tick(&base, &w.bridge, 0, interval, crate::base_capture::CAPTURE_WINDOW_BLOCKS, &state, &state_file, &captures, T)
+        capture_tick(&[&base], &w.bridge, 0, interval, crate::base_capture::CAPTURE_WINDOW_BLOCKS, &state, &state_file, &captures, T)
             .expect("a tick");
         ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     };
-    let (walked, took) = with_captures(Duration::from_millis(10 * MS), tick, |alive| {
+    let (walked, took) = with_captures(Duration::from_millis(10 * MS), tick, |alive, _busy| {
         let started = Instant::now();
         let mut parents = crate::fast::ParentCache::new();
         let views = crate::fast::read_ancestors(&l1, &jetsam_chain::consensus::destination::base_read::BASE_SEPOLIA, crate::fast::tests::g(1), "latest", &mut parents, &mut |_, _| {})
@@ -604,7 +604,7 @@ fn a_tick_never_asks_a_block_above_bases_head_and_asks_the_newest_first() {
         proposal_anchor: Some(A),
         ..RunState::default()
     });
-    let tick = || capture_tick(&base, &w.bridge, 0, 300, 1_000, &state, &state_file, &captures, T).unwrap();
+    let tick = || capture_tick(&[&base], &w.bridge, 0, 300, 1_000, &state, &state_file, &captures, T).unwrap();
     let first = tick();
     assert_eq!(first.head, A + 150);
     assert_eq!(first.capture.captured, vec![A]);
@@ -642,7 +642,7 @@ fn an_old_block_is_asked_again_only_while_the_next_proposal_block_is_far() {
         ..RunState::default()
     });
     let (interval, window) = (crate::base_capture::PROPOSAL_INTERVAL_BLOCKS, crate::base_capture::CAPTURE_WINDOW_BLOCKS);
-    let tick = || capture_tick(&base, &w.bridge, 0, interval, window, &state, &state_file, &captures, T).unwrap();
+    let tick = || capture_tick(&[&base], &w.bridge, 0, interval, window, &state, &state_file, &captures, T).unwrap();
     let at = |head: u64| {
         base.h0.store(head, std::sync::atomic::Ordering::SeqCst);
         base.asked.lock().unwrap().clear();
@@ -675,7 +675,7 @@ fn a_burn_is_seen_before_the_proposal_block_after_it_is_captured() {
         proposal_anchor: Some(A),
         ..RunState::default()
     });
-    let report = capture_tick(&base, &w.bridge, 0, 300, 100, &state, &state_file, &captures, T).unwrap();
+    let report = capture_tick(&[&base], &w.bridge, 0, 300, 100, &state, &state_file, &captures, T).unwrap();
     assert_eq!(report.burns.iter().map(|b| (b.burn.n, b.block)).collect::<Vec<_>>(), vec![(w.burn.n, A - 3)]);
     assert_eq!(report.capture.captured, vec![A]);
     assert!(holds_the_burn(&w, &load(&captures, A).unwrap().unwrap()));
@@ -684,7 +684,7 @@ fn a_burn_is_seen_before_the_proposal_block_after_it_is_captured() {
     assert!(kept.burns.contains_key(&w.burn.n));
     // Without a proposal block known yet, a tick reads the burns and captures nothing.
     let none = Mutex::new(RunState { scanned_to: Some(A - 200), ..RunState::default() });
-    let report = capture_tick(&base, &w.bridge, 0, 300, 100, &none, &dir.path().join("other.json"), &dir.path().join("other"), T).unwrap();
+    let report = capture_tick(&[&base], &w.bridge, 0, 300, 100, &none, &dir.path().join("other.json"), &dir.path().join("other"), T).unwrap();
     assert_eq!(report.burns.len(), 1);
     assert!(report.capture.captured.is_empty() && report.capture.refused.is_empty());
 }
@@ -750,7 +750,7 @@ fn d159_at_the_production_tick_a_proposal_block_is_captured_within_one_period_of
             let caught = loop {
                 live.h0.store(head, std::sync::atomic::Ordering::SeqCst);
                 let report = capture_tick(
-                    &base,
+                    &[&base],
                     &w.bridge,
                     0,
                     crate::base_capture::PROPOSAL_INTERVAL_BLOCKS,
@@ -792,7 +792,7 @@ fn each_pass_says_when_it_begins_and_ends_how_long_it_took_and_why_it_failed() {
         }
         Ok(format!("games #{n}"))
     };
-    let stopped = run_passes(&say, &mut pass, false, Duration::ZERO, &alive, || errors.set(errors.get() + 1));
+    let stopped = run_passes(&say, &mut pass, false, Duration::ZERO, &alive, &|| None, || errors.set(errors.get() + 1));
     assert!(stopped.unwrap_err().to_string().contains("the captures stopped"));
     assert_eq!(errors.get(), 1);
     let lines = lines.into_inner().unwrap();
@@ -807,7 +807,7 @@ fn each_pass_says_when_it_begins_and_ends_how_long_it_took_and_why_it_failed() {
     );
     assert!(lines[5].starts_with("pass 3 done in "));
     let once = Mutex::new(0);
-    run_passes(&|_| *once.lock().unwrap() += 1, &mut |_| Ok(String::new()), true, Duration::ZERO, &|| true, || {}).unwrap();
+    run_passes(&|_| *once.lock().unwrap() += 1, &mut |_| Ok(String::new()), true, Duration::ZERO, &|| true, &|| None, || {}).unwrap();
     assert_eq!(*once.lock().unwrap(), 2);
 }
 
@@ -829,7 +829,7 @@ fn activ_the_passes_stop_at_a_refused_node_and_go_on_past_a_silent_one() {
             _ => Ok(format!("games #{n}")),
         }
     };
-    let stopped = run_passes(&say, &mut pass, false, Duration::ZERO, &|| passes.get() < 3, || errors.set(errors.get() + 1));
+    let stopped = run_passes(&say, &mut pass, false, Duration::ZERO, &|| passes.get() < 3, &|| None, || errors.set(errors.get() + 1));
     let e = format!("{:#}", stopped.unwrap_err());
     assert!(e.contains("base_return_height = 9999") && e.contains("fast-run stops"), "{e}");
     let lines = lines.into_inner().unwrap();
@@ -935,7 +935,7 @@ fn a_fast_record_of_an_n_never_seen_burnt_is_alerted_at_once_and_contradicted_as
     assert!(capture_ns(&s).contains(&absent) && capture_ns(&s).contains(&w.burn.n));
     let base = AbsentToo { live: LiveBase::new(A + 150, u64::MAX / 8, 200, 0), absent, proof, keys: Mutex::new(Vec::new()) };
     let state = Mutex::new(s);
-    let report = capture_tick(&base, &w.bridge, 0, 300, 1_000, &state, &state_file, &captures, T).unwrap();
+    let report = capture_tick(&[&base], &w.bridge, 0, 300, 1_000, &state, &state_file, &captures, T).unwrap();
     assert_eq!(report.capture.captured, vec![A]);
     assert!(base.keys.lock().unwrap().contains(&withdrawal_slot(absent, w.bridge.withdrawals_slot)));
     // under a valid game of that block: the absence contradicts the record
@@ -1096,14 +1096,14 @@ fn a_burn_the_log_endpoint_served_late_is_still_seen() {
     let dir = tempfile::tempdir().unwrap();
     let state = Mutex::new(RunState { scanned_to: Some(h - 100), ..RunState::default() });
     let file = dir.path().join("fast_run.json");
-    let first = capture_tick(&base, &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap();
+    let first = capture_tick(&[&base], &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap();
     assert!(first.burns.is_empty());
     base.live.h0.store(h + 10, std::sync::atomic::Ordering::SeqCst);
-    let second = capture_tick(&base, &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap();
+    let second = capture_tick(&[&base], &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap();
     assert_eq!(second.burns.iter().map(|b| b.burn.n).collect::<Vec<_>>(), vec![w.burn.n]);
     assert!(BURN_RESCAN_BLOCKS >= 300, "30 minutes of Base at least");
     // seen once only: a third tick does not report it again
-    assert!(capture_tick(&base, &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap().burns.is_empty());
+    assert!(capture_tick(&[&base], &w.bridge, 0, 300, 100, &state, &file, &dir.path().join("c"), T).unwrap().burns.is_empty());
 }
 
 /// FR-4: a hole in the burn indices (counted from 1) is said.
@@ -1386,4 +1386,205 @@ fn bridge2_a_run_of_the_second_bridge_leaves_the_first_bridges_records() {
     let before = d.effective_at(u64::MAX);
     assert_eq!(before.bridge, Some(first));
     assert_eq!(records_of_this_bridge(records.clone(), &before), records);
+}
+
+// ---------------------------------------------------------------------------
+// External audit of the robots (FIXEXT): M-8, F-2, F-4, M-10, E-2, M-7
+// ---------------------------------------------------------------------------
+
+/// M-8: a burn the slow lane paid is final: its slot is no longer captured (the list asked of every `eth_getProof`
+/// no longer grows with every burn ever made); a burn paid fast stays until Base's final state settles it (FR-5).
+#[test]
+fn m8_a_burn_the_slow_lane_paid_is_no_longer_captured() {
+    let w = world();
+    let mut s = RunState::default();
+    for n in 1..=4 {
+        s.burns.insert(n, BurnSeen { burn: Burn { n, ..w.burn }, block: 1 });
+    }
+    s.final_slow.insert(2);
+    s.paid.insert(3); // released (fast: sent, a record), not settled yet: still captured
+    s.sent.insert(3, 1);
+    s.settled.insert(4);
+    assert_eq!(capture_ns(&s), vec![1, 3]);
+    // kept across a restart
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fast_run.json");
+    s.store(&path).unwrap();
+    assert_eq!(RunState::load(&path).unwrap(), s);
+}
+
+/// F-4: a state file present but unreadable is no start (never taken for an empty one: every burn seen, every release
+/// handed in would be forgotten); none yet is a fresh start.
+#[test]
+fn f4_an_unreadable_run_state_is_no_start() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(RunState::load(&dir.path().join("none.json")).unwrap(), RunState::default());
+    let path = dir.path().join("fast_run.json");
+    std::fs::create_dir_all(&path).unwrap(); // a directory: read_to_string fails with another error than NotFound
+    assert!(RunState::load(&path).is_err());
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, "{not json").unwrap();
+    assert!(RunState::load(&bad).is_err());
+}
+
+/// F-2: the burns are the union of what every Base RPC serves (one that censors a burn hides it from no one), and a
+/// block one RPC cannot serve is captured from the next one.
+#[test]
+fn f2_burns_are_read_from_every_base_rpc_and_a_capture_from_the_first_that_serves_it() {
+    let w = world();
+    // the first: no burn served, no state served (serve 0): a censoring or broken RPC
+    let first = LiveBase::new(A + 10, u64::MAX / 8, 0, 0);
+    let second = LiveBase::new(A + 10, u64::MAX / 8, 200, A - 3);
+    let dir = tempfile::tempdir().unwrap();
+    let (state_file, captures) = (dir.path().join("fast_run.json"), dir.path().join("captures"));
+    let state = Mutex::new(RunState { scanned_to: Some(A - 200), proposal_anchor: Some(A), ..RunState::default() });
+    let report = capture_tick(&[&first, &second], &w.bridge, 0, 300, 100, &state, &state_file, &captures, T).unwrap();
+    assert_eq!(report.burns.iter().map(|b| b.burn.n).collect::<Vec<_>>(), vec![w.burn.n]);
+    assert_eq!(report.capture.captured, vec![A]);
+    assert!(holds_the_burn(&w, &load(&captures, A).unwrap().unwrap()));
+}
+
+/// M-10: the lines that need a person (a contradiction, a fast record not ours, a release given up, the run stopped or
+/// failing, the captures stalled) go to the operator's alert command, `{event}` and `{detail}` replaced, each line
+/// once an hour at most; the others only to the log.
+#[test]
+fn m10_the_alerts_that_need_a_person_go_to_the_alert_command() {
+    for (line, want) in [
+        ("ALERT FAST CONTRADICTION n 7: Base's final state under game 0x01 holds another word", Some("FAST_CONTRADICTION")),
+        ("ALERT FAST_RECORD n 7: the branch paid 1 µJTM fast to 0x00", Some("FAST_RECORD")),
+        ("ALERT FAST_RELEASE GAVE_UP burn 7: handed in 3 times", Some("GAVE_UP")),
+        ("ALERT SLOW_RELEASE GAVE_UP burn 7: handed in 3 times", Some("GAVE_UP")),
+        ("ALERT FAST_RUN pass 4: refused: fast-run stops (start one built from the node's version)", Some("FAST_RUN_STOPPED")),
+        ("ALERT FAST_RUN_FAILING: 3 passes in a row failed", Some("FAST_RUN_FAILING")),
+        ("ALERT FAST CAPTURES_STALLED: the capture tick has run for 700 s", Some("CAPTURES_STALLED")),
+        ("ALERT FAST BURN_GAP n 5: never seen burnt", Some("BURN_GAP")),
+        ("ALERT FAST_RUN pass 2 failed after 1.0 s: x (tried again at the next pass)", None),
+        ("pass 3 begins", None),
+        ("SENT fast release of burn 7", None),
+    ] {
+        assert_eq!(alert_event(line), want, "{line}");
+    }
+    let ran = std::sync::Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let r = ran.clone();
+    let alerter = Alerter::new(vec!["/bin/alert".into(), "--event".into(), "{event}".into(), "{detail}".into()], Box::new(move |argv| r.lock().unwrap().push(argv)));
+    let line = "ALERT FAST CONTRADICTION n 7: Base's final state holds another word";
+    alerter.on_line(line, 1_000);
+    alerter.on_line(line, 1_500); // the same, again within the hour: not run again
+    alerter.on_line("pass 1 begins", 1_500);
+    alerter.on_line(line, 1_000 + ALERT_REPEAT_SECS);
+    let ran = ran.lock().unwrap().clone();
+    assert_eq!(ran.len(), 2, "{ran:?}");
+    assert_eq!(ran[0], vec!["/bin/alert".to_string(), "--event".into(), "FAST_CONTRADICTION".into(), line.to_string()]);
+}
+
+/// M-10: the alert command from the command line (`--alert-command <program> [--alert-arg <a>]…`, `{event} {detail}`
+/// when no argument is given); required on the mainnet's build only (the test network's lines have none).
+#[test]
+fn m10_the_alert_command_is_read_from_the_command_line_and_required_on_the_mainnet() {
+    let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let run = || -> AlertRunner { Box::new(|_| {}) };
+    let a = alerter_of(&args(&["--alert-command", "/bin/alert"]), &crate::TESTNET_NETWORK, run()).unwrap().unwrap();
+    assert_eq!(a.argv, args(&["/bin/alert", "{event}", "{detail}"]));
+    let a = alerter_of(&args(&["--alert-command", "/bin/alert", "--alert-arg", "x", "--alert-arg", "{event}"]), &crate::MAINNET_NETWORK, run()).unwrap().unwrap();
+    assert_eq!(a.argv, args(&["/bin/alert", "x", "{event}"]));
+    assert!(alerter_of(&args(&[]), &crate::TESTNET_NETWORK, run()).unwrap().is_none());
+    let e = alerter_of(&args(&[]), &crate::MAINNET_NETWORK, run()).err().unwrap().to_string();
+    assert!(e.contains("--alert-command"), "{e}");
+    assert!(alerter_of(&args(&["--alert-command", ""]), &crate::TESTNET_NETWORK, run()).is_err());
+}
+
+/// M-10: passes failing in a row are said once the streak reaches [`FAILED_PASSES_ALERT`] (once per streak).
+#[test]
+fn m10_passes_failing_in_a_row_are_alerted_once_per_streak() {
+    let lines = Mutex::new(Vec::<String>::new());
+    let say = |line: &str| lines.lock().unwrap().push(line.to_string());
+    let passes = Cell::new(0u64);
+    let mut pass = |n: u64| -> anyhow::Result<String> {
+        passes.set(n);
+        if n <= 2 * FAILED_PASSES_ALERT as u64 { bail!("empty answer") } else { Ok(String::new()) }
+    };
+    let alive = || passes.get() < 2 * FAILED_PASSES_ALERT as u64 + 1;
+    let _ = run_passes(&say, &mut pass, false, Duration::ZERO, &alive, &|| None, || {});
+    let failing = lines.lock().unwrap().iter().filter(|l| l.starts_with("ALERT FAST_RUN_FAILING")).count();
+    assert_eq!(failing, 1, "{:?}", lines.lock().unwrap());
+}
+
+/// E-2: a capture tick that hangs (an RPC that never ends) is not a tick that ended: it is said once it has run past
+/// the limit, once per stall.
+#[test]
+fn e2_a_capture_tick_that_hangs_is_alerted() {
+    let mut alerted = false;
+    let limit = Duration::from_secs(CAPTURE_STALL_SECS);
+    assert_eq!(stall_alert(None, limit, &mut alerted), None);
+    assert_eq!(stall_alert(Some(Duration::from_secs(30)), limit, &mut alerted), None);
+    let line = stall_alert(Some(limit + Duration::from_secs(1)), limit, &mut alerted).expect("said");
+    assert!(line.starts_with("ALERT FAST CAPTURES_STALLED"), "{line}");
+    assert_eq!(stall_alert(Some(limit + Duration::from_secs(60)), limit, &mut alerted), None, "once per stall");
+    assert_eq!(stall_alert(None, limit, &mut alerted), None);
+    assert!(stall_alert(Some(limit * 2), limit, &mut alerted).is_some(), "a new stall");
+    // the captures' thread says how long its tick runs
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let g = gate.clone();
+    let mut first = true;
+    let tick = move || {
+        if first {
+            first = false;
+            g.wait();
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    let busy = with_captures(Duration::from_millis(10), tick, |_alive, busy| {
+        gate.wait();
+        std::thread::sleep(Duration::from_millis(150));
+        busy()
+    });
+    assert!(busy.is_some_and(|b| b >= Duration::from_millis(100)), "{busy:?}");
+}
+
+/// M-7: two Base RPCs are two sources only if they are two hosts (two paths or keys of one provider are one source);
+/// the loopback's ports are the operator's local routers, one per provider.
+#[test]
+fn m7_two_base_rpcs_on_one_host_are_one_source() {
+    let chain = |_: &str| -> anyhow::Result<u64> { Ok(84_532) };
+    let urls = |list: &[&str]| list.iter().map(|u| u.to_string()).collect::<Vec<_>>();
+    for list in [
+        ["https://base-sepolia.example.com/v2/KEY1", "https://base-sepolia.example.com/v2/KEY2"],
+        ["https://base-sepolia.example.com/a", "https://BASE-SEPOLIA.example.com:443/b"],
+    ] {
+        let e = check_base_rpcs(&urls(&list), &chain, 84_532).expect_err("one host").to_string();
+        assert!(e.contains("host"), "{e}");
+    }
+    assert!(check_base_rpcs(&urls(&["https://a.example.com", "https://b.example.org"]), &chain, 84_532).is_ok());
+    assert!(check_base_rpcs(&urls(&["http://127.0.0.1:8548", "http://127.0.0.1:8545"]), &chain, 84_532).is_ok());
+}
+
+/// M-7: an RPC silent at the start is used only once it said its chain (the L1 as the Base RPCs): checked again at each
+/// use until it does; another chain, refused.
+#[test]
+fn m7_an_rpc_silent_at_the_start_is_checked_again_before_use() {
+    let mut checked = false;
+    assert!(recheck_chain(&mut checked, || Err(anyhow!("timeout")), 11_155_111).is_err());
+    assert!(!checked);
+    assert!(recheck_chain(&mut checked, || Ok(1), 11_155_111).is_err());
+    assert!(!checked);
+    recheck_chain(&mut checked, || Ok(11_155_111), 11_155_111).unwrap();
+    assert!(checked);
+    recheck_chain(&mut checked, || panic!("not asked again"), 11_155_111).unwrap();
+}
+
+/// M-7: the L1 RPC must serve the finalized block the beacon's update names (its state root), as `fast-release`
+/// checks: two sources that must agree before any game fact is read under that block.
+#[test]
+fn m7_the_l1_rpc_serves_the_block_the_finality_update_names() {
+    struct OneBlock([u8; 32]);
+    impl BaseRpc for OneBlock {
+        fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+            assert_eq!(method, "eth_getBlockByNumber");
+            assert_eq!(params[0], json!("0x10"));
+            Ok(json!({"number": "0x10", "stateRoot": format!("0x{}", hex::encode(self.0))}))
+        }
+    }
+    assert!(check_l1_block(&OneBlock([7u8; 32]), 16, &[7u8; 32]).is_ok());
+    let e = check_l1_block(&OneBlock([8u8; 32]), 16, &[7u8; 32]).unwrap_err().to_string();
+    assert!(e.contains("another block"), "{e}");
 }

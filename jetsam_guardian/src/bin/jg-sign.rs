@@ -49,17 +49,20 @@ fn interfaces() -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-fn harden() {
+/// F-8 (external audit of the robots): the hardening the robots use (`harden::harden`), each result checked: no start
+/// when the process stays dumpable or may write a core, nor with its memory not locked (unless the operator's
+/// `--allow-unlocked-memory`, an ALERT): the share would reach a core file or the swap.
+fn harden(allow_unlocked: bool) -> anyhow::Result<()> {
+    let h = jetsam_guardian::harden::harden();
     unsafe {
-        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
-        let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        libc::setrlimit(libc::RLIMIT_CORE, &zero);
-        if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
-            log("warning: mlockall refused (memory not locked)");
-        }
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
+    anyhow::ensure!(h.dumpable_off && h.core_off, "jg-sign cannot be hardened (dumpable {}, core dumps {}): it does not start", !h.dumpable_off, !h.core_off);
+    if let Some(alert) = jetsam_guardian::harden::memory_gate(&h, true, allow_unlocked).map_err(|e| anyhow::anyhow!("{e:#}: jg-sign does not start"))? {
+        log(&alert);
+    }
+    Ok(())
 }
 
 fn read_passphrase(fd: i32) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
@@ -152,7 +155,7 @@ fn run() -> anyhow::Result<()> {
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let config = PathBuf::from(arg("--config").ok_or_else(|| anyhow::anyhow!("--config <guardian.toml>"))?);
     let fd: i32 = arg("--passphrase-fd").ok_or_else(|| anyhow::anyhow!("--passphrase-fd <n>"))?.parse()?;
-    harden();
+    harden(args.iter().any(|a| a == jetsam_guardian::harden::ALLOW_UNLOCKED_MEMORY))?;
     let ifaces = interfaces()?;
     anyhow::ensure!(
         ifaces.iter().all(|i| i == "lo"),
@@ -162,7 +165,10 @@ fn run() -> anyhow::Result<()> {
     log(&format!("config {} sha256 {}", config.display(), hex::encode(digest)));
     let sign_dir = cfg.state_dir.join("sign");
     let passphrase = read_passphrase(fd)?;
-    let machine = open_machine_key(&std::fs::read(sign_dir.join(format!("machine-g{}.key.sealed", cfg.generation)))?, &passphrase)?;
+    let sealed = std::fs::read(sign_dir.join(format!("machine-g{}.key.sealed", cfg.generation)))?;
+    // M-12: a machine key sealed with the TEST cost is the private rehearsal's only
+    jetsam_guardian::seal::check_machine_key_cost(&sealed, cfg.profile()?)?;
+    let machine = open_machine_key(&sealed, &passphrase)?;
     drop(passphrase);
     let blob = std::fs::read(sign_dir.join(format!("share-g{}.sealed", cfg.generation)))?;
     let payload = open_sealed(&machine, &blob, &share_aad(cfg.generation, cfg.index))?;

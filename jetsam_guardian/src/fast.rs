@@ -315,13 +315,21 @@ pub fn fast_keygen(out: &Path) -> anyhow::Result<[u8; KEY_BYTES]> {
 }
 
 /// The secret of a file [`fast_keygen`] wrote; refused when the file is
-/// readable or writable by anyone but its owner.
+/// readable or writable by anyone but its owner. F-7 (external audit of the
+/// robots): opened without following a symbolic link (`O_NOFOLLOW`), its mode
+/// and owner (this process's user) read from the descriptor opened, then read
+/// from it: no window between the check and the read.
 pub fn load_fast_secret(path: &Path) -> anyhow::Result<SecretKey> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path)
-        .with_context(|| format!("{}", path.display()))?
-        .permissions()
-        .mode();
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| anyhow!("{}: {e} (a symbolic link is refused: name the file itself)", path.display()))?;
+    let meta = f.metadata().with_context(|| format!("{}", path.display()))?;
+    anyhow::ensure!(meta.is_file(), "{}: not a regular file: refused", path.display());
+    let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
         bail!(
             "{}: mode {:o}, readable or writable by others than its owner: refused",
@@ -329,7 +337,11 @@ pub fn load_fast_secret(path: &Path) -> anyhow::Result<SecretKey> {
             mode & 0o777
         );
     }
-    let text = zeroize::Zeroizing::new(std::fs::read_to_string(path)?);
+    // SAFETY: geteuid has no precondition
+    let uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(meta.uid() == uid, "{}: owned by uid {}, not this process's {uid}: refused", path.display(), meta.uid());
+    let mut text = zeroize::Zeroizing::new(String::new());
+    f.read_to_string(&mut text)?;
     let mut lines = text.lines();
     if lines.next() != Some(FAST_SECRET_FILE_TAG) {
         bail!("{}: not a fast-lane secret file", path.display());

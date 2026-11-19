@@ -756,3 +756,17 @@ fn a_game_of_another_type_is_refused_other_type_and_never_read_as_621() {
     // a game of type 621 is still read whole
     assert_eq!(read_game(&l1, &BASE_SEPOLIA, 6, 1_000).unwrap().game_type, 621);
 }
+
+/// F-7 (external audit of the robots): the fast lane's secret is read from the file itself, never through a symbolic
+/// link (O_NOFOLLOW), its mode and owner checked on the descriptor opened (no window between the check and the read).
+#[test]
+fn f7_the_fast_secret_is_never_read_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.key");
+    fast_keygen(&path).expect("a key");
+    assert!(load_fast_secret(&path).is_ok());
+    let link = dir.path().join("link.key");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    let e = load_fast_secret(&link).err().expect("refused through a link").to_string();
+    assert!(e.contains("link") || e.contains("refused"), "{e}");
+}

@@ -3,12 +3,14 @@
 
 //! `jg-keys` — the keys of ONE guardian machine (design §6.1, §6.2 step 10):
 //!
-//! * `machine-init --state <dir> --generation <g> --passphrase-fd <n> [--test-kdf]`:
+//! * `machine-init --state <dir> --generation <g> --passphrase-fd <n> [--test-kdf --private-rehearsal]`:
 //!   a new X25519 machine key, sealed by the operator's passphrase
-//!   (`<state>/sign/machine-g<g>.key.sealed`); prints its public key and
-//!   fingerprint (to compare on paper);
+//!   (`<state>/sign/machine-g<g>.key.sealed`, 0600); prints its public key and
+//!   fingerprint (to compare on paper). M-12: the TEST cost only with
+//!   `--private-rehearsal` said as well (printed `"kdf":"TEST"`; `jg-sign` and
+//!   `import` refuse such a key off the private rehearsal);
 //! * `feed-init --state <dir>`: the Ed25519 feed key of `jg-net`
-//!   (`<state>/net/feed.key`), prints its public key;
+//!   (`<state>/net/feed.key`, 0600, never over a file), prints its public key;
 //! * `import --config <guardian.toml> --sealed <share file> --passphrase-fd <n>
 //!   --h0-header <hex>`: opens the share with the machine key, checks it
 //!   against the Feldman commitments, checks a partial on the ceremony's test
@@ -25,7 +27,7 @@ use jetsam_guardian::chain::HeaderInfo;
 use jetsam_guardian::config::GuardianConfig;
 use jetsam_guardian::feed::FeedKey;
 use jetsam_guardian::journal::{GenesisBody, Journal};
-use jetsam_guardian::seal::{open_machine_key, open_sealed, seal_machine_key, share_aad, KdfCost, MachineKey};
+use jetsam_guardian::seal::{check_machine_key_cost, open_machine_key, open_sealed, seal_machine_key, share_aad, write_new_private, KdfCost, MachineKey};
 use jetsam_guardian::threshold::{partial_sign, share_public_key, verify, verify_share, Share};
 
 fn passphrase(fd: i32) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
@@ -46,31 +48,41 @@ fn run() -> anyhow::Result<()> {
         Some("machine-init") => {
             let state = PathBuf::from(get("--state")?);
             let gen: u32 = get("--generation")?.parse()?;
-            let cost = if a.iter().any(|x| x == "--test-kdf") { KdfCost::TEST } else { KdfCost::PRODUCTION };
+            // M-12 (external audit of the robots): the TEST cost only when the private rehearsal is said too
+            let test_kdf = a.iter().any(|x| x == "--test-kdf");
+            anyhow::ensure!(
+                !test_kdf || a.iter().any(|x| x == "--private-rehearsal"),
+                "--test-kdf seals a key any offline search opens: only for the private rehearsal, with --private-rehearsal said as well"
+            );
+            let cost = if test_kdf { KdfCost::TEST } else { KdfCost::PRODUCTION };
             let pass = passphrase(get("--passphrase-fd")?.parse()?)?;
             let path = state.join("sign").join(format!("machine-g{gen}.key.sealed"));
             anyhow::ensure!(!path.exists(), "{} exists: never overwritten", path.display());
             std::fs::create_dir_all(path.parent().expect("dir"))?;
             let k = MachineKey::generate()?;
-            std::fs::write(&path, seal_machine_key(&k, &pass, cost)?)?;
-            println!("{{\"machine_public\":\"{}\",\"fingerprint\":\"{}\"}}", hex::encode(k.public), k.fingerprint());
+            write_new_private(&path, &seal_machine_key(&k, &pass, cost)?)?;
+            let kdf = if test_kdf { "TEST" } else { "PRODUCTION" };
+            println!("{{\"machine_public\":\"{}\",\"fingerprint\":\"{}\",\"kdf\":\"{kdf}\"}}", hex::encode(k.public), k.fingerprint());
         }
         Some("feed-init") => {
             let state = PathBuf::from(get("--state")?);
             let path = state.join("net").join("feed.key");
             anyhow::ensure!(!path.exists(), "{} exists: never overwritten", path.display());
             std::fs::create_dir_all(path.parent().expect("dir"))?;
-            let mut secret = [0u8; 32];
-            getrandom::getrandom(&mut secret).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let k = FeedKey::from_secret(secret);
-            std::fs::write(&path, hex::encode(secret))?;
+            let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+            getrandom::getrandom(&mut secret[..]).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let k = FeedKey::from_secret(*secret);
+            // M-12: 0600 whatever the umask, never over a file
+            write_new_private(&path, zeroize::Zeroizing::new(hex::encode(&secret[..])).as_bytes())?;
             println!("{{\"feed_public\":\"{}\"}}", hex::encode(k.public()));
         }
         Some("import") => {
             let (cfg, _) = GuardianConfig::load(&PathBuf::from(get("--config")?))?;
             let pass = passphrase(get("--passphrase-fd")?.parse()?)?;
             let sign = cfg.state_dir.join("sign");
-            let machine = open_machine_key(&std::fs::read(sign.join(format!("machine-g{}.key.sealed", cfg.generation)))?, &pass)?;
+            let sealed = std::fs::read(sign.join(format!("machine-g{}.key.sealed", cfg.generation)))?;
+            check_machine_key_cost(&sealed, cfg.profile()?)?;
+            let machine = open_machine_key(&sealed, &pass)?;
             let blob = std::fs::read(get("--sealed")?)?;
             let payload = open_sealed(&machine, &blob, &share_aad(cfg.generation, cfg.index))?;
             let scalar: [u8; 32] = payload[8..40].try_into()?;
