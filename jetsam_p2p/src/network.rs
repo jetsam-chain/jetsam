@@ -739,6 +739,21 @@ struct SyncPath {
     profile_handshake_started: bool,
     closing: bool,
     established_at: Instant,
+    /// The last outbound ping this node saw answered on this path.
+    last_ping_ok: Option<Instant>,
+}
+
+/// A path that has answered no ping for two ping intervals (since it was
+/// established, or since its last answer) is silent: its flow is most
+/// likely dead, and it yields to a new duplicate path of the same direction.
+const SILENT_PATH_AFTER: Duration =
+    Duration::from_secs(2 * crate::behaviour::PING_INTERVAL.as_secs());
+
+impl SyncPath {
+    fn is_silent(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_ping_ok.unwrap_or(self.established_at))
+            >= SILENT_PATH_AFTER
+    }
 }
 
 /// An inbound session whose dialer has not completed the network-profile
@@ -1043,6 +1058,7 @@ impl PeerSyncPaths {
                 profile_handshake_started: false,
                 closing: false,
                 established_at: Instant::now(),
+                last_ping_ok: None,
             },
         );
         debug_assert!(previous.is_none(), "libp2p connection IDs are unique");
@@ -1095,6 +1111,7 @@ impl PeerSyncPaths {
         if existing.is_empty() {
             return Vec::new();
         }
+        let now = Instant::now();
 
         let has_dialer = new_path.dialer || existing.iter().any(|(_, path)| path.dialer);
         let has_listener = !new_path.dialer || existing.iter().any(|(_, path)| !path.dialer);
@@ -1119,6 +1136,25 @@ impl PeerSyncPaths {
             } else {
                 Vec::new()
             }
+        } else if existing.iter().all(|(_, path)| path.is_silent(now)) {
+            // A same-direction duplicate beside a path that has answered no
+            // ping for two intervals: the flow under the old path is most
+            // likely dead (a NAT that dropped its state in silence), and the
+            // peer, often restarted, reached us again through a new one. Keep
+            // the new path. Both ends see the same silence on the same
+            // physical path, so they close the same one; two healthy paths
+            // never reach this branch.
+            let silent = existing
+                .iter()
+                .map(|(connection_id, _)| *connection_id)
+                .collect::<Vec<_>>();
+            tracing::info!(
+                peer = %peer,
+                new = ?new_connection,
+                replaced = ?silent,
+                "a new connection replaces a duplicate path that answers no ping"
+            );
+            silent
         } else if existing.iter().any(|(_, path)| path.identified) {
             // For same-direction duplicates, preserve an already usable path.
             // This is the common cached-peer plus unresolved-DNS case.
@@ -1148,8 +1184,10 @@ impl PeerSyncPaths {
         }
     }
 
-    fn note_ping_success(&mut self, _connection_id: libp2p::swarm::ConnectionId, _at: Instant) {
-        todo!("P2PFIX-B")
+    fn note_ping_success(&mut self, connection_id: libp2p::swarm::ConnectionId, at: Instant) {
+        if let Some(path) = self.paths.get_mut(&connection_id) {
+            path.last_ping_ok = Some(at);
+        }
     }
 
     fn mark_availability_capable(&mut self, connection_id: libp2p::swarm::ConnectionId) {
@@ -9624,7 +9662,15 @@ async fn handle_swarm_event(
         }
 
         // --- Ping: liveness of each connection ---
-        //
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Ping(libp2p::ping::Event {
+            connection,
+            result: Ok(_),
+            ..
+        })) => {
+            // An answered ping keeps a duplicate path from being judged
+            // silent (canonicalize_direct).
+            sync_paths.note_ping_success(connection, Instant::now());
+        }
         // yamux and libp2p-tcp keep no keepalive, and libp2p-ping leaves the
         // policy to us: without this arm a flow dropped in silence by a NAT
         // stayed open until the kernel gave up (tcp_retries2, ~16 min).
