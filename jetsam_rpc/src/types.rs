@@ -44,14 +44,13 @@ pub struct StorageHealthInfo {
 
 impl From<&jetsam_chain::storage::DbHealth> for StorageHealthInfo {
     fn from(health: &jetsam_chain::storage::DbHealth) -> Self {
-        let _ = health;
         Self {
-            file_bytes: 0,
-            live_bytes: 0,
-            gc_free_bytes: 0,
-            disk_total_bytes: None,
-            disk_used_bytes: None,
-            disk_available_bytes: None,
+            file_bytes: health.file_bytes,
+            live_bytes: health.live_bytes,
+            gc_free_bytes: health.gc_free_bytes,
+            disk_total_bytes: health.disk_total_bytes,
+            disk_used_bytes: health.disk_used_bytes,
+            disk_available_bytes: health.disk_available_bytes,
         }
     }
 }
