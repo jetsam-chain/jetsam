@@ -391,7 +391,7 @@ fn equivocation_with_unset_key_is_refused() {
     let (a, b) = two_branches();
     let eq = e1(&statement_at(&a, X), &statement_at(&b, X));
     let mut unset = rules();
-    unset.group_key = None;
+    unset.keys = &[];
     assert_eq!(
         validate_block_guardian(&eq_block(H, &eq), &fresh_state(), &a, &unset),
         Err(GuardianError::GuardianKeyUnset)
@@ -768,7 +768,7 @@ fn equivocation_rules_run_in_order_key_first() {
     let a = branch();
     let not_one = e1(&statement_at(&a, X), &statement_at(&a, X + 1));
     let mut unset = rules();
-    unset.group_key = None;
+    unset.keys = &[];
     assert_eq!(
         validate_block_guardian(&eq_block(H, &not_one), &fresh_state(), &a, &unset),
         Err(GuardianError::GuardianKeyUnset)

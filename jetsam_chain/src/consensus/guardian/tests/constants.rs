@@ -36,9 +36,12 @@ fn guardian_key_placeholder_refuses_every_attestation() {
     // The public and test chains carry no group key until their ceremony
     // (T8.1 / P9): every attestation and every equivocation is refused.
     #[cfg(not(feature = "rehearsal-v1-7"))]
-    assert_eq!(GUARDIAN_GROUP_KEY, None);
+    assert!(GUARDIAN_KEYS.is_empty());
     #[cfg(feature = "rehearsal-v1-7")]
-    assert_eq!(GUARDIAN_GROUP_KEY, Some(REHEARSAL_GUARDIAN_GROUP_KEY));
+    assert_eq!(
+        GUARDIAN_KEYS.iter().map(|k| k.key).collect::<Vec<_>>(),
+        vec![REHEARSAL_GUARDIAN_GROUP_KEY]
+    );
 
     let (key, statement, signature) = t05();
     // The fixture's signature is valid under its own key …
@@ -58,11 +61,8 @@ fn guardian_key_placeholder_refuses_every_attestation() {
         );
     }
     let mut rules = GuardianRules::current();
-    rules.group_key = None;
-    assert_eq!(
-        rules.verify_signature(&statement, &signature),
-        Err(GuardianSignatureError::KeyUnset)
-    );
+    rules.keys = &[];
+    assert_eq!(rules.key_at(u64::MAX), None);
 }
 
 #[test]
@@ -340,14 +340,13 @@ fn guardian_rules_current_are_this_builds_constants() {
     let rules = GuardianRules::current();
     assert_eq!(rules.activation_height, V1_7_ACTIVATION_HEIGHT);
     assert_eq!(rules.delegation_height, DELEGATION_ACTIVATION_HEIGHT);
-    assert_eq!(rules.group_key, GUARDIAN_GROUP_KEY);
+    assert_eq!(rules.keys, GUARDIAN_KEYS);
     assert_eq!(rules.network, network_id());
     assert_eq!(
         network_id(),
         crate::consensus::pow::block_id(&crate::consensus::genesis::genesis_header())
     );
     assert_eq!(rules.l1_chain_id, GUARDIAN_L1_CHAIN_ID);
-    assert_eq!(rules.l1_bridge, GUARDIAN_L1_BRIDGE);
     assert_eq!(rules.period, REWARD_PERIOD_BLOCKS);
     assert_eq!(rules.unbonding, UNBONDING_DELAY_BLOCKS);
     assert_eq!(rules.stake_vault, STAKE_VAULT);

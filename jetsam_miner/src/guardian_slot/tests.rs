@@ -39,14 +39,27 @@ fn values(key: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// The fixture's key and bridge from genesis (FIXEXT E-2: one table entry).
+fn fixture_keys() -> &'static [jetsam_chain::consensus::guardian::GuardianKeyEpoch] {
+    static KEYS: std::sync::OnceLock<[jetsam_chain::consensus::guardian::GuardianKeyEpoch; 1]> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        [jetsam_chain::consensus::guardian::GuardianKeyEpoch {
+            height: 0,
+            key: values("group_key")[0].clone().try_into().unwrap(),
+            l1_bridge: [0xb7; 20],
+        }]
+    })
+}
+
 fn rules() -> GuardianRules {
     GuardianRules {
         activation_height: Some(J),
         delegation_height: Some(JD),
-        group_key: Some(values("group_key")[0].clone().try_into().unwrap()),
+        keys: fixture_keys(),
+        unusable_keys: false,
         network: values("network")[0].clone().try_into().unwrap(),
         l1_chain_id: 1,
-        l1_bridge: Some([0xb7; 20]),
         period: 16,
         unbonding: 32,
         stake_vault: STAKE_VAULT,

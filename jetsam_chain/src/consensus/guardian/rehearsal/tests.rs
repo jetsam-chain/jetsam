@@ -12,7 +12,7 @@ use crate::consensus::guardian::tests::{block_of, MapBranch};
 use crate::consensus::guardian::{cum_work_word, headers_digest};
 use crate::consensus::guardian::{
     network_id, u256_word, validate_block_guardian, verify_guardian_signature, GuardianError,
-    GuardianRules, GuardianState, GUARDIAN_GROUP_KEY, GUARDIAN_L1_BRIDGE, GUARDIAN_L1_CHAIN_ID,
+    GuardianRules, GuardianState, GUARDIAN_KEYS, GUARDIAN_L1_BRIDGE, GUARDIAN_L1_CHAIN_ID,
     GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION, REHEARSAL_GUARDIAN_GROUP_KEY,
 };
 use crate::consensus::params::V1_7_ACTIVATION_HEIGHT;
@@ -28,7 +28,10 @@ fn rehearsal_group_secret_is_the_t05_test_key() {
         rehearsal_group_secret().sk_to_pk().compress(),
         REHEARSAL_GUARDIAN_GROUP_KEY
     );
-    assert_eq!(GUARDIAN_GROUP_KEY, Some(REHEARSAL_GUARDIAN_GROUP_KEY));
+    assert_eq!(
+        GUARDIAN_KEYS.iter().map(|k| k.key).collect::<Vec<_>>(),
+        vec![REHEARSAL_GUARDIAN_GROUP_KEY]
+    );
     let statement = [0x5a; STATEMENT_BYTES];
     assert_eq!(
         verify_guardian_signature(
@@ -67,7 +70,10 @@ fn rehearsal_statement_names_this_builds_domain() {
 fn attestation_accepted_on_rehearsal_profile() {
     let rules = GuardianRules::current();
     assert_eq!(rules, GuardianRules::consensus());
-    assert_eq!(rules.l1_bridge, Some(REHEARSAL_L1_BRIDGE.address));
+    assert_eq!(
+        rules.keys.iter().map(|k| (k.height, k.l1_bridge)).collect::<Vec<_>>(),
+        vec![(V1_7_ACTIVATION_HEIGHT.expect("armed"), REHEARSAL_L1_BRIDGE.address)]
+    );
     let j = V1_7_ACTIVATION_HEIGHT.expect("armed");
     let branch = MapBranch::new("rehearsal", 0, j + 200);
     let h = j + 40;

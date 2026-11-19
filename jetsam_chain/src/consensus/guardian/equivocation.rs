@@ -232,19 +232,25 @@ fn witnessed(
 /// one per block, is the block's). The two signatures are checked last.
 pub fn check_equivocation(
     state: &GuardianState,
+    height: u64,
     equivocation: &GuardianEquivocation,
     rules: &GuardianRules,
 ) -> Result<(), GuardianError> {
-    // Q-1, Q-2.
-    if rules.group_key.is_none() {
-        return Err(GuardianError::GuardianKeyUnset);
-    }
-    if state.revoked_at.is_some() {
+    // Q-1, Q-2 (FIXEXT E-2: the key in force at the block `height`).
+    let key = rules.key_at(height).ok_or(GuardianError::GuardianKeyUnset)?;
+    if GuardianRules::is_revoked(state.revoked_at, key) {
         return Err(GuardianError::GuardianKeyRevoked);
     }
     // Q-3: this network, any L1 domain.
-    let s1 = check_statement_domain(&equivocation.s1, rules, false)?;
-    let s2 = check_statement_domain(&equivocation.s2, rules, false)?;
+    let s1 = check_statement_domain(&equivocation.s1, rules, None)?;
+    let s2 = check_statement_domain(&equivocation.s2, rules, None)?;
+    // FIXEXT E-2: both statements of that key (the holder of a replaced key
+    // never revokes its successor).
+    for statement in [&s1, &s2] {
+        if rules.key_at(statement.height) != Some(key) {
+            return Err(GuardianError::StatementOfAnotherKey);
+        }
+    }
     // Q-4.
     if equivocation.s1 >= equivocation.s2 {
         return Err(GuardianError::EquivocationNotCanonical);
@@ -274,8 +280,8 @@ pub fn check_equivocation(
         }
     }
     // Q-5.
-    check_signature(&equivocation.s1, &equivocation.sig1, rules)?;
-    check_signature(&equivocation.s2, &equivocation.sig2, rules)?;
+    check_signature(&equivocation.s1, &equivocation.sig1, key, rules)?;
+    check_signature(&equivocation.s2, &equivocation.sig2, key, rules)?;
     Ok(())
 }
 

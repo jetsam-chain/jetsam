@@ -441,19 +441,8 @@ fn attestation_wrong_l1_domain_is_refused() {
         refused(signed_edit(&branch, H - 8, |s| s.l1_bridge = [0xb8; 20])),
         GuardianError::ForeignStatementDomain
     );
-    // While the bridge is not frozen (`l1_bridge = None`), no attestation can
-    // name it.
-    let mut unfrozen = rules();
-    unfrozen.l1_bridge = None;
-    assert_eq!(
-        validate_block_guardian(
-            &block_of(H, &[ok_attestation(&branch)]),
-            &fresh_state(),
-            &branch,
-            &unfrozen
-        ),
-        Err(GuardianError::ForeignStatementDomain)
-    );
+    // FIXEXT E-2: a key is armed with its bridge (one table entry), never
+    // without it: no rule set names a key whose bridge is unfrozen.
 }
 
 #[test]
@@ -694,7 +683,7 @@ fn attestation_height_not_increasing_is_refused() {
 fn attestation_with_unset_key_is_refused_in_a_block() {
     let branch = branch();
     let mut unset = rules();
-    unset.group_key = None;
+    unset.keys = &[];
     assert_eq!(
         validate_block_guardian(
             &block_of(H, &[ok_attestation(&branch)]),

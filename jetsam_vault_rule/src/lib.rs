@@ -149,8 +149,8 @@ pub struct LegacyDepositCap {
 /// D123 (10 November 2026): the test chain's caps height. From the block at this height on, the test chain
 /// judges its deposits, releases and vault under D123's caps (50 000 JTM, [`MAX_DEPOSIT_MICRO`] here, V6 and
 /// V8 in the node's vault gate); below it under the caps it ran v1.7 with since J = 8 160 (1 000 / 2 500 /
-/// 10 000 JTM): a hard fork of the test chain. **`None` until the operator chooses it at deployment**: while
-/// it is `None` a test node judges every block exactly as before. The node (`params::V1_7_TESTNET_CAPS_HEIGHT`)
+/// 10 000 JTM): a hard fork of the test chain. **Chosen: 8 910** (`None` would mean not chosen: every block
+/// judged under the caps of before). The node (`params::V1_7_TESTNET_CAPS_HEIGHT`)
 /// and the proof program (`jetsam_bridge_program::deposit`, its own `testnet` feature) both read this one
 /// constant. The public network and the rehearsal have no such height: D123's caps from their J.
 pub const TESTNET_CAPS_HEIGHT: Option<u64> = Some(8_910);

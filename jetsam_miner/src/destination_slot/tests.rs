@@ -1809,6 +1809,7 @@ mod reopened {
                     anchor: None,
                     bridge: None,
                     bridge_rotations: &[],
+                    fixext_height: None,
                 },
             },
             keys,

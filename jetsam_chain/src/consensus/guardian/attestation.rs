@@ -7,8 +7,8 @@
 
 use super::statement::{cum_work_word, headers_digest, u256_word, GuardianStatement};
 use super::{
-    GuardianBranch, GuardianError, GuardianObject, GuardianObjectKind, GuardianRules,
-    GuardianSignatureError, GuardianState, ATTESTATION_MAX_AGE, ATTESTATION_MIN_DEPTH,
+    verify_guardian_signature, GuardianBranch, GuardianError, GuardianKeyEpoch, GuardianObject,
+    GuardianObjectKind, GuardianRules, GuardianSignatureError, GuardianState, ATTESTATION_MAX_AGE, ATTESTATION_MIN_DEPTH,
     GUARDIAN_STATEMENT_DOMAIN, GUARDIAN_STATEMENT_VERSION, SIGNATURE_BYTES, STATEMENT_BYTES,
 };
 
@@ -46,41 +46,44 @@ impl GuardianAttestation {
 }
 
 /// Rule A-4 for any statement Jetsam judges: canonical, and this network's
-/// domain, schema and network words. `l1_domain` also requires the L1 chain
-/// and bridge of this build (an attestation; an equivocation leaves them
-/// free).
+/// domain, schema and network words. `l1_bridge` (an attestation: the bridge
+/// of its key, FIXEXT E-2) also requires the L1 chain of this build and that
+/// bridge (an equivocation, `None`, leaves them free).
 pub(crate) fn check_statement_domain(
     bytes: &[u8; STATEMENT_BYTES],
     rules: &GuardianRules,
-    l1_domain: bool,
+    l1_bridge: Option<[u8; 20]>,
 ) -> Result<GuardianStatement, GuardianError> {
     let statement = GuardianStatement::decode(bytes)?;
     let own = statement.domain == GUARDIAN_STATEMENT_DOMAIN
         && statement.schema_version == GUARDIAN_STATEMENT_VERSION
         && statement.network == rules.network;
-    let l1 = !l1_domain
-        || (statement.l1_chain_id == u256_word(rules.l1_chain_id)
-            && rules.l1_bridge == Some(statement.l1_bridge));
+    let l1 = l1_bridge.is_none_or(|bridge| {
+        statement.l1_chain_id == u256_word(rules.l1_chain_id) && statement.l1_bridge == bridge
+    });
     if !(own && l1) {
         return Err(GuardianError::ForeignStatementDomain);
     }
     Ok(statement)
 }
 
-/// Rule A-10 / Q-5: the signature under this build's key.
+/// Rule A-10 / Q-5: the signature under the key `key` (refused as invalid
+/// under [`GuardianRules::unusable_keys`]).
 pub(crate) fn check_signature(
     statement: &[u8; STATEMENT_BYTES],
     signature: &[u8; SIGNATURE_BYTES],
+    key: &GuardianKeyEpoch,
     rules: &GuardianRules,
 ) -> Result<(), GuardianError> {
-    rules
-        .verify_signature(statement, signature)
-        .map_err(|error| match error {
-            GuardianSignatureError::KeyUnset => GuardianError::GuardianKeyUnset,
-            GuardianSignatureError::BadGroupKey | GuardianSignatureError::BadSignature => {
-                GuardianError::InvalidGuardianSignature
-            }
-        })
+    if rules.unusable_keys {
+        return Err(GuardianError::InvalidGuardianSignature);
+    }
+    verify_guardian_signature(Some(&key.key), statement, signature).map_err(|error| match error {
+        GuardianSignatureError::KeyUnset => GuardianError::GuardianKeyUnset,
+        GuardianSignatureError::BadGroupKey | GuardianSignatureError::BadSignature => {
+            GuardianError::InvalidGuardianSignature
+        }
+    })
 }
 
 fn id_at(branch: &dyn GuardianBranch, height: u64) -> Result<[u8; 32], GuardianError> {
@@ -99,15 +102,19 @@ pub fn check_attestation(
     branch: &dyn GuardianBranch,
     rules: &GuardianRules,
 ) -> Result<u64, GuardianError> {
-    // A-2, A-3.
-    if rules.group_key.is_none() {
+    // A-2, A-3 (FIXEXT E-2: the key of the attested height).
+    if rules.keys.is_empty() {
         return Err(GuardianError::GuardianKeyUnset);
     }
-    if state.revoked_at.is_some() {
+    let attested_at = GuardianStatement::decode(&attestation.statement)?.height;
+    let key = rules
+        .key_at(attested_at)
+        .ok_or(GuardianError::GuardianKeyUnset)?;
+    if GuardianRules::is_revoked(state.revoked_at, key) {
         return Err(GuardianError::GuardianKeyRevoked);
     }
     // A-4.
-    let statement = check_statement_domain(&attestation.statement, rules, true)?;
+    let statement = check_statement_domain(&attestation.statement, rules, Some(key.l1_bridge))?;
     // A-5 (and room for the eight ids of A-7).
     let attested = statement.height;
     let depth = height.checked_sub(attested);
@@ -143,6 +150,6 @@ pub fn check_attestation(
         return Err(GuardianError::AttestationNotIncreasing);
     }
     // A-10.
-    check_signature(&attestation.statement, &attestation.signature, rules)?;
+    check_signature(&attestation.statement, &attestation.signature, key, rules)?;
     Ok(attested)
 }

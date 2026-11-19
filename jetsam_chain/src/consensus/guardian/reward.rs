@@ -222,7 +222,12 @@ pub fn apply_period_boundary(state: &mut GuardianState, height: u64, rules: &Gua
     // 2. The guardians' share of the period's new funding.
     let closed = (height / period).checked_sub(1);
     let funded = u128::from(state.fund_current);
-    let share = if closed.is_some() && state.attested_period == closed && state.revoked_at.is_none()
+    // FIXEXT E-2: the key in force at the boundary, not revoked (a single key
+    // armed from J: as `revoked_at.is_none()`).
+    let key_open = rules
+        .key_at(height)
+        .is_some_and(|key| !GuardianRules::is_revoked(state.revoked_at, key));
+    let share = if closed.is_some() && state.attested_period == closed && key_open
     {
         funded * u128::from(GUARDIAN_SHARE_BPS) / 10_000
     } else {

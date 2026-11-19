@@ -141,10 +141,14 @@ fn revocation_certificate_verifies_on_node_and_contract() {
     assert!(eq.s1 < eq.s2);
     // the node's rules Q-1..Q-8 accept it under this group key and network
     let mut rules = GuardianRules::consensus();
-    rules.group_key = Some(d.group_key);
+    rules.keys = Box::leak(Box::new([jetsam_chain::consensus::guardian::GuardianKeyEpoch {
+        height: 0,
+        key: d.group_key,
+        l1_bridge: domain.l1_bridge,
+    }]));
     rules.network = domain.network;
     let state = GuardianState::default();
-    assert_eq!(check_equivocation(&state, &eq, &rules), Ok(()));
+    assert_eq!(check_equivocation(&state, 1u64 << 63, &eq, &rules), Ok(()));
     // the contract side (E-1..E-5) is checked on the local L1 (T7.6)
 }
 
