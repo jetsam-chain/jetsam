@@ -17,8 +17,9 @@ const BLOCK_9155_ID: &str = "2cc2fbf3210ff9dbf7053341b42a3cc556330efbd800f9568e7
 #[test]
 fn a_fast_release_block_of_the_public_test_chain_is_read_and_holds_no_deposit() {
     let rules = VaultRules::current();
-    if !rules.active_at(9_155) {
-        // the default and rehearsal builds have no v1.7 clock at this height: the vault gate reads nothing there
+    if !jetsam_chain::consensus::vault::TESTNET_PROFILE || !rules.active_at(9_155) {
+        // a block of the public test chain is read with its rule only: the default build has no v1.7 clock at this
+        // height, and the rehearsal's clock (from 96) reads its own markers, not the public test chain's
         eprintln!("skipped: this build's v1.7 clock is not the public test chain's");
         return;
     }
