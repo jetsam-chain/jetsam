@@ -355,3 +355,100 @@ fn fixextcap_the_public_networks_vector_has_no_ceiling_the_test_chains_bridges_k
     let deployed: Value = serde_json::from_str(include_str!("fixtures/bridge2_deployment_testnet.json")).unwrap();
     assert!(code_has_selector(&bytes(&deployed["initCode"]), "OUTSTANDING_CEIL()"), "BRIDGE2B as deployed");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// CO-1 (final audit AUDIT-FINAL2 §3.6, CO1_PLAN §4.1): the vectors around the frozen verifier; the CO-1 bridge, its keys
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The frozen JetsamSP1Verifier (our ceremony's key, D95): its runtime code hash (the contract's
+/// `MAINNET_VERIFIER_CODEHASH` = `TESTNET_VERIFIER_CODEHASH`) and its CREATE2 address on Base Sepolia (D184: through the
+/// factory under `keccak("jetsam-bridge/v3/verifier/sp1-v6.1.0-jtm1")`).
+const FROZEN_VERIFIER_CODEHASH: &str = "0f3729f5205adfa2f8741b5a401a80f7e3bb2be432313fb7a5b5debae3bd9851";
+const FROZEN_VERIFIER: &str = "39aad60ae44a008ef1a6bd92beb652f4c3928e9f";
+
+/// CREATE2 from the init code's hash (the vectors carry the verifier's hash, not its init code).
+fn create2_of_hash(factory: &[u8], salt: &[u8], init_hash: &[u8]) -> Vec<u8> {
+    let mut pre = vec![0xff];
+    pre.extend_from_slice(factory);
+    pre.extend_from_slice(salt);
+    pre.extend_from_slice(init_hash);
+    keccak256(&pre)[12..].to_vec()
+}
+
+/// C5: the public network's vector (the one copied from the contract, information only) is around the frozen verifier:
+/// its code hash is the pin, its address the CREATE2 of its salt and init-code hash and the one on Base Sepolia, and both
+/// adapters wrap it; never SP1's own v6.1.0 (0x5B8C…1187) any more. Checked whatever the profile.
+#[test]
+fn co1_the_public_networks_vector_is_around_the_frozen_verifier() {
+    let v: Value = serde_json::from_str(PROFILES[0].vector).unwrap();
+    let s = &v["sp1Verifier"];
+    assert_eq!(hex(&bytes(&s["codeHash"])), FROZEN_VERIFIER_CODEHASH, "the frozen code hash");
+    assert_eq!(s["version"].as_str(), Some("v6.1.0-jtm1"));
+    assert_eq!(bytes(&s["salt"]), keccak256(b"jetsam-bridge/v3/verifier/sp1-v6.1.0-jtm1"));
+    let at = create2_of_hash(&bytes(&v["factory"]), &bytes(&s["salt"]), &bytes(&s["initCodeHash"]));
+    assert_eq!(at, bytes(&s["address"]));
+    assert_eq!(hex(&at), FROZEN_VERIFIER, "the verifier live on Base Sepolia");
+    for key in ["checkpointVerifier", "claimVerifier"] {
+        let a_init = bytes(&v[key]["initCode"]);
+        assert_eq!(hex(&as_address(word(&a_init[a_init.len() - 64..], 0))), FROZEN_VERIFIER, "{key}");
+    }
+}
+
+/// C6 rehearsed on the CO-1 bridge (the parallel test bridge with real proofs; no node pins it: the nodes pin a bridge
+/// only for the return): its deployment record (`co1_deployment_testnet.json`, written by the contract's
+/// `co1_deployment_record.sh`: what `DeployCreate2.run()` deploys under `testnet-co1`) is the CREATE2 of its keys. Each
+/// adapter is the CREATE2 of `creationCode(adapter) || abi.encode(the frozen verifier, the program's vkey)` — the vkeys of
+/// the testnet guests, the same creation code for both — and the bridge the CREATE2 of an init code whose Config names
+/// those two adapters, the test chain's genesis, its window [13 800 ; 20 000], first burn index 9 000 000 and the test
+/// chain's real genesis and pause keys. Checked whatever the profile. The GO deployment must find exactly this address and
+/// code hash on Base Sepolia.
+#[test]
+fn co1_the_real_proof_bridge_is_its_keys() {
+    let v: Value = serde_json::from_str(include_str!("fixtures/co1_deployment_testnet.json")).unwrap();
+    assert_eq!(v["profile"].as_str(), Some("testnet-co1"));
+    let factory = bytes(&v["factory"]);
+    assert_eq!(hex(&factory), FACTORY);
+    let sp1 = bytes(&v["sp1Verifier"]["address"]);
+    assert_eq!(hex(&sp1), FROZEN_VERIFIER);
+    assert_eq!(hex(&bytes(&v["sp1Verifier"]["codeHash"])), FROZEN_VERIFIER_CODEHASH);
+    assert_eq!(bytes(&v["sp1Verifier"]["salt"]), keccak256(b"jetsam-bridge/v3/verifier/sp1-v6.1.0-jtm1"));
+    // the testnet guests (ELF 5f4b71fc… / 78e98af1…), as in the test chain's vector
+    let t: Value = serde_json::from_str(PROFILES[1].vector).unwrap();
+    let mut adapters = Vec::new();
+    let mut creation: Option<Vec<u8>> = None;
+    for (key, salt) in [("checkpointVerifier", &b"jetsam-bridge/v3/verifier/checkpoint"[..]), ("claimVerifier", &b"jetsam-bridge/v3/verifier/claim"[..])] {
+        let a = &v[key];
+        let vkey = bytes(&a["vkey"]);
+        assert_eq!(vkey, bytes(&t[key]["vkey"]), "{key}: the testnet guest's vkey");
+        assert_eq!(bytes(&a["salt"]), keccak256(salt), "{key}");
+        let init = bytes(&a["initCode"]);
+        let (code, args) = init.split_at(init.len() - 64);
+        assert_eq!(as_address(word(args, 0)), sp1, "{key}: wraps the frozen verifier");
+        assert_eq!(word(args, 1), &vkey[..], "{key}");
+        assert_eq!(*creation.get_or_insert_with(|| code.to_vec()), code, "{key}: one adapter creation code");
+        let at = create2(&factory, &keccak256(salt), &init);
+        assert_eq!(at, bytes(&a["address"]), "{key}");
+        adapters.push(at);
+    }
+    assert_ne!(adapters[0], adapters[1]);
+    let b = &v["bridge"];
+    let init = bytes(&b["initCode"]);
+    assert_eq!(bytes(&b["salt"]), keccak256(b"jetsam-bridge/v3"));
+    let address = create2(&factory, &keccak256(b"jetsam-bridge/v3"), &init);
+    assert_eq!(address, bytes(&b["address"]), "the bridge is the CREATE2 of its init code");
+    let config = &init[init.len() - 9 * 32..];
+    assert_eq!(as_address(word(config, 0)), adapters[0]);
+    assert_eq!(as_address(word(config, 1)), adapters[1]);
+    assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
+    assert_eq!((as_u64(word(config, 3)), as_u64(word(config, 4))), (13_800, 20_000), "the genesis window");
+    assert_eq!(hex(word(config, 5)), PROFILES[1].network, "the test chain's genesis");
+    assert_eq!(hex(&as_address(word(config, 6))), "fd9aec19a49b71bd38ecf03e4774afb1b0888317", "the test chain's genesis key");
+    assert_eq!(hex(&as_address(word(config, 7))), "60d2f7093181e1a47f54d0b4b30efedc5505eaea", "the test chain's pause key");
+    assert_eq!(as_u64(word(config, 8)), 9_000_000, "first burn index, in no node table");
+    // the audit's code (no C-6), the vault's address in it, and no node table names it (it changes no consensus)
+    assert!(!code_has_selector(&init, "OUTSTANDING_CEIL()"));
+    assert!(init.windows(33).any(|w| w[0] == 0x7f && w[1..] == VAULT_ADDRESS.0));
+    use jetsam_chain::consensus::destination::state::BASE_RETURN_BRIDGE_ROTATIONS;
+    assert!(BASE_RETURN_BRIDGE_ROTATIONS.iter().all(|r| r.bridge.address.to_vec() != address), "no node pins the CO-1 bridge");
+    assert!(BASE_RETURN_BRIDGE_ROTATIONS.iter().all(|r| r.first_burn < 9_000_000));
+}
