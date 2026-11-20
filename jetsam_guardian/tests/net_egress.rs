@@ -1299,6 +1299,8 @@ fn minted_first(inner: Answer, keys: std::collections::HashMap<String, String>) 
                 minted.lock().unwrap().insert(data[10 + 192..10 + 256].to_string());
                 inner(method, params)
             }
+            // M-2: the robot reads `advanceOf` and `isMinted` at one L1 block, the head it reads first
+            "eth_blockNumber" => json!({"result": "0x10"}),
             "eth_call" if data.starts_with(&is_minted) => json!({"result": format!("0x{:064x}", u8::from(minted.lock().unwrap().contains(&data[10..74])))}),
             "eth_call" if data.starts_with(&advance_of) => {
                 let repaid = keys.get(&data[10..74]).is_some_and(|t| minted.lock().unwrap().contains(t));
