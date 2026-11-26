@@ -452,3 +452,61 @@ fn co1_the_real_proof_bridge_is_its_keys() {
     assert!(BASE_RETURN_BRIDGE_ROTATIONS.iter().all(|r| r.bridge.address.to_vec() != address), "no node pins the CO-1 bridge");
     assert!(BASE_RETURN_BRIDGE_ROTATIONS.iter().all(|r| r.first_burn < 9_000_000));
 }
+
+/// The public network's bridge (26/11/2026): its deployment record (`bridge_deployment_mainnet.json`, written by the
+/// contract's `mainnet_deployment_record.sh`: what `DeployCreate2.run()` deploys under `mainnet`, the same on a local fork
+/// of Base) is the CREATE2 of its keys: the two adapters around the frozen verifier with the vkeys of the guests armed at
+/// J = 61 440 (the public network's vector), and the bridge whose Config names them, the public network's genesis, its
+/// window [61 440 ; 62 880], first burn index 1, the genesis key (the deployer, single use, D73) and the pause key (D220)
+/// the operator named. A public build pins exactly this address and code hash for its return over Base, with no genesis
+/// id yet (`initGenesis` comes at a height in the window, after J: a later release writes it). The GO deployment must find
+/// exactly this address and code hash on Base.
+#[test]
+fn mainnet_the_bridge_is_its_keys() {
+    let v: Value = serde_json::from_str(include_str!("fixtures/bridge_deployment_mainnet.json")).unwrap();
+    assert_eq!(v["profile"].as_str(), Some("mainnet"));
+    let factory = bytes(&v["factory"]);
+    assert_eq!(hex(&factory), FACTORY);
+    let sp1 = bytes(&v["sp1Verifier"]["address"]);
+    assert_eq!(hex(&sp1), FROZEN_VERIFIER);
+    assert_eq!(hex(&bytes(&v["sp1Verifier"]["codeHash"])), FROZEN_VERIFIER_CODEHASH);
+    let m: Value = serde_json::from_str(PROFILES[0].vector).unwrap();
+    let mut adapters = Vec::new();
+    for (key, salt) in [("checkpointVerifier", &b"jetsam-bridge/v3/verifier/checkpoint"[..]), ("claimVerifier", &b"jetsam-bridge/v3/verifier/claim"[..])] {
+        let a = &v[key];
+        assert_eq!(bytes(&a["vkey"]), bytes(&m[key]["vkey"]), "{key}: the armed guest's vkey");
+        assert_eq!(bytes(&a["initCode"]), bytes(&m[key]["initCode"]), "{key}: the vector's adapter");
+        let at = create2(&factory, &keccak256(salt), &bytes(&a["initCode"]));
+        assert_eq!(at, bytes(&a["address"]), "{key}");
+        adapters.push(at);
+    }
+    assert_ne!(adapters[0], adapters[1]);
+    let b = &v["bridge"];
+    let init = bytes(&b["initCode"]);
+    let address = create2(&factory, &keccak256(b"jetsam-bridge/v3"), &init);
+    assert_eq!(address, bytes(&b["address"]), "the bridge is the CREATE2 of its init code");
+    assert_eq!(hex(&address), "d9caa158dcec2947c5429eafbe561a36a958f74b");
+    let config = &init[init.len() - 9 * 32..];
+    assert_eq!(as_address(word(config, 0)), adapters[0]);
+    assert_eq!(as_address(word(config, 1)), adapters[1]);
+    assert_eq!(as_u64(word(config, 2)), RELEASE_FEE_MICRO);
+    assert_eq!((as_u64(word(config, 3)), as_u64(word(config, 4))), (61_440, 62_880), "the genesis window");
+    assert_eq!(hex(word(config, 5)), PROFILES[0].network, "the public network's genesis");
+    assert_eq!(hex(&as_address(word(config, 6))), "a40d6f4cfe04ce52a29f03d6ecf09a2f3ccd2bd5", "the genesis key");
+    assert_eq!(hex(&as_address(word(config, 7))), "4dc6adecf60ab8128679fac7334a94a76873a52a", "the pause key");
+    assert_eq!(as_u64(word(config, 8)), 1, "first burn index");
+    // the bridge's own creation code is the vector's (only the two keys differ in the Config)
+    let vector_init = bytes(&m["bridge"]["initCode"]);
+    assert_eq!(init.len(), vector_init.len());
+    assert_eq!(&init[..init.len() - 9 * 32], &vector_init[..vector_init.len() - 9 * 32]);
+    assert!(!code_has_selector(&init, "OUTSTANDING_CEIL()"));
+    assert!(init.windows(33).any(|w| w[0] == 0x7f && w[1..] == VAULT_ADDRESS.0));
+    if this_profile().name == "mainnet" {
+        use jetsam_chain::consensus::destination::state::BASE_RETURN_BRIDGE;
+        let pinned = BASE_RETURN_BRIDGE.expect("the public build pins its bridge");
+        assert_eq!(pinned.address.to_vec(), address, "the build's bridge");
+        assert_eq!(pinned.code_hash.to_vec(), bytes(&b["codeHash"]), "the build's code hash");
+        assert_eq!((pinned.withdrawals_slot, pinned.genesis_id_slot), (9, 13));
+        assert_eq!(pinned.genesis_id, [0u8; 32], "no genesis id before initGenesis");
+    }
+}

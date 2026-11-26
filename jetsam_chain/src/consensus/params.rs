@@ -3054,7 +3054,10 @@ mod tests {
     #[test]
     fn the_v1_7_height_of_each_profile() {
         #[cfg(not(feature = "testnet"))]
-        assert_eq!(V1_7_ACTIVATION_HEIGHT, None);
+        {
+            assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(61_440));
+            assert!(61_440_u64.is_multiple_of(V1_7_ACTIVATION_ALIGNMENT));
+        }
         #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
         assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(8_160));
         #[cfg(feature = "rehearsal-v1-7")]
@@ -3101,10 +3104,17 @@ mod tests {
             V1_7_ACTIVATION_HEIGHT,
             V1_7_BASE_RETURN_HEIGHT
         ));
-        #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+        #[cfg(feature = "rehearsal-v1-7")]
         {
             assert_eq!(V1_7_BASE_RETURN_HEIGHT, None);
             assert!(!v1_7_base_return_active(u64::MAX));
+        }
+        // The public network's: from F = J + 1 440 = 62 880 on, not one block earlier.
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(V1_7_BASE_RETURN_HEIGHT, Some(62_880));
+            assert!(!v1_7_base_return_active(62_880 - 1));
+            assert!(v1_7_base_return_active(62_880));
         }
         // The test chain's, armed by update n°2: from 8982 on, not one block earlier.
         #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]

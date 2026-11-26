@@ -243,9 +243,28 @@ pub const BASE_RETURN_ANCHOR: Option<L1Anchor> = Some(L1Anchor {
 pub const BASE_RETURN_ANCHOR: Option<L1Anchor> = None;
 
 /// The bridge on Base the return reads under a Base state root, in force from
-/// the return-over-Base height on: none on the public network yet.
+/// the return-over-Base height on. The public network's: the bridge
+/// `DeployCreate2.run()` deploys under `mainnet` (contract `v3-mn61440`,
+/// `bridge_deployment_mainnet.json`, the same on a local fork of Base): CREATE2
+/// address and runtime code hash with its immutables, `withdrawals` at slot 9
+/// and `genesisId` at slot 13. `genesis_id` stays zero (no genesis matches it,
+/// nothing is payable) until `initGenesis` at a height of its window
+/// [61 440 ; 62 880], read back and written by the next release.
 #[cfg(not(feature = "testnet"))]
-pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = None;
+pub const BASE_RETURN_BRIDGE: Option<L1BridgeParams> = Some(L1BridgeParams {
+    address: [
+        0xd9, 0xca, 0xa1, 0x58, 0xdc, 0xec, 0x29, 0x47, 0xc5, 0x42, 0x9e, 0xaf, 0xbe, 0x56, 0x1a,
+        0x36, 0xa9, 0x58, 0xf7, 0x4b,
+    ],
+    code_hash: [
+        0xba, 0xf6, 0x18, 0x90, 0x4e, 0x2a, 0xfb, 0x17, 0x66, 0xa4, 0x46, 0xe2, 0xe3, 0x8d, 0x78,
+        0xd4, 0x6d, 0xbd, 0x83, 0x18, 0x37, 0x87, 0x8f, 0x38, 0xb9, 0x47, 0x11, 0xde, 0x64, 0xd1,
+        0xe7, 0x28,
+    ],
+    withdrawals_slot: 9,
+    genesis_id_slot: 13,
+    genesis_id: [0u8; 32],
+});
 /// The test chain's: TN1's test bridge on Base Sepolia (`TN1_READY_BRIDGE.txt`,
 /// computed offline before its deployment: CREATE2 address and runtime code
 /// hash with its immutables), `withdrawals` at slot 9 and `genesisId` at

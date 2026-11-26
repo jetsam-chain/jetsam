@@ -67,11 +67,31 @@ fn statement() -> FastStatement {
 fn the_fast_lane_keys_of_each_profile() {
     assert_eq!(FastLaneRules::CONSENSUS.release_key, FAST_RELEASE_KEY);
     assert_eq!(FastLaneRules::CONSENSUS.revoke_key, FAST_REVOKE_KEY);
-    #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+    #[cfg(feature = "rehearsal-v1-7")]
     {
         assert_eq!(FAST_RELEASE_KEY, None);
         assert_eq!(FAST_REVOKE_KEY, None);
         assert_eq!(crate::consensus::params::V1_7_BASE_RETURN_HEIGHT, None);
+    }
+    // The public network (armed with v1.7, FIXEXT M-2): the operator's two
+    // keys of 2026-11-26, distinct, from its return-over-Base height 62 880 on.
+    #[cfg(not(feature = "testnet"))]
+    {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        assert_eq!(
+            FAST_RELEASE_KEY.expect("the relay's key").to_vec(),
+            hex("89e5abece0a938dfda69785d3bbf84ce2ac62938d653def88a43e3bc3111a9d8d306295d1c76e8c8b51ff0bd25c47b6e")
+        );
+        assert_eq!(
+            FAST_REVOKE_KEY.expect("the cold key").to_vec(),
+            hex("b9cd52c4221ca1cb26cfc5fccb29d2bd9b17f71bfb00c2f91c7d4afa4eedce993eb67f98a176cf90c3ee7bde7a4329f1")
+        );
+        assert_eq!(crate::consensus::params::V1_7_BASE_RETURN_HEIGHT, Some(62_880));
     }
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     {

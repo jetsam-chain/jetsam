@@ -351,8 +351,32 @@ fn the_profiles_base_return_anchor_and_bridge() {
     assert_eq!(base.bridge, BASE_RETURN_BRIDGE);
     #[cfg(not(feature = "testnet"))]
     {
-        assert_eq!(BASE_RETURN_ANCHOR, None);
-        assert_eq!(BASE_RETURN_BRIDGE, None);
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let anchor = BASE_RETURN_ANCHOR.expect("Ethereum's committee 1921");
+        assert_eq!(anchor.period, 1_921);
+        assert_eq!(
+            anchor.committee_root.to_vec(),
+            hex("0f91266be1cd1a0984fdffd2c9d6123ee6c58debcc1620af98cf467584048d3c")
+        );
+        let bridge = BASE_RETURN_BRIDGE.expect("the public network's bridge");
+        assert_eq!(
+            bridge.address.to_vec(),
+            hex("d9caa158dcec2947c5429eafbe561a36a958f74b")
+        );
+        assert_eq!(
+            bridge.code_hash.to_vec(),
+            hex("baf618904e2afb1766a446e2e38d78d46dbd831837878f38b94711de64d1e728")
+        );
+        assert_eq!((bridge.withdrawals_slot, bridge.genesis_id_slot), (9, 13));
+        // initGenesis comes after J: the next release writes it.
+        assert_eq!(bridge.genesis_id, [0u8; 32]);
+        assert_eq!(L1_ANCHOR, None);
+        assert_eq!(L1_BRIDGE, None);
     }
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     {
