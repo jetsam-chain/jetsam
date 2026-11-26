@@ -486,10 +486,10 @@ mod tests {
         }
     }
 
-    /// The public network's v1.7 height: none until it is decided with the
-    /// operator against the tip of the day (`arm.sh --clock v1.7`).
+    /// The public network's v1.7 height: 61 440, decided with the operator
+    /// against the tip of the day (25-26 November 2026, tip 59 509).
     #[cfg(not(feature = "testnet"))]
-    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(61_440);
 
     /// The test chain's v1.7 height: 8 160, decided with the operator (D78).
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]

@@ -611,8 +611,12 @@ const _: () = assert!(
 ///
 /// `wire_limits::tests::arming_v1_7_takes_two_deliberate_edits` fails the moment
 /// this value disagrees with the declaration beside it.
+///
+/// The public network's: 61 440 = 64 × 960, decided with the operator on
+/// 25 November 2026 and confirmed on 26 November 2026 (tip 59 509, ≈ 180 s a
+/// block: ≈ 30 November 2026, 22:10-23:00 UTC).
 #[cfg(not(feature = "testnet"))]
-pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(61_440);
 
 /// The test chain's v1.7 height: 8 160 = 255 × 32, decided with the operator
 /// against the tip of the day (D78, 8 November 2026, tip ≈ 8 095), brought
@@ -649,8 +653,10 @@ pub const REHEARSAL_V1_7_ACTIVATION: u64 = 96;
 /// armed [`V1_7_ACTIVATION_HEIGHT`] ([`base_return_schedule_is_valid`]).
 /// Declared per profile, like [`V1_7_ACTIVATION_HEIGHT`], so that arming the
 /// test chain's can never arm another's.
+///
+/// The public network's: 62 880 = J + 1 440, the bridge's opening (D44).
 #[cfg(not(feature = "testnet"))]
-pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = Some(62_880);
 /// The test chain's: the only one an operator arms (update n°2 of the test
 /// chain, `FAST_ARMING.txt`): 8982.
 #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
