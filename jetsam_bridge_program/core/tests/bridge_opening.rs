@@ -28,9 +28,11 @@ fn the_programs_bridge_opening_of_each_clock() {
             // A build holding the node's `jetsam_chain/testnet`: the test chain's clock (M5).
             assert_eq!(DEPOSIT_RULE.deposits_from_height, Some(8_704));
         } else {
-            // The public network: no J, so no F and no deposit.
-            assert_eq!(DEPOSIT_RULE.deposits_from_height, None);
-            assert!(!DEPOSIT_RULE.deposits_open_at(1 << 40));
+            // The public network: J = 61 440 (26/11/2026), F = J + 1 440 = 62 880.
+            assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(61_440));
+            assert_eq!(DEPOSIT_RULE.deposits_from_height, Some(62_880));
+            assert!(!DEPOSIT_RULE.deposits_open_at(62_880));
+            assert!(DEPOSIT_RULE.deposits_open_at(62_881));
             assert_eq!(jetsam_vault_rule::bridge_deposits_from_height(Some(69_120)), Some(70_560));
         }
     }

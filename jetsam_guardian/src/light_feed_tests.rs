@@ -107,9 +107,11 @@ fn the_sepolia_anchor_is_the_committee_two_beacon_sources_agree_on() {
             root: root_1409()
         })
     );
-    #[cfg(feature = "testnet")]
-    if let Some(build) = DestinationRules::CONSENSUS.base_return.anchor {
-        assert_eq!(build, anchor, "the build's anchor is this committee");
+    // (this crate has no profile feature of its own: the node's is read through its L1)
+    if jetsam_chain::consensus::destination::fast::FAST_L1_CHAIN_ID != 1 {
+        if let Some(build) = DestinationRules::CONSENSUS.base_return.anchor {
+            assert_eq!(build, anchor, "the build's anchor is this committee");
+        }
     }
 }
 
@@ -158,8 +160,8 @@ fn the_mainnet_anchor_is_the_committee_two_beacon_sources_agree_on() {
         period: 1_921,
         committee_root: root_1921(),
     };
-    #[cfg(not(feature = "testnet"))]
-    {
+    // The public build (its L1 is Ethereum's main network) pins this committee.
+    if jetsam_chain::consensus::destination::fast::FAST_L1_CHAIN_ID == 1 {
         assert_eq!(
             DestinationRules::CONSENSUS.base_return.anchor,
             Some(anchor),

@@ -557,11 +557,13 @@ mod tests {
         assert_eq!(v["fixext_height"], serde_json::json!(13_500));
     }
 
-    /// The public network's record: its genesis, v1.7 dormant (no `J`, `F`,
-    /// `H`, no fast lane key, no group key).
+    /// The public network's record: its genesis, v1.7 armed with the operator
+    /// (26/11/2026): J 61 440, F = H = 62 880, its bridge on Base and the fast
+    /// lane's two keys; the guardians from J, delegation from J + 15 360, no
+    /// group key yet (the mainnet ceremony).
     #[cfg(not(feature = "testnet"))]
     #[test]
-    fn the_public_network_publishes_a_dormant_v1_7() {
+    fn the_public_network_publishes_its_armed_v1_7() {
         let a = Activations::current();
         assert_eq!(
             a.network,
@@ -570,18 +572,27 @@ mod tests {
         assert_eq!(a.v1_5_height, Some(38_400));
         assert_eq!(
             (a.v1_7_height, a.deposits_from_height, a.base_return_height),
-            (None, None, None)
+            (Some(61_440), Some(62_880), Some(62_880))
         );
         assert_eq!(
-            (a.fast_release_key, a.fast_revoke_key, a.base_return_bridge),
-            (None, None, None)
+            a.fast_release_key.as_deref(),
+            Some("89e5abece0a938dfda69785d3bbf84ce2ac62938d653def88a43e3bc3111a9d8d306295d1c76e8c8b51ff0bd25c47b6e")
+        );
+        assert_eq!(
+            a.fast_revoke_key.as_deref(),
+            Some("b9cd52c4221ca1cb26cfc5fccb29d2bd9b17f71bfb00c2f91c7d4afa4eedce993eb67f98a176cf90c3ee7bde7a4329f1")
+        );
+        assert_eq!(
+            a.base_return_bridge.as_deref(),
+            Some("d9caa158dcec2947c5429eafbe561a36a958f74b")
         );
         assert_eq!(
             (a.guardian_height, a.delegation_height, a.guardian_group_key),
-            (None, None, None)
+            (Some(61_440), Some(61_440 + 15_360), None)
         );
         assert_eq!(a.vault_caps_height, Some(0));
-        assert_eq!(a.return_fix_height, None);
+        assert_eq!(a.return_fix_height, Some(62_880));
+        assert_eq!(a.fixext_height, Some(62_880));
         assert!(a.base_return_bridge_rotations.is_empty());
     }
 

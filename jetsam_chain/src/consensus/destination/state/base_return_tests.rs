@@ -188,11 +188,23 @@ pub(super) fn drop_kind(b: &Block, kind: DestinationObjectKind) -> Block {
 fn the_return_over_base_reads_its_profiles_base_from_its_height() {
     let rules = DestinationRules::CONSENSUS;
     assert_eq!(rules.base_return.advance, AdvanceRules::CONSENSUS);
-    #[cfg(not(all(feature = "testnet", not(feature = "rehearsal-v1-7"))))]
+    #[cfg(feature = "rehearsal-v1-7")]
     {
         assert_eq!(rules.base_return.activation_height, None);
         assert!(!rules.base_return.active_at(u64::MAX));
         assert_eq!(rules.effective_at(u64::MAX), rules);
+    }
+    // The public network (26/11/2026): from F = 62 880 on, with its anchor
+    // and bridge from that height only.
+    #[cfg(not(feature = "testnet"))]
+    {
+        const H: u64 = 62_880;
+        assert_eq!(rules.base_return.activation_height, Some(H));
+        assert!(!rules.base_return.active_at(H - 1));
+        assert!(rules.base_return.active_at(H));
+        assert_eq!(rules.effective_at(H).anchor, BASE_RETURN_ANCHOR);
+        assert_eq!(rules.effective_at(H).bridge, BASE_RETURN_BRIDGE);
+        assert!(BASE_RETURN_ANCHOR.is_some() && BASE_RETURN_BRIDGE.is_some());
     }
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
     {

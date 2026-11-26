@@ -237,7 +237,7 @@ fn vault_address_is_the_addrfx_image_of_the_published_secret() {
     assert_eq!(VAULT_RELEASE_WINDOW_CAP_MICRO, 50_000_000_000);
 }
 
-/// F = J + 1 440 on the public network (D44, none while its J is none),
+/// F = J + 1 440 on the public network (D44: 61 440 + 1 440 = 62 880),
 /// J + 544 = 8 704 on the test chain (D104), J_R + 32 = 128 in the
 /// rehearsal; V8's ceiling and D59's release fee are this build's.
 #[test]
@@ -251,7 +251,7 @@ fn bridge_opening_follows_the_v1_7_clock() {
     #[cfg(not(feature = "testnet"))]
     {
         assert_eq!(BRIDGE_OPENING_DELAY, 1_440);
-        assert_eq!(bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT), None);
+        assert_eq!(bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT), Some(62_880));
         assert_eq!(bridge_deposits_from_height(Some(69_120)), Some(70_560));
     }
     #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
