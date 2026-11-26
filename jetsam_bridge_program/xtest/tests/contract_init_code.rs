@@ -43,13 +43,13 @@ struct Profile {
 }
 
 const PROFILES: [Profile; 2] = [
-    // D1: 69 120 on the public network.
+    // 61 440 on the public network, armed with the operator (26/11/2026).
     Profile {
         name: "mainnet",
         network: "6e592c07be6fd1b4259eeacbf4eb7eb2948a77f1d02626a12fdab42c448c5f44",
         vector: include_str!("fixtures/bridge_init_code_v3.json"),
-        planned_j: 69_120,
-        planned_f: 69_120 + 1_440,
+        planned_j: 61_440,
+        planned_f: 61_440 + 1_440,
     },
     // D78: 8 160 = 255 x 32 on the test chain (its v1.6 at 4 800), armed in params.rs; D104: F = 8 160 + 544.
     Profile {

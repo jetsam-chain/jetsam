@@ -16,6 +16,16 @@
 //!   the finality update and the execution header it names;
 //! * `sepolia_el_block_6132e572.json`: T0.8's header, whose RLP is the node's
 //!   fixture `gloas_blk_6132e572.rlp.hex`.
+//!
+//! And Ethereum's main network, read on 2026-11-26 23:12 UTC (the public
+//! network's anchor):
+//!
+//! * `mainnet_updates_1920_1921.lodestar.json`: `light_client/updates?
+//!   start_period=1920&count=2` of `lodestar-mainnet.chainsafe.io` (Fulu);
+//! * `mainnet_committee_1921.publicnode.json`: the 512 public keys of the
+//!   committee of period 1 921 as publicnode's beacon API gives them
+//!   (`states/finalized/sync_committees?epoch=491776`, then
+//!   `states/finalized/validators` of those indices), seat by seat.
 
 use super::*;
 use jetsam_chain::consensus::destination::bls::committee_keys;
@@ -97,9 +107,97 @@ fn the_sepolia_anchor_is_the_committee_two_beacon_sources_agree_on() {
             root: root_1409()
         })
     );
+    #[cfg(feature = "testnet")]
     if let Some(build) = DestinationRules::CONSENSUS.base_return.anchor {
         assert_eq!(build, anchor, "the build's anchor is this committee");
     }
+}
+
+const ROOT_1921: &str = "0f91266be1cd1a0984fdffd2c9d6123ee6c58debcc1620af98cf467584048d3c";
+
+fn mainnet_updates() -> Value {
+    fixture("mainnet_updates_1920_1921.lodestar.json")
+}
+
+fn root_1921() -> Root {
+    hex::decode(ROOT_1921).expect("hex").try_into().expect("32")
+}
+
+#[test]
+fn the_mainnet_anchor_is_the_committee_two_beacon_sources_agree_on() {
+    let item = &mainnet_updates()[0];
+    assert_eq!(item["version"], "fulu");
+    let update = update_of(item, GLOAS_EPOCH_UNKNOWN).expect("update 1920");
+    assert_eq!(period_of(update.attested_header.beacon.slot), 1_920);
+    let payload = update.encode_payload();
+    assert_eq!(LightClientUpdate::decode_payload(&payload), Ok(update.clone()));
+    // The second source: the same 512 keys, seat by seat.
+    let other = fixture("mainnet_committee_1921.publicnode.json");
+    let keys: Vec<[u8; 48]> = other["pubkeys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .map(|k| crate::base_capture::hex_bytes(k.as_str().unwrap()).unwrap().try_into().unwrap())
+        .collect();
+    assert_eq!(keys.len(), 512);
+    assert_eq!(update.next_sync_committee.pubkeys, keys);
+    // The aggregate key is the keys' aggregate.
+    let parsed: Vec<blst::min_pk::PublicKey> = keys
+        .iter()
+        .map(|k| blst::min_pk::PublicKey::key_validate(k).expect("a key"))
+        .collect();
+    let refs: Vec<&blst::min_pk::PublicKey> = parsed.iter().collect();
+    let aggregate = blst::min_pk::AggregatePublicKey::aggregate(&refs, false).expect("aggregate");
+    assert_eq!(
+        aggregate.to_public_key().compress(),
+        update.next_sync_committee.aggregate_pubkey
+    );
+    // Its root is the anchor of the public network's return over Base.
+    assert_eq!(update.next_sync_committee.hash_tree_root(), root_1921());
+    let anchor = L1Anchor {
+        period: 1_921,
+        committee_root: root_1921(),
+    };
+    #[cfg(not(feature = "testnet"))]
+    {
+        assert_eq!(
+            DestinationRules::CONSENSUS.base_return.anchor,
+            Some(anchor),
+            "the build's anchor is this committee"
+        );
+        let rules = DestinationRules {
+            anchor: Some(anchor),
+            ..DestinationRules::CONSENSUS
+        };
+        assert_eq!(
+            verify_committee_update_payload(&payload, &[], &rules, &CommitteeKeyCache::default()),
+            Ok(CommitteeRef {
+                period: 1_921,
+                root: root_1921()
+            })
+        );
+    }
+    let _ = anchor;
+}
+
+#[test]
+fn the_next_mainnet_update_verifies_under_the_anchor_committee() {
+    let first = update_of(&mainnet_updates()[0], GLOAS_EPOCH_UNKNOWN).expect("update 1920");
+    let known = KnownCommittee {
+        period: 1_921,
+        keys: committee_keys(&first.next_sync_committee).expect("keys"),
+    };
+    let update = update_of(&mainnet_updates()[1], GLOAS_EPOCH_UNKNOWN).expect("update 1921");
+    assert_eq!(period_of(update.attested_header.beacon.slot), 1_921);
+    let verified = verify_committee_update(
+        &jetsam_chain::consensus::destination::forks::L1_MAINNET,
+        &known,
+        &update,
+    )
+    .expect("verifies");
+    assert_eq!(verified.next_period, 1_922);
+    // Under Sepolia's domain it proves nothing.
+    assert!(verify_committee_update(&L1_SEPOLIA, &known, &update).is_err());
 }
 
 #[test]

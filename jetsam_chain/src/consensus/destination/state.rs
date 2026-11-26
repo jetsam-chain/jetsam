@@ -204,9 +204,23 @@ pub const BASE_RETURN_PARAMS: BaseParams = super::base_read::BASE_SEPOLIA;
 
 /// The anchor of the light client of the L1 Base settles on, in force from
 /// the return-over-Base height on ([`DestinationRules::effective_at`]): none
-/// on the public network yet.
+/// The public network's: Ethereum's sync committee of period 1 921 (from slot
+/// 15 736 832), finalized when read on 2026-11-26 23:12 UTC. Its root is the
+/// `hash_tree_root` of the next committee of the best update of period 1 920
+/// served by `lodestar-mainnet.chainsafe.io`, whose 512 public keys are, seat
+/// by seat, those publicnode's beacon API gives for that committee
+/// (`states/finalized/sync_committees?epoch=491776` then
+/// `states/finalized/validators`); checked by `jetsam_guardian::light_feed`
+/// on both answers, kept in its fixtures.
 #[cfg(not(feature = "testnet"))]
-pub const BASE_RETURN_ANCHOR: Option<L1Anchor> = None;
+pub const BASE_RETURN_ANCHOR: Option<L1Anchor> = Some(L1Anchor {
+    period: 1_921,
+    committee_root: [
+        0x0f, 0x91, 0x26, 0x6b, 0xe1, 0xcd, 0x1a, 0x09, 0x84, 0xfd, 0xff, 0xd2, 0xc9, 0xd6, 0x12,
+        0x3e, 0xe6, 0xc5, 0x8d, 0xeb, 0xcc, 0x16, 0x20, 0xaf, 0x98, 0xcf, 0x46, 0x75, 0x84, 0x04,
+        0x8d, 0x3c,
+    ],
+});
 /// The test chain's: Sepolia's sync committee of period 1 409 (from slot
 /// 11 542 528, 2026-11-09), finalized when read on 2026-11-10 19:40 UTC.
 /// Its root is the `hash_tree_root` of the next committee of the best update
