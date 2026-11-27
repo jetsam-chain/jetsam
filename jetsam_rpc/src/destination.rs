@@ -1,0 +1,787 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+
+//! v1.7 (T2.5): the bridge vault and the L1 committees over RPC.
+//!
+//! `submitDestinationObject` hands a destination intent (a committee update
+//! with its payment, or a release with its proofs and its release group) to
+//! the mempool; `getVaultState` reports V8's balance, its ceiling and room,
+//! the paid indices, the V6 window and the deposits per height over the last
+//! 1 024 heights (the guardian's SG-17); `getDestinationCommittee` the L1
+//! committees the branch knows and whether this node holds their keys;
+//! `getAdvances` (the return over Base, D107, D114) the advances the branch
+//! holds for one withdrawal index and whom the release of a burn must pay.
+
+use jetsam_chain::consensus::destination::state::{DestinationRules, DestinationState};
+use jetsam_chain::consensus::vault::{destination_marker_kind, DestinationMarkerKind};
+use jetsam_poseidon2b::primitives::Address;
+use serde::{Deserialize, Serialize};
+
+/// Heights the deposit count of `getVaultState` covers (SG-17).
+pub const DEPOSIT_COUNT_HEIGHTS: u64 = 1_024;
+
+/// What `submitDestinationObject` admitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitDestinationObjectResponse {
+    /// `"committee_update"`, `"release"`, `"release_over_base"`, and for the
+    /// fast lane `"fast_release"`, `"fast_contradiction"`, `"fast_revocation"`.
+    pub kind: String,
+    /// The period a committee update brings.
+    pub period: Option<u64>,
+    /// The withdrawal index of a release.
+    pub n: Option<u64>,
+}
+
+impl From<jetsam_mempool::destination::DestinationAdmitted> for SubmitDestinationObjectResponse {
+    fn from(admitted: jetsam_mempool::destination::DestinationAdmitted) -> Self {
+        use jetsam_mempool::destination::DestinationAdmitted;
+        match admitted {
+            DestinationAdmitted::CommitteeUpdate { period } => Self {
+                kind: "committee_update".into(),
+                period: Some(period),
+                n: None,
+            },
+            DestinationAdmitted::Release { n } => Self {
+                kind: "release".into(),
+                period: None,
+                n: Some(n),
+            },
+            DestinationAdmitted::ReleaseOverBase { n } => Self {
+                kind: "release_over_base".into(),
+                period: None,
+                n: Some(n),
+            },
+            DestinationAdmitted::FastRelease { n } => Self {
+                kind: "fast_release".into(),
+                period: None,
+                n: Some(n),
+            },
+            DestinationAdmitted::FastContradiction { n } => Self {
+                kind: "fast_contradiction".into(),
+                period: None,
+                n: Some(n),
+            },
+            DestinationAdmitted::FastRevocation => Self {
+                kind: "fast_revocation".into(),
+                period: None,
+                n: None,
+            },
+        }
+    }
+}
+
+/// One advance of `getAdvances` (addresses in bech32m).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvanceInfo {
+    /// Who advanced (its outstanding counts it).
+    pub origin: String,
+    /// Whom the release of exactly this burn pays.
+    pub creditor: String,
+    /// The burn advanced: its owner and amount (µJTM).
+    pub owner: String,
+    pub amount: u64,
+    /// What `origin` has outstanding in all (≤ 3 000 JTM).
+    pub origin_outstanding: u64,
+}
+
+/// `getAdvances`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvancesResponse {
+    /// Whether the return over Base governs the tip's child.
+    pub active: bool,
+    pub n: u64,
+    /// Whether the branch has paid `n` (D52: no advance of it any more).
+    pub released: bool,
+    /// The advances of `n`, by key `(owner, amount)`.
+    pub advances: Vec<AdvanceInfo>,
+    /// Given a burn `(owner, amount)`: the payee its release's first output
+    /// must pay at the tip's child (V2): the creditor of the advance of
+    /// exactly that burn over Base, else the owner.
+    pub payee: Option<String>,
+}
+
+/// The `getAdvances` reply from the tip's destination state (`None` below
+/// J) for withdrawal index `n`, and the payee of the burn `burn` if given.
+pub fn advances_of(
+    state: Option<&DestinationState>,
+    tip_height: u64,
+    rules: &DestinationRules,
+    n: u64,
+    burn: Option<(Address, u64)>,
+) -> AdvancesResponse {
+    use jetsam_chain::consensus::destination::advance::release_payee;
+    let active = rules.base_return.active_at(tip_height.saturating_add(1));
+    let advances = state
+        .filter(|_| active)
+        .map(|state| {
+            state
+                .advances
+                .of_n(n)
+                .map(|entry| AdvanceInfo {
+                    origin: entry.origin.to_bech32(),
+                    creditor: entry.creditor.to_bech32(),
+                    owner: entry.owner.to_bech32(),
+                    amount: entry.amount,
+                    origin_outstanding: state.advances.outstanding_of(&entry.origin),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let payee = burn.map(|(owner, amount)| match state {
+        Some(state) if active => release_payee(&state.advances, n, &owner, amount).to_bech32(),
+        _ => owner.to_bech32(),
+    });
+    AdvancesResponse {
+        active,
+        n,
+        released: state.is_some_and(|state| state.released.contains(n)),
+        advances,
+        payee,
+    }
+}
+
+/// `getVaultState`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultStateResponse {
+    /// Whether the v1.7 clock is armed at the tip's child.
+    pub active: bool,
+    pub tip_height: u64,
+    /// V8's `bridge_locked` (µJTM).
+    pub bridge_locked: u64,
+    /// `VAULT_OUTSTANDING_CEIL` (µJTM); FIXEXT-CAP: `null` once V8 no longer
+    /// applies (the bridge in force has no outstanding ceiling, C-6).
+    pub ceiling: Option<u64>,
+    /// `ceiling − bridge_locked`, never negative; `null` with the ceiling.
+    pub room: Option<u64>,
+    /// `alloc_counter(J − 1)` (V1-b); 0 below J.
+    pub floor: u64,
+    /// `F`: deposits only in blocks above it.
+    pub deposits_from_height: Option<u64>,
+    /// Withdrawal indices the branch has paid (D52).
+    pub released_count: u64,
+    /// Released over the window ending at the tip's child (V6, µJTM).
+    pub released_in_window: u64,
+    pub window_blocks: u64,
+    pub window_cap: u64,
+    /// `(height, deposits)` over the last [`DEPOSIT_COUNT_HEIGHTS`] heights,
+    /// heights without deposit left out, increasing.
+    pub deposits_by_height: Vec<(u64, u32)>,
+    pub deposits_last_1024: u64,
+    /// Release intents this node holds for its miners.
+    pub held_releases: usize,
+    /// Heights of the last 1 024 at or above J whose block this node no
+    /// longer retains: their deposits are not in the count.
+    pub deposit_heights_unread: u64,
+    /// RC-5 (audit 13/11): the largest burn one release can pay today, from
+    /// the vault's slots (µJTM; `largest_payable_release`: at most its 1 020
+    /// largest slots a release may spend). A burn above it waits until
+    /// releases regroup the vault. 0 below J.
+    #[serde(default)]
+    pub largest_release: u64,
+}
+
+/// The `getVaultState` reply from the tip's destination state (`None` below
+/// J), the tip height, the rules, per-height deposit counts (any heights; the
+/// last [`DEPOSIT_COUNT_HEIGHTS`] are kept) and the releases held.
+pub fn vault_state(
+    state: Option<&DestinationState>,
+    tip_height: u64,
+    rules: &DestinationRules,
+    deposits: &[(u64, u32)],
+    held_releases: usize,
+) -> VaultStateResponse {
+    let next = tip_height.saturating_add(1);
+    // D123: the caps of the next block.
+    let vault = &rules.vault.at(next);
+    let from = tip_height.saturating_sub(DEPOSIT_COUNT_HEIGHTS - 1);
+    let mut deposits_by_height: Vec<(u64, u32)> = deposits
+        .iter()
+        .copied()
+        .filter(|(height, count)| *height >= from && *height <= tip_height && *count > 0)
+        .collect();
+    deposits_by_height.sort_unstable();
+    let bridge_locked = state.map_or(0, |state| state.bridge_locked);
+    VaultStateResponse {
+        active: rules.active_at(next),
+        tip_height,
+        bridge_locked,
+        ceiling: vault.v8_ceiling(),
+        room: vault.v8_ceiling().map(|ceil| ceil.saturating_sub(bridge_locked)),
+        floor: state.map_or(0, |state| state.floor),
+        deposits_from_height: vault.deposits_from_height,
+        released_count: state.map_or(0, |state| state.released.len()),
+        released_in_window: state.map_or(0, |state| {
+            state.released_in_window(next, vault.window_blocks)
+        }),
+        window_blocks: vault.window_blocks,
+        window_cap: vault.window_cap,
+        deposits_last_1024: deposits_by_height.iter().map(|(_, c)| u64::from(*c)).sum(),
+        deposits_by_height,
+        held_releases,
+        deposit_heights_unread: 0,
+        largest_release: 0,
+    }
+}
+
+/// The deposits among a block's user outputs: one deposit marker per deposit
+/// group (V4: exactly one per group, in an accepted block).
+pub fn deposit_count_of_outputs(outputs: impl IntoIterator<Item = (Address, u64)>) -> u32 {
+    outputs
+        .into_iter()
+        .filter(|(owner, _)| destination_marker_kind(owner) == Some(DestinationMarkerKind::Deposit))
+        .count() as u32
+}
+
+/// One committee of `getDestinationCommittee`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitteeInfo {
+    pub period: u64,
+    /// SSZ root (hex).
+    pub root: String,
+    /// Whether this node holds its 512 keys (D57: read from the update that
+    /// brought them, never state).
+    pub keys_held: bool,
+}
+
+/// `getDestinationCommittee`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationCommitteeResponse {
+    pub active: bool,
+    /// At most two, by increasing period; empty until the anchor update.
+    pub committees: Vec<CommitteeInfo>,
+    /// The build's anchor `(P0, R0)`: `None` until the bridge's genesis.
+    pub anchor: Option<CommitteeInfo>,
+    /// Whether this build pins the L1 bridge contract (no release without).
+    pub bridge_set: bool,
+}
+
+/// The `getDestinationCommittee` reply; `holds` says whether the keys of a
+/// root are in this node's cache.
+pub fn destination_committee(
+    state: Option<&DestinationState>,
+    rules: &DestinationRules,
+    holds: impl Fn(&[u8; 32]) -> bool,
+) -> DestinationCommitteeResponse {
+    DestinationCommitteeResponse {
+        active: state.is_some(),
+        committees: state
+            .map(|state| {
+                state
+                    .committees
+                    .iter()
+                    .map(|committee| CommitteeInfo {
+                        period: committee.period,
+                        root: hex::encode(committee.root),
+                        keys_held: holds(&committee.root),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        anchor: rules.anchor.map(|anchor| CommitteeInfo {
+            period: anchor.period,
+            root: hex::encode(anchor.committee_root),
+            keys_held: holds(&anchor.committee_root),
+        }),
+        bridge_set: rules.bridge.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jetsam_chain::consensus::destination::state::{
+        CommitteeRef, DestinationRules, DestinationState,
+    };
+    use jetsam_chain::consensus::params::MICRO_PER_JTM;
+    use jetsam_chain::consensus::vault::{
+        VAULT_OUTSTANDING_CEIL_MICRO, VAULT_RELEASE_WINDOW_BLOCKS, VAULT_RELEASE_WINDOW_CAP_MICRO,
+    };
+
+    fn rules() -> DestinationRules {
+        let mut rules = DestinationRules {
+            activation_height: Some(960),
+            ..DestinationRules::CONSENSUS
+        };
+        rules.vault.activation_height = Some(960);
+        rules.vault.deposits_from_height = Some(970);
+        // D123's caps on every profile (the test chain's caps of before: `d123_*`)
+        rules.vault.legacy = None;
+        // FIXEXT-CAP: V8 applied (a bridge with C-6) on every profile; lifted: `fixextcap_*`
+        rules.vault.outstanding_ceil_lifted_at = None;
+        rules
+    }
+
+    /// A1 M4, m5: `getVaultState` reports `bridge_locked`, the ceiling, the
+    /// room left, the paid indices and the window, and the deposits per
+    /// height over the last 1 024 heights (SG-17).
+    #[test]
+    fn rpc_get_vault_state_reports_locked_ceiling_room_and_deposit_count() {
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.tip = 1_500;
+        state.bridge_locked = 9_000 * MICRO_PER_JTM;
+        state.released.insert(1);
+        state.released.insert(4);
+        state
+            .window
+            .push(jetsam_chain::consensus::destination::state::WindowRelease {
+                height: 1_400,
+                n: 4,
+                owner: jetsam_poseidon2b::primitives::Address([1; 32]),
+                amount: 300 * MICRO_PER_JTM,
+            });
+        let deposits = [(1_200u64, 2u32), (1_499, 1), (400, 9)];
+        let reply = vault_state(Some(&state), 1_500, &rules(), &deposits, 3);
+        assert!(reply.active);
+        assert_eq!(reply.bridge_locked, 9_000 * MICRO_PER_JTM);
+        assert_eq!(reply.ceiling, Some(VAULT_OUTSTANDING_CEIL_MICRO));
+        assert_eq!(reply.room, Some(VAULT_OUTSTANDING_CEIL_MICRO - 9_000 * MICRO_PER_JTM));
+        assert_eq!(reply.floor, 77);
+        assert_eq!(reply.deposits_from_height, Some(970));
+        assert_eq!(reply.released_count, 2);
+        assert_eq!(reply.released_in_window, 300 * MICRO_PER_JTM);
+        assert_eq!(reply.window_blocks, VAULT_RELEASE_WINDOW_BLOCKS);
+        assert_eq!(reply.window_cap, VAULT_RELEASE_WINDOW_CAP_MICRO);
+        assert_eq!(reply.held_releases, 3);
+        // Only the last 1 024 heights count (1 500 − 1 023 = 477 on).
+        assert_eq!(reply.deposits_by_height, vec![(1_200, 2), (1_499, 1)]);
+        assert_eq!(reply.deposits_last_1024, 3);
+        // Full vault: no room, never negative.
+        state.bridge_locked = VAULT_OUTSTANDING_CEIL_MICRO;
+        assert_eq!(vault_state(Some(&state), 1_500, &rules(), &[], 0).room, Some(0));
+        // Below J: inactive, nothing locked.
+        let below = vault_state(None, 900, &rules(), &[], 0);
+        assert!(!below.active);
+        assert_eq!(below.bridge_locked, 0);
+        assert_eq!(below.room, Some(VAULT_OUTSTANDING_CEIL_MICRO));
+    }
+
+    /// FIXEXT-CAP: under a bridge without an outstanding ceiling (C-6) from the next block on, no ceiling and
+    /// no room are reported (`null` on the wire: nothing bounds `bridge_locked`); while V8 applies, numbers as
+    /// before (the reply of a node of the test chain today is unchanged).
+    #[test]
+    fn fixextcap_get_vault_state_reports_no_ceiling_once_v8_is_lifted() {
+        let mut lifted = rules();
+        lifted.vault.outstanding_ceil_lifted_at = Some(1_600);
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.bridge_locked = 90_000 * MICRO_PER_JTM;
+        let before = vault_state(Some(&state), 1_598, &lifted, &[], 0);
+        assert_eq!((before.ceiling, before.room), (Some(VAULT_OUTSTANDING_CEIL_MICRO), Some(0)));
+        let json = serde_json::to_value(&before).unwrap();
+        assert_eq!(json["ceiling"], serde_json::json!(VAULT_OUTSTANDING_CEIL_MICRO));
+        let from = vault_state(Some(&state), 1_599, &lifted, &[], 0);
+        assert_eq!((from.ceiling, from.room), (None, None));
+        assert_eq!(from.bridge_locked, 90_000 * MICRO_PER_JTM);
+        let json = serde_json::to_value(&from).unwrap();
+        assert!(json["ceiling"].is_null() && json["room"].is_null());
+        assert_eq!(json.as_object().unwrap().get("room"), Some(&serde_json::Value::Null), "present, null");
+    }
+
+    /// D123: `getVaultState` reports the caps of the next block: on a chain
+    /// raising its caps at `c` (the test chain), the ceiling and the window
+    /// cap of before while the next block is below `c`, D123's from it on.
+    #[test]
+    fn d123_get_vault_state_reports_the_caps_of_the_next_block() {
+        use jetsam_chain::consensus::vault::{LegacyVaultCaps, TESTNET_LEGACY_VAULT_CAPS};
+        let c = 1_600;
+        let mut raising = rules();
+        raising.vault.legacy = Some(LegacyVaultCaps {
+            raised_at: Some(c),
+            ..TESTNET_LEGACY_VAULT_CAPS
+        });
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.bridge_locked = 9_000 * MICRO_PER_JTM;
+        state.tip = c - 2;
+        let before = vault_state(Some(&state), c - 2, &raising, &[], 0);
+        assert_eq!(
+            (before.ceiling, before.room, before.window_cap),
+            (Some(10_000 * MICRO_PER_JTM), Some(1_000 * MICRO_PER_JTM), 2_500 * MICRO_PER_JTM)
+        );
+        state.tip = c - 1;
+        let from = vault_state(Some(&state), c - 1, &raising, &[], 0);
+        assert_eq!(
+            (from.ceiling, from.room, from.window_cap),
+            (Some(50_000 * MICRO_PER_JTM), Some(41_000 * MICRO_PER_JTM), 50_000 * MICRO_PER_JTM)
+        );
+    }
+
+    /// The deposits a block makes: its deposit markers among user outputs.
+    #[test]
+    fn deposit_count_of_block_counts_deposit_markers_only() {
+        use jetsam_chain::consensus::vault::{deposit_marker, VAULT_ADDRESS};
+        use jetsam_poseidon2b::primitives::Address;
+        let outputs = [
+            vec![(VAULT_ADDRESS, 5), (deposit_marker(&[1; 20]), 0)],
+            vec![(Address([3; 32]), 9)],
+            vec![(VAULT_ADDRESS, 7), (deposit_marker(&[2; 20]), 0)],
+        ];
+        assert_eq!(
+            deposit_count_of_outputs(outputs.iter().flatten().copied()),
+            2
+        );
+    }
+
+    /// `getDestinationCommittee`: the committees the branch knows, whether
+    /// this node holds their keys, the build's anchor and bridge.
+    #[test]
+    fn rpc_get_destination_committee_reports_known_committees_and_held_keys() {
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.committees = vec![
+            CommitteeRef {
+                period: 1_894,
+                root: [0xaa; 32],
+            },
+            CommitteeRef {
+                period: 1_895,
+                root: [0xbb; 32],
+            },
+        ];
+        let reply = destination_committee(Some(&state), &rules(), |root| *root == [0xbb; 32]);
+        assert!(reply.active);
+        assert_eq!(reply.committees.len(), 2);
+        assert_eq!(reply.committees[0].period, 1_894);
+        assert_eq!(reply.committees[0].root, hex::encode([0xaa; 32]));
+        assert!(!reply.committees[0].keys_held);
+        assert!(reply.committees[1].keys_held);
+        assert_eq!(reply.anchor, None, "no anchor before T8.3");
+        assert!(!reply.bridge_set);
+        let below = destination_committee(None, &rules(), |_| true);
+        assert!(!below.active);
+        assert!(below.committees.is_empty());
+    }
+
+    /// `getAdvances` (D107, D114): the advances of `n` by key, each with its
+    /// creditor and its origin's outstanding, and the payee of a burn — the
+    /// creditor of the advance of exactly that burn over Base, else the
+    /// owner; nothing while the return over Base is dormant.
+    #[test]
+    fn rpc_get_advances_reports_the_advances_of_n_and_the_payee_of_a_burn() {
+        use jetsam_chain::consensus::destination::advance::AdvanceEntry;
+        use jetsam_poseidon2b::primitives::Address;
+        let (alice, payer, bob, stranger) = (
+            Address([0xa1; 32]),
+            Address([0x51; 32]),
+            Address([0xb0; 32]),
+            Address([0x5e; 32]),
+        );
+        let mut armed = rules();
+        armed.base_return.activation_height = Some(1_000);
+        let mut state = DestinationState::at_v1_7(960, 77);
+        state.tip = 1_500;
+        state.advances.insert(
+            3,
+            AdvanceEntry {
+                origin: payer,
+                creditor: bob,
+                owner: alice,
+                amount: 5 * MICRO_PER_JTM,
+            },
+        );
+        state.advances.insert(
+            3,
+            AdvanceEntry {
+                origin: stranger,
+                creditor: stranger,
+                owner: stranger,
+                amount: MICRO_PER_JTM / 10,
+            },
+        );
+        state.released.insert(2);
+        let reply = advances_of(
+            Some(&state),
+            1_500,
+            &armed,
+            3,
+            Some((alice, 5 * MICRO_PER_JTM)),
+        );
+        assert!(reply.active);
+        assert!(!reply.released);
+        assert_eq!(reply.advances.len(), 2);
+        assert_eq!(reply.advances[0].owner, stranger.to_bech32());
+        assert_eq!(reply.advances[1].creditor, bob.to_bech32());
+        assert_eq!(reply.advances[1].origin_outstanding, 5 * MICRO_PER_JTM);
+        assert_eq!(reply.payee, Some(bob.to_bech32()));
+        // Another burn of 3: its owner.
+        let other = advances_of(Some(&state), 1_500, &armed, 3, Some((alice, 1)));
+        assert_eq!(other.payee, Some(alice.to_bech32()));
+        assert!(advances_of(Some(&state), 1_500, &armed, 2, None).released);
+        // Dormant (every profile today): no advance read, the owner paid.
+        let dormant = advances_of(
+            Some(&state),
+            1_500,
+            &rules(),
+            3,
+            Some((alice, 5 * MICRO_PER_JTM)),
+        );
+        assert!(!dormant.active);
+        assert!(dormant.advances.is_empty());
+        assert_eq!(dormant.payee, Some(alice.to_bech32()));
+    }
+}
+
+/// One fast release the branch remembers (`getFastLane`), byte fields in hex:
+/// what a contradiction's marker commits to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastRecordInfo {
+    pub n: u64,
+    /// The burn's owner, 32 bytes hex.
+    pub owner: String,
+    pub amount: u64,
+    pub l2_block: u64,
+    pub height: u64,
+    pub contradicted: bool,
+    pub consumed: bool,
+}
+
+/// `getFastLane`: the fast lane of the tip's branch (the return over Base).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastLaneResponse {
+    /// Whether the return over Base governs the next block.
+    pub active: bool,
+    /// This build's relay key (48 bytes hex), if any, and whether the branch
+    /// closed it (revoked, or fused by a contradiction).
+    pub release_key: Option<String>,
+    pub release_key_closed: bool,
+    /// Every key the branch closed, 48 bytes hex, in chain order.
+    pub closed_keys: Vec<String>,
+    /// What the vault paid that Base contradicted (µJTM).
+    pub deficit: u64,
+    /// The horizon of a fast release, in blocks.
+    pub reconcile_blocks: u64,
+    pub records: Vec<FastRecordInfo>,
+}
+
+/// The `getFastLane` answer for the tip's destination state `state`.
+pub fn fast_lane_of(
+    state: Option<&jetsam_chain::consensus::destination::state::DestinationState>,
+    tip: u64,
+    rules: &jetsam_chain::consensus::destination::state::DestinationRules,
+) -> FastLaneResponse {
+    let fast = &rules.base_return.fast;
+    let lane = state.map(|s| &s.fast);
+    let closed_keys = lane
+        .map(|l| {
+            l.contradictions
+                .iter()
+                .filter_map(|c| c.key)
+                .chain(l.revocations.iter().copied())
+                .map(hex::encode)
+                .collect()
+        })
+        .unwrap_or_default();
+    FastLaneResponse {
+        active: rules.base_return.active_at(tip.saturating_add(1)),
+        release_key: fast.release_key.map(hex::encode),
+        release_key_closed: match (lane, fast.release_key) {
+            (Some(l), Some(key)) => l.is_closed(&key),
+            _ => false,
+        },
+        closed_keys,
+        deficit: lane.map_or(0, |l| l.deficit()),
+        reconcile_blocks: fast.reconcile_blocks,
+        records: lane
+            .map(|l| {
+                l.records
+                    .iter()
+                    .map(|(n, r)| FastRecordInfo {
+                        n: *n,
+                        owner: hex::encode(r.owner.0),
+                        amount: r.amount,
+                        l2_block: r.l2_block,
+                        height: r.height,
+                        contradicted: r.contradicted,
+                        consumed: r.consumed,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// `walletBuildDestinationPayment`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationPaymentResponse {
+    /// The proved `PagedSpendIntent`, hex: the payment of the intent the
+    /// caller assembles for `submitDestinationObject`.
+    pub payment_hex: String,
+    pub txid: String,
+    pub fee_micro_jtm: u64,
+    /// The marker it carries, hex.
+    pub marker: String,
+}
+
+/// The marker a `walletBuildDestinationPayment` carries: 32 bytes (hex) of a
+/// destination object a relay pays for — a committee update (`JTMLCU01`),
+/// a contradiction (`JTMFCT01`) or a revocation (`JTMFRV01`) of the fast lane.
+/// Anything else is refused: the wallet never pays a value-0 output to any
+/// other owner.
+pub fn destination_payment_marker(marker: &str) -> Result<Address, String> {
+    let bytes = hex::decode(marker.strip_prefix("0x").unwrap_or(marker))
+        .map_err(|_| "marker: not hex".to_string())?;
+    let owner: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "marker: not 32 bytes".to_string())?;
+    let tag: [u8; 8] = owner[..8].try_into().expect("eight bytes");
+    if tag == jetsam_vault_rule::LIGHT_CLIENT_UPDATE_MARKER_TAG
+        || tag == jetsam_chain::consensus::destination::fast::FAST_CONTRADICTION_MARKER_TAG
+        || tag == jetsam_chain::consensus::destination::fast::FAST_REVOCATION_MARKER_TAG
+    {
+        Ok(Address(owner))
+    } else {
+        Err("marker: not a committee update's, a contradiction's or a revocation's".into())
+    }
+}
+
+/// What `walletBuildAdvance` builds: the advance of the burn `(n, owner,
+/// amount)` by `advancer` paying `paid` (the least the rule allows when
+/// none is given), for the block at `height`: its outputs before the change
+/// — the owner paid, then the marker (`JTMADV02`, or `JTMADV03` from the fix
+/// height on, FIXRC ET-1) — and the marker. Refused outside the rule's
+/// bounds (`RELEASE_FEE ≤ amount ≤` the bond, `min_paid ≤ paid ≤ amount`;
+/// under the fix, `n < 2²⁸`).
+pub fn advance_plan(
+    n: u64,
+    owner: Address,
+    amount: u64,
+    paid: Option<u64>,
+    advancer: Address,
+    rules: &DestinationRules,
+    height: u64,
+) -> Result<(Vec<([u8; 32], u64)>, Address), String> {
+    let fee = rules.vault.release_fee;
+    let advance = &rules.base_return.advance;
+    if amount < fee || amount > advance.max_amount {
+        return Err(format!(
+            "an advance covers a burn of {fee} to {} µJTM, not {amount}",
+            advance.max_amount
+        ));
+    }
+    let min = advance.min_paid(amount, fee);
+    let paid = paid.unwrap_or(min);
+    if paid < min || paid > amount {
+        return Err(format!("an advance of this burn pays {min} to {amount} µJTM, not {paid}"));
+    }
+    let marker = jetsam_chain::consensus::destination::advance::advance_marker_of(
+        advance.fixed_at(height),
+        n,
+        &owner,
+        amount,
+        &advancer,
+    )
+    .ok_or_else(|| format!("an advance of this format covers an index below 2^28, not {n}"))?;
+    Ok((vec![(owner.0, paid)], marker))
+}
+
+#[cfg(test)]
+mod fast_lane_tests {
+    use super::*;
+    use jetsam_chain::consensus::destination::fast::{ContradictionEntry, FastRecord};
+    use jetsam_chain::consensus::destination::state::{DestinationRules, DestinationState};
+    use jetsam_poseidon2b::primitives::Address;
+
+    /// `getFastLane` reads the tip's fast lane: records with what a
+    /// contradiction's marker commits to, closed keys, the deficit; the kinds
+    /// `submitDestinationObject` answers for the fast lane.
+    #[test]
+    fn a_destination_payment_carries_only_a_relays_object_marker() {
+        let tagged = |tag: &[u8; 8]| {
+            let mut owner = [0x5a; 32];
+            owner[..8].copy_from_slice(tag);
+            owner
+        };
+        for tag in [b"JTMLCU01", b"JTMFCT01", b"JTMFRV01"] {
+            let owner = tagged(tag);
+            assert_eq!(
+                destination_payment_marker(&hex::encode(owner)),
+                Ok(Address(owner))
+            );
+            assert_eq!(
+                destination_payment_marker(&format!("0x{}", hex::encode(owner))),
+                Ok(Address(owner))
+            );
+        }
+        // A release's, an advance's, a client object's or any owner: never.
+        for tag in [b"JTMVRL01", b"JTMADV02", b"JTMREL01", b"JTMLCU02", b"\0\0\0\0\0\0\0\0"] {
+            assert!(destination_payment_marker(&hex::encode(tagged(tag))).is_err());
+        }
+        assert!(destination_payment_marker(&hex::encode([0x4a; 31])).is_err());
+        assert!(destination_payment_marker("zz").is_err());
+    }
+
+    #[test]
+    fn an_advance_pays_the_burns_owner_then_carries_its_marker() {
+        use jetsam_chain::consensus::destination::advance::advance_marker;
+        let rules = DestinationRules::CONSENSUS;
+        let fee = rules.vault.release_fee;
+        let (owner, advancer) = (Address([0xa1; 32]), Address([0xad; 32]));
+        let amount = 5_000 * jetsam_chain::consensus::params::MICRO_PER_JTM;
+        let min = rules.base_return.advance.min_paid(amount, fee);
+        let marker = advance_marker(3, &owner, amount, &advancer);
+        assert_eq!(
+            advance_plan(3, owner, amount, None, advancer, &rules, 0),
+            Ok((vec![(owner.0, min)], marker))
+        );
+        assert_eq!(
+            advance_plan(3, owner, amount, Some(amount - fee), advancer, &rules, 0),
+            Ok((vec![(owner.0, amount - fee)], marker))
+        );
+        // Below the least, above the burn, a burn out of bounds: refused.
+        assert!(advance_plan(3, owner, amount, Some(min - 1), advancer, &rules, 0).is_err());
+        assert!(advance_plan(3, owner, amount, Some(amount + 1), advancer, &rules, 0).is_err());
+        assert!(advance_plan(3, owner, fee - 1, None, advancer, &rules, 0).is_err());
+        let over = rules.base_return.advance.max_amount + 1;
+        assert!(advance_plan(3, owner, over, None, advancer, &rules, 0).is_err());
+    }
+
+    #[test]
+    fn rpc_get_fast_lane_reports_the_branchs_fast_lane() {
+        let mut rules = DestinationRules::CONSENSUS;
+        rules.base_return.activation_height = Some(100);
+        rules.base_return.fast.release_key = Some([0x22; 48]);
+        let mut state = DestinationState::at_v1_7(90, 0);
+        state.tip = 120;
+        state.fast.records.insert(
+            7,
+            FastRecord {
+                owner: Address([0xa1; 32]),
+                amount: 5,
+                l2_block: 9,
+                height: 110,
+                contradicted: true,
+                consumed: false,
+            },
+        );
+        state.fast.contradictions.push(ContradictionEntry {
+            n: 7,
+            owner: Address([0xa1; 32]),
+            amount: 5,
+            l2_block: 9,
+            height: 110,
+            key: Some([0x22; 48]),
+        });
+        let lane = fast_lane_of(Some(&state), 120, &rules);
+        assert!(lane.active);
+        assert!(lane.release_key_closed);
+        assert_eq!(lane.closed_keys, vec![hex::encode([0x22; 48])]);
+        assert_eq!(lane.deficit, 5);
+        assert_eq!(lane.records.len(), 1);
+        assert_eq!(lane.records[0].owner, hex::encode([0xa1; 32]));
+        assert_eq!(lane.reconcile_blocks, 14_400);
+        // This build below its height (the test chain's is armed at 8 982,
+        // the others dormant): not active, nothing remembered; the build's
+        // key as it has it (none but on the test chain).
+        let dormant = fast_lane_of(None, 120, &DestinationRules::CONSENSUS);
+        assert!(!dormant.active && dormant.records.is_empty());
+        assert_eq!(
+            dormant.release_key,
+            jetsam_chain::consensus::destination::fast::FAST_RELEASE_KEY.map(hex::encode)
+        );
+        use jetsam_mempool::destination::DestinationAdmitted;
+        for (admitted, kind) in [
+            (DestinationAdmitted::FastRelease { n: 1 }, "fast_release"),
+            (DestinationAdmitted::FastContradiction { n: 1 }, "fast_contradiction"),
+            (DestinationAdmitted::FastRevocation, "fast_revocation"),
+        ] {
+            assert_eq!(SubmitDestinationObjectResponse::from(admitted).kind, kind);
+        }
+    }
+}

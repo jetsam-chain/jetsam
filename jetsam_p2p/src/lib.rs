@@ -11,6 +11,7 @@
 
 pub mod availability_codec;
 pub mod behaviour;
+pub mod bridge_intent_gossip;
 pub mod client_object_codec;
 pub mod client_object_protocol;
 pub mod client_object_transport;
@@ -27,6 +28,7 @@ pub mod network;
 pub mod network_profile;
 pub mod object_codec;
 pub mod object_protocol;
+pub mod onion;
 mod outbound_budget;
 mod peer_diversity;
 pub mod peer_store;

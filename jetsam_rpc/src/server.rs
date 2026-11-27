@@ -32,6 +32,7 @@ use jetsam_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 use jetsam_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 
 use crate::api::JetsamApiServer;
+use crate::types::StorageHealthInfo;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, BlockTransactionInfo,
     BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, FeeBreakdownInfo,
@@ -51,6 +52,9 @@ use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError}
 use crate::wallet_submit::{
     collect_empty_slot_hints, next_user_epoch_anchor, PendingAdmissionGuard, WalletOperationGate,
 };
+
+/// `getChainInfo.storage` is read again at most this often.
+const STORAGE_HEALTH_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// External workers receive only a short-lived capability for immutable
 /// node-owned material.  The server retains exactly one attempt across its
@@ -1289,6 +1293,8 @@ pub struct RpcHandler {
     /// The node's v1.5 client objects (M3.8): offered to external-mining
     /// templates, reached by the client-object methods.
     pub client_objects: Option<crate::client_objects::SharedRpcClientObjects>,
+    /// The node's record of refused branches (T3.10b, `getObservedBranches`).
+    pub observed_branches: crate::observed_branches::SharedObservedBranches,
 }
 
 #[derive(Clone)]
@@ -1394,6 +1400,88 @@ impl RpcHandler {
             .map_err(rpc_err);
         drop(chain);
         result
+    }
+
+    /// The transaction of the active wallet paying `payments`, then carrying
+    /// `marker` (value 0), then its change: proven, its inputs reserved until
+    /// mined (`walletBuildDestinationPayment`, `walletBuildAdvance`).
+    async fn build_marker_payment(
+        &self,
+        payments: Vec<([u8; 32], u64)>,
+        marker: jetsam_poseidon2b::primitives::Address,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse> {
+        let output_count = payments.len() + 2; // the payments, the marker and, at most, change
+        let reserved_outputs = self.mempool.reserved_output_slots().await;
+        let (epoch_anchor, log_slots, slot_hints, required, next_height) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
+            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
+            let slot_hints =
+                collect_empty_slot_hints(&chain, &reserved_outputs, seed, output_count)
+                    .map_err(rpc_err)?;
+            let required = crate::client_objects::client_payment_required_fee(
+                output_count as u64,
+                tip.active_slot_count,
+                tip.log_slots,
+            );
+            (
+                epoch_anchor,
+                tip.log_slots,
+                slot_hints,
+                required,
+                chain.tip_height().saturating_add(1),
+            )
+        };
+        if !jetsam_chain::consensus::destination::state::DestinationRules::current()
+            .active_at(next_height)
+        {
+            return Err(rpc_err("destination objects are carried from the v1.7 height only"));
+        }
+        let fee = fee_micro_jtm.unwrap_or(required);
+        let wallet = Arc::clone(&self.wallet);
+        let paid: u64 = payments.iter().map(|(_, amount)| amount).sum();
+        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_wallet_proof_cpu(|| {
+                wallet.build_client_payment(
+                    payments,
+                    marker.0,
+                    fee,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+            .and_then(|result| result)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        .map_err(rpc_err)?;
+        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
+            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
+        let txid = payment.logical_txid().0;
+        let output_slots: Vec<u32> = payment
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
+            .map(|(_, output)| output.slot_index)
+            .collect();
+        // Held until mined, or until no block can include it any more, as a
+        // guardian object's payment.
+        self.wallet
+            .reserve_pending_submission(txid, &input_slots, &output_slots, paid, marker.0)
+            .map_err(rpc_err)?;
+        let built_at = self.chain.read().await.tip_height();
+        self.wallet.track_client_payment(txid, built_at);
+        Ok(crate::destination::DestinationPaymentResponse {
+            payment_hex: hex::encode(&intent_bytes),
+            txid: hex::encode(txid),
+            fee_micro_jtm: fee,
+            marker: hex::encode(marker.0),
+        })
     }
 
     async fn reload_active_wallet(&self) -> RpcResult<WalletScanResult> {
@@ -1571,6 +1659,54 @@ impl RpcHandler {
         Err(rpc_err(format!(
             "{failure_label} failed after 3 attempts: {last_error}"
         )))
+    }
+
+    /// v1.7 (F4): the plan of a deposit from the active address for the
+    /// Base/EVM `recipient`, refused before anything is built by this build's
+    /// rules (no v1.7 height, the next block not above `F`, V4's limits:
+    /// `crate::bridge::check_deposit`). The recipient's 20 bytes with it.
+    async fn bridge_deposit_plan(
+        &self,
+        recipient: &str,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<(crate::bridge::BridgeDepositPlan, [u8; 20])> {
+        use crate::bridge::{check_deposit, checksummed, deposit_fee, parse_recipient};
+        use jetsam_chain::consensus::vault::{deposit_marker, VaultRules};
+        let recipient =
+            parse_recipient(recipient).map_err(|error| rpc_err(format!("recipient: {error}")))?;
+        let rules = VaultRules::current();
+        let next_height = self.chain.read().await.tip_height().saturating_add(1);
+        check_deposit(amount_micro_jtm, &recipient, next_height, &rules)
+            .map_err(|refusal| rpc_err(format!("deposit refused: {refusal}")))?;
+        let deposits_from_height = rules
+            .deposits_from_height
+            .ok_or_else(|| rpc_err("deposit refused: the bridge is not armed in this build"))?;
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let floor = self.mempool.relay_floor().await;
+        let fee = fee_micro_jtm.unwrap_or_else(|| deposit_fee(active_slot_count, log_slots, floor));
+        let total_micro_jtm = amount_micro_jtm
+            .checked_add(fee)
+            .ok_or_else(|| rpc_err("amount plus fee overflows u64"))?;
+        let (_, from) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("no active wallet address"))?;
+        Ok((
+            crate::bridge::BridgeDepositPlan {
+                recipient: checksummed(&recipient),
+                amount_micro_jtm,
+                fee_micro_jtm: fee,
+                total_micro_jtm,
+                from,
+                spendable_micro_jtm: self.wallet.get_balance().spendable_micro_jtm,
+                vault: rules.vault.to_bech32(),
+                marker: hex::encode(deposit_marker(&recipient).0),
+                next_height,
+                deposits_from_height,
+            },
+            recipient,
+        ))
     }
 
     async fn collect_slot_hints(&self, count: u32, salt_seed: u64) -> RpcResult<Vec<u32>> {
@@ -2048,6 +2184,12 @@ impl JetsamApiServer for RpcHandler {
             active_slot_count: tip.active_slot_count,
             log_slots: tip.log_slots,
             circulating_supply_micro_jtm: chain.state.circulating_supply_micro_jtm.to_string(),
+            // Read-only, at most once a minute whatever the callers do.
+            storage: chain
+                .store
+                .database_health_cached(STORAGE_HEALTH_MAX_AGE)
+                .ok()
+                .map(|health| StorageHealthInfo::from(&health)),
         })
     }
 
@@ -2320,6 +2462,15 @@ impl JetsamApiServer for RpcHandler {
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>> {
         let chain = self.chain.read().await;
         match chain.store.get_recent_block(height) {
+            Ok(Some(bytes)) => Ok(Some(hex::encode(bytes))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(rpc_err(e.to_string())),
+        }
+    }
+
+    async fn get_deposit_block(&self, height: u64) -> RpcResult<Option<String>> {
+        let chain = self.chain.read().await;
+        match chain.store.get_canonical_deposit_block(height) {
             Ok(Some(bytes)) => Ok(Some(hex::encode(bytes))),
             Ok(None) => Ok(None),
             Err(e) => Err(rpc_err(e.to_string())),
@@ -2711,6 +2862,26 @@ impl JetsamApiServer for RpcHandler {
         }
     }
 
+    async fn get_observed_branches(
+        &self,
+        since_unix: u64,
+    ) -> RpcResult<crate::observed_branches::ObservedBranchesResponse> {
+        let (tip, work) = {
+            let chain = self.chain.read().await;
+            (
+                jetsam_p2p::object_protocol::ChainPoint::new(chain.tip_height(), chain.tip_hash()),
+                *chain.tip_chain_work(),
+            )
+        };
+        crate::observed_branches::get_observed_branches(
+            self.observed_branches.clone(),
+            since_unix,
+            tip,
+            work,
+        )
+        .await
+    }
+
     async fn get_node_status(&self) -> RpcResult<NodeStatus> {
         let p2p = self.p2p_health.borrow().clone();
         let heartbeat_age = p2p.updated_at.elapsed();
@@ -2738,11 +2909,11 @@ impl JetsamApiServer for RpcHandler {
 
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64> {
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
+        let floor = self.mempool.relay_floor().await;
         Ok(
             jetsam_chain::consensus::fee_breakdown(1, n_outputs as u64, active_slot_count, log_slots)
                 .required_total
-                .max(floor),
+                .max(floor.required(1, n_outputs as u64)),
         )
     }
 
@@ -2751,7 +2922,11 @@ impl JetsamApiServer for RpcHandler {
         let n_outputs = n_outputs as usize;
         validate_tx_counts(n_inputs, n_outputs)?;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
+        let floor = self
+            .mempool
+            .relay_floor()
+            .await
+            .required(n_inputs as u64, n_outputs as u64);
         let breakdown = jetsam_chain::consensus::fee_breakdown(
             n_inputs as u64,
             n_outputs as u64,
@@ -3345,6 +3520,486 @@ impl JetsamApiServer for RpcHandler {
         ))
     }
 
+    async fn submit_destination_object(
+        &self,
+        intent_hex: String,
+    ) -> RpcResult<crate::destination::SubmitDestinationObjectResponse> {
+        let bytes = hex::decode(intent_hex.trim())
+            .map_err(|error| rpc_err(format!("intent_hex: {error}")))?;
+        if bytes.len() > jetsam_mempool::destination::MAX_DESTINATION_INTENT_BYTES {
+            return Err(rpc_err("destination intent too large"));
+        }
+        self.mempool
+            .submit_destination(&bytes)
+            .await
+            .map(Into::into)
+            .map_err(|error| rpc_err(format!("destination intent refused: {error}")))
+    }
+
+    async fn get_vault_state(&self) -> RpcResult<crate::destination::VaultStateResponse> {
+        use crate::destination::{deposit_count_of_outputs, vault_state, DEPOSIT_COUNT_HEIGHTS};
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let held_releases = self.mempool.destination_candidates().await.1.len();
+        let chain = self.chain.read().await;
+        let tip = chain.tip_height();
+        let state = chain.destination_state();
+        let mut deposits = Vec::new();
+        let mut unread = 0u64;
+        if let Some(state) = state {
+            let from = state
+                .start
+                .max(tip.saturating_sub(DEPOSIT_COUNT_HEIGHTS - 1));
+            for height in from..=tip {
+                let block = chain
+                    .store
+                    .get_recent_block(height)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| jetsam_chain::block::Block::from_bytes(&bytes).ok());
+                let Some(block) = block else {
+                    unread += 1;
+                    continue;
+                };
+                let count = deposit_count_of_outputs(block.transactions.iter().flat_map(|tx| {
+                    tx.body
+                        .live_outputs()
+                        .map(|(_, output)| (output.owner, output.amount))
+                        .collect::<Vec<_>>()
+                }));
+                deposits.push((height, count));
+            }
+        }
+        let mut reply = vault_state(state, tip, &rules, &deposits, held_releases);
+        reply.deposit_heights_unread = unread;
+        // RC-5: what one release can pay today from the vault's slots.
+        if let Some(state) = state {
+            let vault = chain
+                .store
+                .get_verified_utxos_by_owner(&rules.vault.vault.0)
+                .map_err(|e| rpc_err(e.to_string()))?;
+            let slots: Vec<jetsam_chain::consensus::vault::VaultSlotRef> = vault
+                .utxos
+                .into_iter()
+                .map(|utxo| jetsam_chain::consensus::vault::VaultSlotRef {
+                    slot_index: utxo.slot_index,
+                    amount: utxo.amount,
+                    creation_id: utxo.creation_id,
+                })
+                .collect();
+            reply.largest_release =
+                jetsam_chain::consensus::vault::largest_payable_release(&slots, state.floor);
+        }
+        Ok(reply)
+    }
+
+    async fn get_destination_committee(
+        &self,
+    ) -> RpcResult<crate::destination::DestinationCommitteeResponse> {
+        let chain = self.chain.read().await;
+        // The next block's rules: from the return-over-Base height on, its
+        // anchor and bridge.
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current()
+            .effective_at(chain.tip_height().saturating_add(1));
+        let keys = chain.committee_keys();
+        Ok(crate::destination::destination_committee(
+            chain.destination_state(),
+            &rules,
+            |root| keys.get(root).is_some(),
+        ))
+    }
+
+    async fn get_fast_lane(&self) -> RpcResult<crate::destination::FastLaneResponse> {
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let chain = self.chain.read().await;
+        Ok(crate::destination::fast_lane_of(
+            chain.destination_state(),
+            chain.tip_height(),
+            &rules,
+        ))
+    }
+
+    async fn get_activations(
+        &self,
+    ) -> RpcResult<jetsam_chain::consensus::activations::Activations> {
+        Ok(jetsam_chain::consensus::activations::Activations::current())
+    }
+
+    async fn get_advances(
+        &self,
+        n: u64,
+        owner: Option<String>,
+        amount: Option<u64>,
+    ) -> RpcResult<crate::destination::AdvancesResponse> {
+        let burn = match (owner, amount) {
+            (Some(owner), Some(amount)) => Some((parse_address_param(&owner)?, amount)),
+            (None, None) => None,
+            _ => return Err(rpc_err("owner and amount go together")),
+        };
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        let chain = self.chain.read().await;
+        Ok(crate::destination::advances_of(
+            chain.destination_state(),
+            chain.tip_height(),
+            &rules,
+            n,
+            burn,
+        ))
+    }
+
+    async fn submit_guardian_object(
+        &self,
+        ext: &jsonrpsee::Extensions,
+        intent_hex: String,
+    ) -> RpcResult<crate::guardian::SubmitGuardianObjectResponse> {
+        crate::guardian::submit_guardian_object(&self.mempool, ext, &intent_hex)
+            .await
+            .map_err(rpc_err)
+    }
+
+    async fn get_guardian_state(&self) -> RpcResult<crate::guardian::GuardianStateResponse> {
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let held = self.mempool.guardian_candidates().await.len();
+        let chain = self.chain.read().await;
+        let tip = chain.tip_height();
+        let state = guardian_state_for_child(&chain, &rules);
+        let stake_vault = guardian_pool_slots(&chain, &rules.stake_vault)?;
+        let reward_pool = guardian_pool_slots(&chain, &rules.reward_pool)?;
+        Ok(crate::guardian::guardian_state(
+            state.as_ref(),
+            tip,
+            &rules,
+            &stake_vault,
+            &reward_pool,
+            held,
+        ))
+    }
+
+    async fn get_stake_info(&self, owner: String) -> RpcResult<crate::guardian::StakeInfoResponse> {
+        let owner = parse_address_param(&owner)?;
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let chain = self.chain.read().await;
+        let state = guardian_state_for_child(&chain, &rules);
+        let stake_vault = guardian_pool_slots(&chain, &rules.stake_vault)?;
+        Ok(crate::guardian::stake_info(
+            state.as_ref(),
+            &owner,
+            chain.tip_height(),
+            &rules,
+            &stake_vault,
+        ))
+    }
+
+    async fn get_reward_info(
+        &self,
+        owner: String,
+    ) -> RpcResult<crate::guardian::RewardInfoResponse> {
+        let owner = parse_address_param(&owner)?;
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let chain = self.chain.read().await;
+        let state = guardian_state_for_child(&chain, &rules);
+        Ok(crate::guardian::reward_info(
+            state.as_ref(),
+            &owner,
+            chain.tip_height(),
+            &rules,
+        ))
+    }
+
+    async fn wallet_build_guardian_payment(
+        &self,
+        object: crate::guardian::GuardianPaymentObject,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::guardian::GuardianPaymentResponse> {
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let (_, active) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("no active wallet address"))?;
+        let owner = parse_address_param(&active)?;
+        let (guardian_object, payments) =
+            crate::guardian::plan_guardian_payment(&object, owner, &rules).map_err(rpc_err)?;
+        let marker = guardian_object.marker();
+        let output_count = payments.len() + 2; // the marker and, at most, change
+        let reserved_outputs = self.mempool.reserved_output_slots().await;
+        let (epoch_anchor, log_slots, slot_hints, required, next_height) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
+            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
+            let slot_hints =
+                collect_empty_slot_hints(&chain, &reserved_outputs, seed, output_count)
+                    .map_err(rpc_err)?;
+            let required = crate::client_objects::client_payment_required_fee(
+                output_count as u64,
+                tip.active_slot_count,
+                tip.log_slots,
+            );
+            (
+                epoch_anchor,
+                tip.log_slots,
+                slot_hints,
+                required,
+                chain.tip_height().saturating_add(1),
+            )
+        };
+        if !jetsam_chain::consensus::params::v1_7_active_with(
+            next_height,
+            rules.activation_height,
+        ) {
+            return Err(rpc_err("guardian objects are carried from the v1.7 height only"));
+        }
+        let fee = fee_micro_jtm.unwrap_or(required);
+        let wallet = Arc::clone(&self.wallet);
+        let build_payments = payments.clone();
+        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_wallet_proof_cpu(|| {
+                wallet.build_client_payment(
+                    build_payments,
+                    marker.0,
+                    fee,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+            .and_then(|result| result)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        .map_err(rpc_err)?;
+        let payment = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
+            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
+        let guardian_intent = crate::guardian::guardian_intent_bytes(&guardian_object, &payment)
+            .map_err(rpc_err)?;
+        let txid = payment.logical_txid().0;
+        let output_slots: Vec<u32> = payment
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
+            .map(|(_, output)| output.slot_index)
+            .collect();
+        // Held until mined, or until no block can include it any more, as a
+        // client-object payment: it never enters the fee pool either.
+        self.wallet
+            .reserve_pending_submission(
+                txid,
+                &input_slots,
+                &output_slots,
+                payments.iter().map(|(_, amount)| amount).sum(),
+                marker.0,
+            )
+            .map_err(rpc_err)?;
+        let built_at = self.chain.read().await.tip_height();
+        self.wallet.track_client_payment(txid, built_at);
+        Ok(crate::guardian::GuardianPaymentResponse {
+            kind: crate::guardian::kind_name(guardian_object.kind).into(),
+            payment_hex: hex::encode(&intent_bytes),
+            intent_hex: hex::encode(guardian_intent),
+            txid: hex::encode(txid),
+            fee_micro_jtm: fee,
+            marker: hex::encode(marker.0),
+        })
+    }
+
+    async fn wallet_build_destination_payment(
+        &self,
+        marker: String,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse> {
+        let marker = crate::destination::destination_payment_marker(&marker).map_err(rpc_err)?;
+        if self.wallet.active_address().is_none() {
+            return Err(rpc_err("no active wallet address"));
+        }
+        self.build_marker_payment(Vec::new(), marker, fee_micro_jtm).await
+    }
+
+    async fn wallet_build_advance(
+        &self,
+        n: u64,
+        owner: String,
+        amount_micro_jtm: u64,
+        paid_micro_jtm: Option<u64>,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse> {
+        let (_, active) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("no active wallet address"))?;
+        let advancer = parse_address_param(&active)?;
+        let owner = parse_address_param(&owner)?;
+        let rules = jetsam_chain::consensus::destination::state::DestinationRules::current();
+        // FIXRC ET-1: the marker of the block the advance is built for.
+        let next_height = self.chain.read().await.tip_height().saturating_add(1);
+        let (payments, marker) = crate::destination::advance_plan(
+            n,
+            owner,
+            amount_micro_jtm,
+            paid_micro_jtm,
+            advancer,
+            &rules,
+            next_height,
+        )
+        .map_err(rpc_err)?;
+        self.build_marker_payment(payments, marker, fee_micro_jtm).await
+    }
+
+    async fn wallet_plan_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::bridge::BridgeDepositPlan> {
+        let _wallet_operation = self.wallet_operation_gate.lock().await;
+        self.reload_active_wallet().await?;
+        Ok(self
+            .bridge_deposit_plan(&recipient, amount_micro_jtm, fee_micro_jtm)
+            .await?
+            .0)
+    }
+
+    async fn wallet_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
+    ) -> RpcResult<crate::bridge::BridgeDepositResult> {
+        use jetsam_chain::consensus::vault::VAULT_ADDRESS;
+        let _wallet_operation = self.wallet_operation_gate.lock().await;
+        self.reload_active_wallet().await?;
+        if fee_micro_jtm == 0 {
+            return Err(rpc_err(
+                "walletBridgeDeposit pays the fee its plan gave (walletPlanBridgeDeposit)",
+            ));
+        }
+        let (plan, recipient) = self
+            .bridge_deposit_plan(&recipient, amount_micro_jtm, Some(fee_micro_jtm))
+            .await?;
+        if plan.total_micro_jtm > plan.spendable_micro_jtm {
+            return Err(rpc_err(format!(
+                "insufficient funds: the deposit and its fee take {} \u{03bc}{ticker}, the active address can spend {} \u{03bc}{ticker}",
+                plan.total_micro_jtm,
+                plan.spendable_micro_jtm,
+                ticker = jetsam_chain::consensus::identity::TICKER
+            )));
+        }
+        // The vault, then the marker (the one definition of a deposit's
+        // outputs); the wallet adds the change after them.
+        let outputs = crate::bridge::deposit_outputs(amount_micro_jtm, &recipient);
+        let payments = vec![(outputs[0].0 .0, outputs[0].1)];
+        let marker = outputs[1].0;
+        let reserved_outputs = self.mempool.reserved_output_slots().await;
+        let (epoch_anchor, log_slots, slot_hints) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            let seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                ^ u64::from_le_bytes(marker.0[8..16].try_into().unwrap());
+            let epoch_anchor = next_user_epoch_anchor(&chain).map_err(rpc_err)?;
+            let slot_hints = collect_empty_slot_hints(
+                &chain,
+                &reserved_outputs,
+                seed,
+                crate::bridge::DEPOSIT_OUTPUTS_WITH_CHANGE as usize,
+            )
+            .map_err(rpc_err)?;
+            (epoch_anchor, tip.log_slots, slot_hints)
+        };
+        let wallet = Arc::clone(&self.wallet);
+        let (intent_bytes, input_slots) = tokio::task::spawn_blocking(move || {
+            jetsam_miner::install_wallet_proof_cpu(|| {
+                wallet.build_client_payment(
+                    payments,
+                    marker.0,
+                    fee_micro_jtm,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+            .and_then(|result| result)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("wallet proof task: {error}")))?
+        .map_err(rpc_err)?;
+        let intent = jetsam_tx::PagedSpendIntent::from_bytes(&intent_bytes)
+            .map_err(|error| rpc_err(format!("intent decode: {error:?}")))?;
+        let facts = jetsam_tx::validate_paged_spend(&intent.pages)
+            .map_err(|error| rpc_err(format!("wallet PagedSpend: {error}")))?;
+        let output_slots: Vec<u32> = intent
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
+            .map(|(_, output)| output.slot_index)
+            .collect();
+        // Reserved before admission, rolled back if the mempool refuses it
+        // (V4 and V8 are checked there, at the next block's height).
+        let reservation = PendingAdmissionGuard::reserve(
+            Arc::clone(&self.wallet),
+            facts.logical_txid.0,
+            input_slots,
+            output_slots,
+            amount_micro_jtm,
+            VAULT_ADDRESS.0,
+        )
+        .map_err(rpc_err)?;
+        match self
+            .wallet_submission_mempool
+            .submit(intent, intent_bytes)
+            .await
+        {
+            Ok(txid) => {
+                reservation.commit();
+                tracing::info!(
+                    amount_micro_jtm,
+                    fee_micro_jtm,
+                    next_height = plan.next_height,
+                    recipient = %plan.recipient,
+                    "bridge deposit admitted"
+                );
+                Ok(crate::bridge::BridgeDepositResult {
+                    txid: hex::encode(txid.0),
+                    recipient: plan.recipient,
+                    amount_micro_jtm,
+                    fee_micro_jtm: facts.fee,
+                    input_count: usize::from(facts.live_inputs),
+                    output_count: usize::from(facts.live_outputs),
+                    next_height: plan.next_height,
+                })
+            }
+            Err(error) => {
+                drop(reservation);
+                Err(rpc_err(format!("deposit refused by the mempool: {error}")))
+            }
+        }
+    }
+
+    async fn plan_guardian_payout(&self, entry_id: u64) -> RpcResult<crate::guardian::PayoutPlan> {
+        use jetsam_chain::consensus::guardian::PayoutEntryKind;
+        let rules = jetsam_chain::consensus::guardian::GuardianRules::current();
+        let chain = self.chain.read().await;
+        let state = guardian_state_for_child(&chain, &rules)
+            .ok_or_else(|| rpc_err(crate::guardian::DELEGATION_INACTIVE_MESSAGE))?;
+        let pool = match state.entries.get(&entry_id).map(|entry| entry.kind) {
+            Some(PayoutEntryKind::Stake) => rules.stake_vault,
+            Some(_) => rules.reward_pool,
+            None => return Err(rpc_err(format!("no open entry {entry_id}"))),
+        };
+        let slots = guardian_pool_slots(&chain, &pool)?;
+        let tip = chain.tip_header();
+        crate::guardian::plan_guardian_payout(
+            &state,
+            entry_id,
+            chain.tip_height().saturating_add(1),
+            &rules,
+            &slots,
+            tip.active_slot_count,
+            tip.log_slots,
+        )
+        .map_err(rpc_err)
+    }
+
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
         let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = jetsam_poseidon2b::primitives::TxBodyHash(hash_bytes);
@@ -3893,7 +4548,7 @@ impl JetsamApiServer for RpcHandler {
         self.reload_active_wallet().await?;
         let _to_address = parse_address_param(&to_address)?.0;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
+        let floor = self.mempool.relay_floor().await;
         self.wallet
             .plan_send(
                 amount_micro_jtm,
@@ -3920,7 +4575,7 @@ impl JetsamApiServer for RpcHandler {
         let to_address = parse_address_param(&to_address)?.0;
 
         let (fee_active_slot_count, fee_log_slots) = self.mempool.fee_context().await;
-        let fee_floor = self.mempool.fee_floor().await;
+        let fee_floor = self.mempool.relay_floor().await;
         let plan = self
             .wallet
             .plan_send(
@@ -3956,7 +4611,7 @@ impl JetsamApiServer for RpcHandler {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let relay_floor = self.mempool.fee_floor().await;
+        let relay_floor = self.mempool.relay_floor().await;
         self.wallet
             .plan_consolidation(
                 WALLET_CONSOLIDATION_INPUT_LIMIT,
@@ -3981,7 +4636,7 @@ impl JetsamApiServer for RpcHandler {
             .ok_or_else(|| rpc_err("wallet not initialized"))?;
         let active_address = parse_address_param(&active_address)?.0;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let relay_floor = self.mempool.fee_floor().await;
+        let relay_floor = self.mempool.relay_floor().await;
         let plan = self
             .wallet
             .plan_consolidation(
@@ -4110,7 +4765,7 @@ impl JetsamApiServer for RpcHandler {
 
         Ok(MempoolInfo {
             size: txs.len(),
-            fee_floor: snapshot.fee_floor,
+            fee_floor: snapshot.fee_floor.required(1, 1),
             txs,
         })
     }
@@ -4122,7 +4777,7 @@ impl JetsamApiServer for RpcHandler {
             capacity: usage.capacity,
             intent_bytes: usage.intent_bytes as u64,
             max_intent_bytes: usage.max_intent_bytes as u64,
-            fee_floor: usage.fee_floor,
+            fee_floor: usage.fee_floor.required(1, 1),
         })
     }
 }
@@ -4144,6 +4799,40 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// The v1.7 guardian state the tip's child is judged against (T3.7): at J a
+/// fresh one on the tip's `alloc_counter`, `None` below J.
+fn guardian_state_for_child(
+    chain: &jetsam_chain::storage::MdbxChainContext,
+    rules: &jetsam_chain::consensus::guardian::GuardianRules,
+) -> Option<jetsam_chain::consensus::guardian::GuardianState> {
+    jetsam_chain::consensus::guardian::GuardianState::for_child(
+        chain.guardian_state(),
+        chain.tip_header().alloc_counter,
+        chain.tip_height().saturating_add(1),
+        rules.activation_height,
+    )
+}
+
+/// The live slots of a guardian pool, from the store's owner index.
+fn guardian_pool_slots(
+    chain: &jetsam_chain::storage::MdbxChainContext,
+    pool: &jetsam_poseidon2b::primitives::Address,
+) -> RpcResult<Vec<crate::guardian::PoolSlot>> {
+    let snapshot = chain
+        .store
+        .get_verified_utxos_by_owner(&pool.0)
+        .map_err(|error| rpc_err(format!("pool slots: {error}")))?;
+    Ok(snapshot
+        .utxos
+        .iter()
+        .map(|utxo| crate::guardian::PoolSlot {
+            slot: utxo.slot_index,
+            amount: utxo.amount,
+            creation_id: utxo.creation_id,
+        })
+        .collect())
 }
 
 /// Parse a required address parameter from canonical bech32m (`o1…`).
@@ -4772,9 +5461,11 @@ pub async fn start_rpc_server(
     mining_api_enabled: bool,
     mining_payout_address: Option<jetsam_poseidon2b::primitives::Address>,
     mining_key: Option<String>,
+    rpc_cookie: String,
     allow_custom_coinbase: bool,
     rpc_is_loopback: bool,
     client_objects: Option<crate::client_objects::SharedRpcClientObjects>,
+    observed_branches: crate::observed_branches::SharedObservedBranches,
 ) -> anyhow::Result<(
     jsonrpsee::server::ServerHandle,
     tokio::sync::oneshot::Receiver<()>,
@@ -4865,27 +5556,192 @@ pub async fn start_rpc_server(
             external_mining_terminal_bytes,
         ))),
         client_objects,
+        observed_branches,
     };
 
-    // Always add the RPC access-control middleware layer. Browser-originated
-    // requests are rejected before JSON-RPC dispatch so an arbitrary website
-    // cannot reach a wallet through its loopback listener. Native local
-    // clients do not send Origin. When mining_key is Some(key), all remaining
-    // requests must also carry `Authorization: Bearer <key>`.
-    //
-    // Pool operators:  jetsam --rpc-listen 0.0.0.0:9701 --mining-key <secret>
-    // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
-    let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
-    let server = Server::builder()
-        .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
-            expected: expected_bearer,
-        }))
-        .build(listen)
+    anyhow::ensure!(!rpc_cookie.is_empty(), "the RPC cookie is empty");
+    let services = rpc_services(&rpc_cookie, mining_key.as_deref());
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|e| anyhow::anyhow!("build RPC server: {e}"))?;
-    let handle = server.start(handler.into_rpc());
+    let handle = serve_rpc(listener, services, handler.into_rpc().into());
     tracing::debug!(%listen, "RPC server started");
     Ok((handle, stop_rx))
+}
+
+/// R-5 (audit 2026-11-10): the most calls one JSON-RPC batch carries.
+pub const RPC_MAX_BATCH_CALLS: u32 = 16;
+
+/// R-5: the largest object one call hands the node, in bytes: an intent, a
+/// client proof or batch bundle, a destination or guardian intent, a receipt
+/// (an assembled bundle's parts are within its bundle).
+const RPC_LARGEST_OBJECT_BYTES: usize = {
+    let objects = [
+        MAX_TX_INTENT_BYTES_GLOBAL,
+        jetsam_p2p::client_object_protocol::MAX_CLIENT_PROOF_BUNDLE_BYTES,
+        jetsam_p2p::client_object_protocol::MAX_CLIENT_BATCH_BUNDLE_BYTES,
+        jetsam_mempool::destination::MAX_DESTINATION_INTENT_BYTES,
+        jetsam_mempool::guardian::MAX_GUARDIAN_INTENT_BYTES,
+        MAX_RPC_RECEIPT_BYTES,
+    ];
+    let mut largest = 0;
+    let mut index = 0;
+    while index < objects.len() {
+        if objects[index] > largest {
+            largest = objects[index];
+        }
+        index += 1;
+    }
+    largest
+};
+
+/// R-5: the largest request body: one such object in hex and 64 KiB of JSON
+/// around it, where jsonrpsee's default was 10 MB.
+pub const RPC_MAX_REQUEST_BODY_BYTES: u32 = (2 * RPC_LARGEST_OBJECT_BYTES + 64 * 1024) as u32;
+
+/// R-1, R-2 (audit 2026-11-10): whether `method` (its wire name) answers only
+/// to the node's RPC cookie: every wallet method — they spend, sign with or
+/// reveal the node's keys and history — `stop`, and `registerClient` (it
+/// opens a path of this node's disk). Neither the `--mining-key` bearer nor
+/// an anonymous caller reaches them.
+fn method_needs_cookie(method: &str) -> bool {
+    let name = method.strip_prefix("jetsam_").unwrap_or(method);
+    name.starts_with("wallet") || name == "stop" || name == "registerClient"
+}
+
+/// R-1, R-2: what a request authenticated with, put in its extensions by
+/// [`BearerAuthLayer`] for [`CookieGate`] to read call by call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RpcCredential {
+    /// The node's RPC cookie: every method.
+    Cookie,
+    /// The `--mining-key` bearer, or no credential on a node without one:
+    /// every method but those of [`method_needs_cookie`].
+    Other,
+}
+
+/// The RPC middleware of [`CookieGate`].
+#[derive(Clone, Copy, Debug)]
+struct CookieGateLayer;
+
+impl<S> tower::Layer<S> for CookieGateLayer {
+    type Service = CookieGate<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        CookieGate(inner)
+    }
+}
+
+/// R-1, R-2: refuses, call by call (a batch included), every method of
+/// [`method_needs_cookie`] to a request that did not present the cookie.
+#[derive(Clone, Debug)]
+struct CookieGate<S>(S);
+
+impl<'a, S> jsonrpsee::server::middleware::rpc::RpcServiceT<'a> for CookieGate<S>
+where
+    S: jsonrpsee::server::middleware::rpc::RpcServiceT<'a> + Send + Sync,
+    S::Future: Send + 'a,
+{
+    type Future = Pin<Box<dyn Future<Output = jsonrpsee::MethodResponse> + Send + 'a>>;
+
+    fn call(&self, request: jsonrpsee::types::Request<'a>) -> Self::Future {
+        if method_needs_cookie(request.method_name())
+            && request.extensions().get::<RpcCredential>() != Some(&RpcCredential::Cookie)
+        {
+            let refusal = ErrorObject::owned(
+                crate::types::ERR_RPC_COOKIE_REQUIRED,
+                format!(
+                    "{} needs this node's RPC cookie: send `Authorization: Bearer <cookie>`, the \
+                     cookie being the contents of rpc.cookie in the node's data directory \
+                     (written at every start, readable by the node's user only)",
+                    request.method_name()
+                ),
+                None::<()>,
+            );
+            let response = jsonrpsee::MethodResponse::error(request.id(), refusal);
+            return Box::pin(std::future::ready(response));
+        }
+        Box::pin(self.0.call(request))
+    }
+}
+
+/// The layers every RPC connection is served through.
+type RpcServices = jsonrpsee::server::TowerServiceBuilder<
+    tower::layer::util::Stack<CookieGateLayer, tower::layer::util::Identity>,
+    tower::layer::util::Stack<BearerAuthLayer, tower::layer::util::Identity>,
+>;
+
+/// Always add the RPC access-control middleware layer. Browser-originated
+/// requests are rejected before JSON-RPC dispatch so an arbitrary website
+/// cannot reach a wallet through its loopback listener. Native local
+/// clients do not send Origin. When mining_key is Some(key), all remaining
+/// requests must also carry `Authorization: Bearer <key>` or the cookie.
+///
+/// R-1, R-2 (audit 2026-11-10): the wallet methods, `stop` and
+/// `registerClient` answer only to `Authorization: Bearer <cookie>`
+/// ([`CookieGate`]); the mining key opens mining and reads, never them.
+/// R-5: at most [`RPC_MAX_BATCH_CALLS`] calls a batch, bodies of at most
+/// [`RPC_MAX_REQUEST_BODY_BYTES`].
+///
+/// Pool operators:  jetsam --rpc-listen 0.0.0.0:9701 --mining-key <secret>
+/// Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
+fn rpc_services(cookie: &str, mining_key: Option<&str>) -> RpcServices {
+    assert!(!cookie.is_empty(), "the RPC cookie is never empty");
+    Server::builder()
+        .max_request_body_size(RPC_MAX_REQUEST_BODY_BYTES)
+        .set_batch_request_config(jsonrpsee::server::BatchRequestConfig::Limit(
+            RPC_MAX_BATCH_CALLS,
+        ))
+        .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
+            cookie: format!("Bearer {cookie}"),
+            mining_key: mining_key.map(|key| format!("Bearer {key}")),
+        }))
+        .set_rpc_middleware(jsonrpsee::server::RpcServiceBuilder::new().layer(CookieGateLayer))
+        .to_service_builder()
+}
+
+/// Serve `methods` through `services` on every connection `listener` accepts.
+fn serve_rpc(
+    listener: tokio::net::TcpListener,
+    services: RpcServices,
+    methods: jsonrpsee::Methods,
+) -> jsonrpsee::server::ServerHandle {
+    let (stop, handle) = jsonrpsee::server::stop_channel();
+    // A3-5: jsonrpsee's own accept loop does not hand a method the client's
+    // address; this one (its low-level API) puts it in every request's
+    // extensions, for the guardian rate limit to key by it.
+    tokio::spawn(async move {
+        loop {
+            let (socket, remote) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::debug!(%error, "RPC: failed to accept a connection");
+                        continue;
+                    }
+                },
+                _ = stop.clone().shutdown() => break,
+            };
+            // As jsonrpsee's own loop does (its default `tcp_no_delay`).
+            if let Err(error) = socket.set_nodelay(true) {
+                tracing::warn!(%error, "RPC: could not set NODELAY on a connection");
+                continue;
+            }
+            let (services, methods, stop_conn) = (services.clone(), methods.clone(), stop.clone());
+            let service = tower::service_fn(move |mut request: http::Request<_>| {
+                request
+                    .extensions_mut()
+                    .insert(crate::guardian::RpcRemoteAddr(remote));
+                let mut service = services.clone().build(methods.clone(), stop_conn.clone());
+                async move { tower::Service::call(&mut service, request).await }
+            });
+            tokio::spawn(jsonrpsee::server::serve_with_graceful_shutdown(
+                socket,
+                service,
+                stop.clone().shutdown(),
+            ));
+        }
+    });
+    handle
 }
 
 // ---------------------------------------------------------------------------
@@ -4894,8 +5750,12 @@ pub async fn start_rpc_server(
 
 #[derive(Clone)]
 struct BearerAuthLayer {
-    /// `None` = no bearer token required. `Some(s)` = require `Authorization: <s>`.
-    expected: Option<String>,
+    /// `Authorization: <cookie>` opens every method (R-1).
+    cookie: String,
+    /// `None` = no bearer token required. `Some(s)` = require
+    /// `Authorization: <s>` (or the cookie); it never opens the methods of
+    /// [`method_needs_cookie`] (R-2).
+    mining_key: Option<String>,
 }
 
 impl<S> tower::Layer<S> for BearerAuthLayer {
@@ -4903,7 +5763,8 @@ impl<S> tower::Layer<S> for BearerAuthLayer {
     fn layer(&self, inner: S) -> Self::Service {
         BearerAuthService {
             inner,
-            expected: self.expected.clone(),
+            cookie: self.cookie.clone(),
+            mining_key: self.mining_key.clone(),
         }
     }
 }
@@ -4911,7 +5772,8 @@ impl<S> tower::Layer<S> for BearerAuthLayer {
 #[derive(Clone)]
 struct BearerAuthService<S> {
     inner: S,
-    expected: Option<String>,
+    cookie: String,
+    mining_key: Option<String>,
 }
 
 use std::future::Future;
@@ -4935,7 +5797,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
         // A browser can reach a loopback TCP listener from an unrelated web
         // origin. Reject every browser-originated HTTP and WebSocket request;
         // the official GUI, CLI and miner are native clients without Origin.
@@ -4948,19 +5810,27 @@ where
             });
         }
 
-        // No key configured — native clients may pass without bearer auth.
-        let Some(ref expected) = self.expected else {
-            let fut = self.inner.call(req);
-            return Box::pin(fut);
-        };
-
         let auth = req
             .headers()
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if bearer_matches(auth, &expected) {
+        // The cookie opens everything. No key configured — native clients
+        // may pass without bearer auth, to every method but the cookie's.
+        let credential = if bearer_matches(auth, &self.cookie) {
+            Some(RpcCredential::Cookie)
+        } else {
+            match self.mining_key {
+                None => Some(RpcCredential::Other),
+                Some(ref expected) => {
+                    bearer_matches(auth, expected).then_some(RpcCredential::Other)
+                }
+            }
+        };
+
+        if let Some(credential) = credential {
+            req.extensions_mut().insert(credential);
             let fut = self.inner.call(req);
             Box::pin(fut)
         } else {
@@ -4975,6 +5845,304 @@ where
                     .expect("static 401 response"))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod rpc_access_tests {
+    //! R-1, R-2, R-5 (audit 2026-11-10), through the real layers and limits
+    //! of `start_rpc_server` over HTTP, in front of stand-in methods that
+    //! answer their own name.
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const COOKIE: &str = "5f2c8e0d4b7a91c3e6f80d1b2a3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e";
+    const MINING_KEY: &str = "a-mining-key-of-the-pool";
+
+    /// Methods of each kind, by their wire name.
+    const READS: &[&str] = &[
+        "jetsam_getChainInfo",
+        "jetsam_getAdvances",
+        "jetsam_getBlock",
+        "jetsam_getActivations",
+    ];
+    const MINING: &[&str] = &["jetsam_getBlockTemplate", "jetsam_submitBlock"];
+    const COOKIE_ONLY: &[&str] = &[
+        "jetsam_walletSend",
+        "jetsam_walletConsolidate",
+        "jetsam_walletBuildClientPayment",
+        "jetsam_walletBuildGuardianPayment",
+        "jetsam_walletBuildDestinationPayment",
+        "jetsam_walletBuildAdvance",
+        "jetsam_walletBridgeDeposit",
+        "jetsam_walletGetBalance",
+        "jetsam_stop",
+        "jetsam_registerClient",
+    ];
+
+    async fn node(mining_key: Option<&str>) -> (SocketAddr, jsonrpsee::server::ServerHandle) {
+        let mut module = jsonrpsee::RpcModule::new(());
+        for name in READS
+            .iter()
+            .chain(MINING)
+            .chain(COOKIE_ONLY)
+            .chain(&["jetsam_submitTxIntent"])
+        {
+            module
+                .register_method(name, move |_, _, _| name.to_string())
+                .unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = serve_rpc(listener, rpc_services(COOKIE, mining_key), module.into());
+        (address, handle)
+    }
+
+    /// POST `body` (with `Content-Length: declared` when given, and nothing
+    /// sent after the headers): the status and the JSON answer.
+    async fn post_with(
+        address: SocketAddr,
+        bearer: Option<&str>,
+        body: &str,
+        declared: Option<usize>,
+    ) -> (u16, serde_json::Value) {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let auth = bearer
+            .map(|bearer| format!("Authorization: Bearer {bearer}\r\n"))
+            .unwrap_or_default();
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n{auth}\r\n",
+            declared.unwrap_or(body.len())
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        if declared.is_none() {
+            socket.write_all(body.as_bytes()).await.unwrap();
+        }
+        // A node that waits for a body never sent must fail the test, not hang it.
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(20), socket.read_to_end(&mut raw)).await;
+        let raw = String::from_utf8_lossy(&raw);
+        let status = raw
+            .split(' ')
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap_or(0);
+        let answer = raw
+            .split_once("\r\n\r\n")
+            .and_then(|(_, body)| serde_json::from_str(body.trim()).ok())
+            .unwrap_or(serde_json::Value::Null);
+        (status, answer)
+    }
+
+    async fn post(
+        address: SocketAddr,
+        bearer: Option<&str>,
+        body: &str,
+    ) -> (u16, serde_json::Value) {
+        post_with(address, bearer, body, None).await
+    }
+
+    fn call(method: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#)
+    }
+
+    /// The method answered (its stand-in returns its own name).
+    async fn answers(address: SocketAddr, bearer: Option<&str>, method: &str) -> bool {
+        let (status, answer) = post(address, bearer, &call(method)).await;
+        status == 200 && answer["result"] == method
+    }
+
+    /// The method was refused for want of the cookie, with its own code.
+    async fn needs_cookie(address: SocketAddr, bearer: Option<&str>, method: &str) -> bool {
+        let (status, answer) = post(address, bearer, &call(method)).await;
+        status == 200
+            && answer["error"]["code"] == crate::types::ERR_RPC_COOKIE_REQUIRED
+            && answer["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("rpc.cookie"))
+    }
+
+    /// R-1: on a node without `--mining-key`, anything local could spend
+    /// the wallet and stop the node. Reads and mining stay open; every
+    /// method that spends, signs with or reveals the wallet, `stop` and
+    /// `registerClient` answer only to the cookie.
+    #[tokio::test]
+    async fn without_a_mining_key_spending_and_stopping_need_the_cookie() {
+        let (address, _node) = node(None).await;
+        for method in READS.iter().chain(MINING).chain(&["jetsam_submitTxIntent"]) {
+            assert!(
+                answers(address, None, method).await,
+                "{method} without a credential"
+            );
+        }
+        for method in COOKIE_ONLY {
+            assert!(
+                needs_cookie(address, None, method).await,
+                "{method} without the cookie"
+            );
+            assert!(
+                needs_cookie(address, Some("a-guess"), method).await,
+                "{method} with a guess"
+            );
+            assert!(
+                answers(address, Some(COOKIE), method).await,
+                "{method} with the cookie"
+            );
+        }
+    }
+
+    /// R-2: the mining key handed to a pool's miners used to open every
+    /// method. It opens mining and reads now, never the wallet nor `stop`;
+    /// without any credential the node still answers 401, as before.
+    #[tokio::test]
+    async fn the_mining_key_opens_mining_and_reads_but_never_the_wallet() {
+        let (address, _node) = node(Some(MINING_KEY)).await;
+        let (status, _) = post(address, None, &call("jetsam_getChainInfo")).await;
+        assert_eq!(
+            status, 401,
+            "a gated node still refuses an anonymous caller"
+        );
+        for method in READS.iter().chain(MINING) {
+            assert!(
+                answers(address, Some(MINING_KEY), method).await,
+                "{method} with the key"
+            );
+            assert!(
+                answers(address, Some(COOKIE), method).await,
+                "{method} with the cookie"
+            );
+        }
+        for method in COOKIE_ONLY {
+            assert!(
+                needs_cookie(address, Some(MINING_KEY), method).await,
+                "{method} with the key"
+            );
+            assert!(
+                answers(address, Some(COOKIE), method).await,
+                "{method} with the cookie"
+            );
+        }
+    }
+
+    /// R-1: a batch is judged call by call: a read beside `walletSend`
+    /// does not carry it through.
+    #[tokio::test]
+    async fn a_batch_is_judged_call_by_call() {
+        let (address, _node) = node(None).await;
+        let body = format!(
+            r#"[{},{}]"#,
+            call("jetsam_getChainInfo"),
+            call("jetsam_walletSend").replace(r#""id":1"#, r#""id":2"#)
+        );
+        let (status, answer) = post(address, None, &body).await;
+        assert_eq!(status, 200);
+        let answers = answer.as_array().expect("a batch answer");
+        let by_id = |id: u64| answers.iter().find(|a| a["id"] == id).unwrap().clone();
+        assert_eq!(by_id(1)["result"], "jetsam_getChainInfo");
+        assert_eq!(
+            by_id(2)["error"]["code"],
+            crate::types::ERR_RPC_COOKIE_REQUIRED
+        );
+    }
+
+    /// R-5: jsonrpsee's defaults (batches unlimited, 10 MB bodies) are
+    /// bounded: at most `RPC_MAX_BATCH_CALLS` calls, and a body of
+    /// `RPC_MAX_REQUEST_BODY_BYTES` — room for the largest object a method
+    /// takes, in hex, with its JSON.
+    #[tokio::test]
+    async fn batches_and_bodies_are_bounded() {
+        let (address, _node) = node(None).await;
+        let batch = |n: u32| {
+            let calls: Vec<String> = (1..=n)
+                .map(|id| {
+                    call("jetsam_getChainInfo").replace(r#""id":1"#, &format!(r#""id":{id}"#))
+                })
+                .collect();
+            format!("[{}]", calls.join(","))
+        };
+        let (_, answer) = post(address, None, &batch(RPC_MAX_BATCH_CALLS)).await;
+        assert_eq!(
+            answer.as_array().map(Vec::len),
+            Some(RPC_MAX_BATCH_CALLS as usize)
+        );
+        let (_, answer) = post(address, None, &batch(RPC_MAX_BATCH_CALLS + 1)).await;
+        assert!(
+            answer["error"].is_object(),
+            "one call more is refused: {answer}"
+        );
+
+        // The largest legitimate request fits...
+        let largest = 2 * RPC_LARGEST_OBJECT_BYTES;
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"jetsam_submitTxIntent","params":["{}"]}}"#,
+            "a".repeat(largest)
+        );
+        assert!(body.len() <= RPC_MAX_REQUEST_BODY_BYTES as usize);
+        assert!(
+            answers_body(address, &body).await,
+            "the largest object in hex is served"
+        );
+        // ... one byte over the bound is refused before it is read.
+        let (status, _) = post_with(
+            address,
+            None,
+            "",
+            Some(RPC_MAX_REQUEST_BODY_BYTES as usize + 1),
+        )
+        .await;
+        assert_eq!(status, 413);
+        // And the bound is far below jsonrpsee's 10 MB.
+        assert!(RPC_MAX_REQUEST_BODY_BYTES <= 4 * 1024 * 1024);
+        for object in [
+            MAX_TX_INTENT_BYTES_GLOBAL,
+            jetsam_p2p::client_object_protocol::MAX_CLIENT_PROOF_BUNDLE_BYTES,
+            jetsam_p2p::client_object_protocol::MAX_CLIENT_BATCH_BUNDLE_BYTES,
+            jetsam_mempool::destination::MAX_DESTINATION_INTENT_BYTES,
+            jetsam_mempool::guardian::MAX_GUARDIAN_INTENT_BYTES,
+            MAX_RPC_RECEIPT_BYTES,
+        ] {
+            assert!(object <= RPC_LARGEST_OBJECT_BYTES, "{object}");
+        }
+    }
+
+    async fn answers_body(address: SocketAddr, body: &str) -> bool {
+        let (status, answer) = post(address, None, body).await;
+        status == 200 && answer["result"] == "jetsam_submitTxIntent"
+    }
+
+    /// The cookie gate keys on the method's name: every wallet method,
+    /// `stop` and `registerClient`; nothing else.
+    #[test]
+    fn the_methods_that_need_the_cookie() {
+        for method in COOKIE_ONLY {
+            assert!(method_needs_cookie(method), "{method}");
+        }
+        for method in [
+            "jetsam_walletStatus",
+            "jetsam_walletPlanSend",
+            "jetsam_walletPlanBridgeDeposit",
+            "jetsam_walletScan",
+            "jetsam_walletSetActiveAddress",
+        ] {
+            assert!(method_needs_cookie(method), "{method}");
+        }
+        for method in READS.iter().chain(MINING).chain(&[
+            "jetsam_submitTxIntent",
+            "jetsam_submitGuardianObject",
+            "jetsam_estimateFee",
+        ]) {
+            assert!(!method_needs_cookie(method), "{method}");
+        }
+    }
+
+    /// D171, D176: the node has `getActivations` (a method of the handler,
+    /// wire name `jetsam_getActivations`), a read every guardian program
+    /// reaches as it reaches the others: never behind the cookie.
+    #[test]
+    fn the_activations_are_a_read_of_the_handler_open_without_the_cookie() {
+        let _method = <RpcHandler as crate::api::JetsamApiServer>::get_activations;
+        assert!(!method_needs_cookie("jetsam_getActivations"));
     }
 }
 
@@ -5009,7 +6177,11 @@ mod access_control_tests {
 
     #[tokio::test]
     async fn browser_origin_is_rejected_before_rpc_dispatch() {
-        let service = BearerAuthLayer { expected: None }.layer(OkService);
+        let service = BearerAuthLayer {
+            cookie: "Bearer cookie".into(),
+            mining_key: None,
+        }
+        .layer(OkService);
         let request = http::Request::builder()
             .header(http::header::ORIGIN, "https://attacker.example")
             .header(http::header::UPGRADE, "websocket")
@@ -5022,7 +6194,11 @@ mod access_control_tests {
 
     #[tokio::test]
     async fn native_originless_client_remains_available_without_a_key() {
-        let service = BearerAuthLayer { expected: None }.layer(OkService);
+        let service = BearerAuthLayer {
+            cookie: "Bearer cookie".into(),
+            mining_key: None,
+        }
+        .layer(OkService);
         let request = http::Request::builder().body(()).unwrap();
 
         let response = service.oneshot(request).await.unwrap();
@@ -5032,7 +6208,8 @@ mod access_control_tests {
     #[tokio::test]
     async fn bearer_auth_remains_required_when_configured() {
         let layer = BearerAuthLayer {
-            expected: Some("Bearer correct-token".into()),
+            cookie: "Bearer cookie".into(),
+            mining_key: Some("Bearer correct-token".into()),
         };
 
         let unauthorized = layer

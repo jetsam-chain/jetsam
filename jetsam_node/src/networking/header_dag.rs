@@ -14,6 +14,7 @@ use jetsam_chain::{
     consensus::fork_choice::{choose_chain_by_work, ChainChoice},
 };
 use jetsam_p2p::header_protocol::HeaderInventoryRecord;
+use jetsam_p2p::object_protocol::BlockBodyObjectId;
 use thiserror::Error;
 
 use super::types::{ChainPoint, Hash32};
@@ -370,6 +371,36 @@ impl HeaderDag {
         let mut peers = providers.keys().copied().collect::<Vec<_>>();
         peers.sort_by_key(|peer| peer.to_bytes());
         peers.into_iter().find_map(terminal)
+    }
+
+    /// The providers whose inventory for the block of `body` advertises
+    /// exactly that body (these bytes), in a fixed order.
+    pub fn providers_of_body(&self, body: &BlockBodyObjectId) -> Vec<PeerId> {
+        let mut peers = self
+            .inventories
+            .get(&body.claim.block_hash)
+            .map(|providers| {
+                providers
+                    .iter()
+                    .filter(|(_, record)| record.body.as_ref() == Some(body))
+                    .map(|(peer, _)| *peer)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        peers.sort_by_key(|peer| peer.to_bytes());
+        peers
+    }
+
+    /// Whether a provider advertises, for the block of `body`, a body other
+    /// than `body`: an inventory record without a body offers none.
+    pub fn offers_other_body(&self, body: &BlockBodyObjectId) -> bool {
+        self.inventories
+            .get(&body.claim.block_hash)
+            .is_some_and(|providers| {
+                providers
+                    .values()
+                    .any(|record| record.body.is_some_and(|offered| offered != *body))
+            })
     }
 
     pub fn remove_inventory_provider(&mut self, peer: PeerId) {
@@ -913,6 +944,61 @@ mod tests {
         dag.advertise_inventory(PeerId::random(), &[inventory(stripped_2, 2, true)]).unwrap();
         assert!(!dag.forget_unsupplied_branch(&stripped_2.hash, &applied.hash));
         assert_eq!(dag.best_tip(), stripped_2.point());
+    }
+
+    /// v1.7 gate 1: the bytes a body provider advertises are told apart. The
+    /// providers of one exact body are named, and only a provider offering
+    /// other bytes for the same block — or another block — is not among them;
+    /// a header-only record offers no body at all.
+    #[test]
+    fn the_providers_of_one_exact_body_are_told_apart_from_other_bodies() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let ours = child(genesis, [1; 32], 1);
+        let theirs = child(genesis, [1; 32], 2);
+        for header in [ours, theirs] {
+            dag.insert(header).unwrap();
+        }
+        let refused = inventory(theirs, 7, false).body.unwrap();
+        let mut peers = [
+            PeerId::random(),
+            PeerId::random(),
+            PeerId::random(),
+            PeerId::random(),
+        ];
+        peers.sort_by_key(|peer| peer.to_bytes());
+        let [first, second, header_only, elsewhere] = peers;
+        assert!(dag.providers_of_body(&refused).is_empty());
+        assert!(!dag.offers_other_body(&refused));
+        // Listed in reverse order: the answer is ordered all the same.
+        dag.advertise_inventory(second, &[inventory(theirs, 7, true)])
+            .unwrap();
+        dag.advertise_inventory(first, &[inventory(theirs, 7, false)])
+            .unwrap();
+        dag.advertise_inventory(
+            header_only,
+            &[HeaderInventoryRecord::header_only(theirs.header)],
+        )
+        .unwrap();
+        dag.advertise_inventory(elsewhere, &[inventory(ours, 7, true)])
+            .unwrap();
+        assert_eq!(dag.providers_of_body(&refused), [first, second]);
+        assert!(
+            !dag.offers_other_body(&refused),
+            "no body, or the block next door, is no other body"
+        );
+
+        let honest = PeerId::random();
+        dag.advertise_inventory(honest, &[inventory(theirs, 8, false)])
+            .unwrap();
+        assert_eq!(dag.providers_of_body(&refused), [first, second]);
+        assert!(dag.offers_other_body(&refused));
+        let honest_body = inventory(theirs, 8, false).body.unwrap();
+        assert_eq!(dag.providers_of_body(&honest_body), [honest]);
+        assert!(dag.offers_other_body(&honest_body));
+        dag.remove_inventory_provider(honest);
+        assert!(!dag.offers_other_body(&refused));
     }
 
     #[test]

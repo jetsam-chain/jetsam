@@ -5,6 +5,8 @@
 //! Mempool configuration.
 
 use jetsam_chain::consensus::client_objects::ClientObjectRules;
+use jetsam_chain::consensus::guardian::GuardianRules;
+use jetsam_chain::consensus::vault::VaultRules;
 use jetsam_chain::consensus::wire_limits::{MAX_MEMPOOL_BYTES, MAX_MEMPOOL_TXS};
 
 /// Configuration for the async mempool.
@@ -29,6 +31,17 @@ pub struct MempoolConfig {
     /// (`check_plain_transaction`): the consensus rules of this binary. A
     /// test arms a clock of its own with [`Self::with_client_object_rules`].
     pub client_object_rules: ClientObjectRules,
+
+    /// The v1.7 vault rules the pool judges plain transactions by
+    /// (`check_plain_vault_transaction`, V8 against the tip): this binary's
+    /// consensus rules. A test arms a clock of its own with
+    /// [`Self::with_vault_rules`].
+    pub vault_rules: VaultRules,
+
+    /// The v1.7 guardian rules the pool judges guardian intents and plain
+    /// transactions by: this binary's consensus rules. A test arms a clock
+    /// and a key of its own with [`Self::with_guardian_rules`].
+    pub guardian_rules: GuardianRules,
 }
 
 impl Default for MempoolConfig {
@@ -39,6 +52,8 @@ impl Default for MempoolConfig {
             fee_floor_window: 50,
             auth_verify_workers: 4,
             client_object_rules: ClientObjectRules::current(),
+            vault_rules: VaultRules::current(),
+            guardian_rules: GuardianRules::current(),
         }
     }
 }
@@ -61,6 +76,16 @@ impl MempoolConfig {
 
     pub fn with_client_object_rules(mut self, rules: ClientObjectRules) -> Self {
         self.client_object_rules = rules;
+        self
+    }
+
+    pub fn with_vault_rules(mut self, rules: VaultRules) -> Self {
+        self.vault_rules = rules;
+        self
+    }
+
+    pub fn with_guardian_rules(mut self, rules: GuardianRules) -> Self {
+        self.guardian_rules = rules;
         self
     }
 }

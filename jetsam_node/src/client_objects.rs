@@ -1077,7 +1077,10 @@ impl ClientObjects {
             tokens.retain(|_, (_, request, _)| match request {
                 ClientObjectRequest::MatrixManifest(file)
                 | ClientObjectRequest::MatrixChunk { file, .. } => fetches.contains_key(file),
-                ClientObjectRequest::Proof(_) | ClientObjectRequest::Batch(_) => true,
+                ClientObjectRequest::Proof(_)
+                | ClientObjectRequest::Batch(_)
+                | ClientObjectRequest::SnapshotAnnexIndex(_)
+                | ClientObjectRequest::SnapshotAnnexChunk { .. } => true,
             });
             if state.fetches.len() != before {
                 tracing::info!(
@@ -1367,6 +1370,10 @@ impl ClientObjects {
                     chunks: fetch.chunks.into_iter().flatten().collect(),
                 }))
             }
+            // Snapshot annexes are fetched by `snapshot_annex`, never from
+            // here: no token of this table names one.
+            ClientObjectRequest::SnapshotAnnexIndex(_)
+            | ClientObjectRequest::SnapshotAnnexChunk { .. } => Ok(ClientObjectFetched::Nothing),
         }
     }
 
@@ -1800,7 +1807,10 @@ impl ClientObjects {
 
 fn release(state: &mut State, peer: &PeerId, request: &ClientObjectRequest, liar: bool) -> bool {
     match request {
-        ClientObjectRequest::Batch(_) => liar,
+        // Snapshot annexes are fetched by `snapshot_annex`, never from here.
+        ClientObjectRequest::Batch(_)
+        | ClientObjectRequest::SnapshotAnnexIndex(_)
+        | ClientObjectRequest::SnapshotAnnexChunk { .. } => liar,
         ClientObjectRequest::Proof(id) => {
             if liar {
                 state.proofs.failed(peer, id, true)
@@ -1990,6 +2000,9 @@ impl ClientObjectSource for ClientObjects {
                 Some(chunk)
             }
             ClientObjectRequest::Batch(id) => self.batches.as_ref()?.bytes(id),
+            // Served by `snapshot_annex::NodeObjectSource`.
+            ClientObjectRequest::SnapshotAnnexIndex(_)
+            | ClientObjectRequest::SnapshotAnnexChunk { .. } => None,
         }
     }
 }

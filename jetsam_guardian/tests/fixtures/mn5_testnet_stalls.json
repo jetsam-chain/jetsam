@@ -1,0 +1,123 @@
+{
+  "note": "Jetsam test chain v1.7 headers (local node RPC, read-only), the three MN-5 stalls of 11/11 and 13/11 (DECISIONS D181, D190, D200). Works are block_work of the program (u256.rs), exact; at = L1 landing time.",
+  "count": 9,
+  "cases": [
+    {
+      "name": "2026-11-11 tip 9224 at 09:44:45 (a fast relayer, the grace missed)",
+      "baseHeight": 9220,
+      "tipHeight": 9224,
+      "forkBaseTimestamp": 1794388325,
+      "forkBaseWork": "1014809",
+      "segmentWork": "3103560",
+      "maxTimestamp": 1794390225,
+      "at": 1794390285,
+      "acceptedBefore": false,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 280
+    },
+    {
+      "name": "2026-11-11 tip 9227 at 10:12:54 (a GPU proof, 1 090 s)",
+      "baseHeight": 9220,
+      "tipHeight": 9227,
+      "forkBaseTimestamp": 1794388325,
+      "forkBaseWork": "1014809",
+      "segmentWork": "5165418",
+      "maxTimestamp": 1794390884,
+      "at": 1794391974,
+      "acceptedBefore": false,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 251
+    },
+    {
+      "name": "2026-11-11 tip 9337 at 16:43:00 (the deficit measured in D181)",
+      "baseHeight": 9220,
+      "tipHeight": 9337,
+      "forkBaseTimestamp": 1794388325,
+      "forkBaseWork": "1014809",
+      "segmentWork": "42287340",
+      "maxTimestamp": 1794415281,
+      "at": 1794415380,
+      "acceptedBefore": false,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 277
+    },
+    {
+      "name": "2026-11-11 tip 9390 at 18:04:44 (the point that landed, R2)",
+      "baseHeight": 9220,
+      "tipHeight": 9390,
+      "forkBaseTimestamp": 1794388325,
+      "forkBaseWork": "1014809",
+      "segmentWork": "73655916",
+      "maxTimestamp": 1794420159,
+      "at": 1794420284,
+      "acceptedBefore": true,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 408
+    },
+    {
+      "name": "2026-11-13 tip 10175 at 08:55:54 (a GPU proof, 1 090 s)",
+      "baseHeight": 10172,
+      "tipHeight": 10175,
+      "forkBaseTimestamp": 1794558354,
+      "forkBaseWork": "2653022",
+      "segmentWork": "8217287",
+      "maxTimestamp": 1794558811,
+      "at": 1794560154,
+      "acceptedBefore": false,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 309
+    },
+    {
+      "name": "2026-11-13 tip 10188 at 09:33:26 (the point that landed)",
+      "baseHeight": 10172,
+      "tipHeight": 10188,
+      "forkBaseTimestamp": 1794558354,
+      "forkBaseWork": "2653022",
+      "segmentWork": "32910944",
+      "maxTimestamp": 1794562188,
+      "at": 1794562406,
+      "acceptedBefore": true,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 551
+    },
+    {
+      "name": "2026-11-13 tip 10442 at 22:29:24 (first L advance; one weak miner)",
+      "baseHeight": 10441,
+      "tipHeight": 10442,
+      "forkBaseTimestamp": 1794607045,
+      "forkBaseWork": "2422773",
+      "segmentWork": "2469959",
+      "maxTimestamp": 1794608904,
+      "at": 1794608964,
+      "acceptedBefore": false,
+      "acceptedAfter": false,
+      "rateSinceBase_x1000": 95
+    },
+    {
+      "name": "2026-11-13 tip 10449 at 22:52:22 (a fast relayer)",
+      "baseHeight": 10441,
+      "tipHeight": 10449,
+      "forkBaseTimestamp": 1794607045,
+      "forkBaseWork": "2422773",
+      "segmentWork": "11961999",
+      "maxTimestamp": 1794610282,
+      "at": 1794610342,
+      "acceptedBefore": false,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 269
+    },
+    {
+      "name": "2026-11-13 tip 10457 at 23:07:36 (the point that landed)",
+      "baseHeight": 10441,
+      "tipHeight": 10457,
+      "forkBaseTimestamp": 1794607045,
+      "forkBaseWork": "2422773",
+      "segmentWork": "23450301",
+      "maxTimestamp": 1794611165,
+      "at": 1794611256,
+      "acceptedBefore": true,
+      "acceptedAfter": true,
+      "rateSinceBase_x1000": 413
+    }
+  ]
+}

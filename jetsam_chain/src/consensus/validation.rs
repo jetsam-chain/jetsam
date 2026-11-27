@@ -128,9 +128,23 @@ fn page_stream_consensus_error(error: BlockPageStreamError) -> ConsensusError {
 pub fn validate_block_resource_preflight(
     block: &Block,
 ) -> Result<BlockResourcePreflight, ConsensusError> {
+    validate_block_resource_preflight_with_v1_7(
+        block,
+        crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+    )
+}
+
+/// [`validate_block_resource_preflight`] on an injected v1.7 clock: the
+/// destination section (0xC2) is absent below the height, present from it on,
+/// within its own budget, outside `MAX_BLOCK_BYTES`.
+pub(crate) fn validate_block_resource_preflight_with_v1_7(
+    block: &Block,
+    v1_7_activation: Option<u64>,
+) -> Result<BlockResourcePreflight, ConsensusError> {
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
     }
+    crate::consensus::destination::check_destination_section(block, v1_7_activation)?;
     if !block.client_objects.is_empty() {
         let rules = crate::consensus::client_objects::ClientObjectRules::current();
         if !rules.active_at(block.header.height) {
@@ -138,7 +152,7 @@ pub fn validate_block_resource_preflight(
                 crate::consensus::client_objects::ClientObjectError::ObjectsBeforeActivation,
             ));
         }
-        let wire_len = block.canonical_wire_len().map_err(|_| {
+        let wire_len = block.canonical_wire_len_before_destination().map_err(|_| {
             ConsensusError::ShapeMismatch("block wire length overflows".into())
         })?;
         if wire_len > crate::consensus::wire_limits::MAX_BLOCK_BYTES {
@@ -694,6 +708,7 @@ mod tests {
             header: header(1),
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         };
         let counts = validate_block_resource_preflight(&block).unwrap();
         assert_eq!(counts.user_page_count, 255);
@@ -702,6 +717,257 @@ mod tests {
         assert_eq!(counts.output_count, 511);
         assert_eq!(counts.action_count, 1_531);
         assert_eq!(counts.touched_slot_count, 1_531);
+    }
+
+    /// The destination section of a v1.7 block, at the sizes the SPEC
+    /// measured: one committee update (26 913 B), one finality update
+    /// (2 090 B), the bridge account proof (3 794 B) followed by the storage
+    /// proof of `genesisId` (A5-8: one storage path of the same contract,
+    /// counted at a release's measured 2 914 B) and four releases of
+    /// 48 + 2 914 B: 47 559 bytes of objects.
+    fn largest_measured_destination_section() -> crate::consensus::destination::DestinationSection
+    {
+        use crate::consensus::destination::{
+            DestinationObject, DestinationObjectKind, DestinationSection,
+        };
+        let object = |kind, len| DestinationObject {
+            kind,
+            payload: vec![0x5a; len],
+        };
+        let mut objects = vec![
+            object(DestinationObjectKind::CommitteeUpdate, 26_913),
+            object(DestinationObjectKind::FinalityUpdate, 2_090),
+            object(DestinationObjectKind::BridgeAccountProof, 3_794 + 2_914),
+        ];
+        objects.extend((0..4).map(|_| object(DestinationObjectKind::VaultRelease, 48 + 2_914)));
+        DestinationSection { objects }
+    }
+
+    const J: u64 = 69_120;
+
+    #[test]
+    fn destination_objects_before_v1_7_are_refused() {
+        use crate::consensus::destination::{DestinationError, DestinationSection};
+        let parent = header(J - 2);
+        for (height, v1_7) in [(J - 1, Some(J)), (J, None), (J + 1, None)] {
+            for section in [
+                DestinationSection::default(),
+                largest_measured_destination_section(),
+            ] {
+                let block = Block {
+                    header: header(height),
+                    transactions: vec![coinbase(&parent)],
+                    client_objects: Vec::new(),
+                    destination: Some(section),
+                };
+                assert_eq!(
+                    validate_block_resource_preflight_with_v1_7(&block, v1_7),
+                    Err(ConsensusError::Destination(
+                        DestinationError::SectionBeforeActivation
+                    )),
+                    "height {height} under {v1_7:?}"
+                );
+            }
+        }
+        // The production rule reads this build's clock.
+        if crate::consensus::params::V1_7_ACTIVATION_HEIGHT.is_none() {
+            let block = Block {
+                header: header(J),
+                transactions: vec![coinbase(&parent)],
+                client_objects: Vec::new(),
+                destination: Some(DestinationSection::default()),
+            };
+            assert_eq!(
+                validate_block_resource_preflight(&block),
+                Err(ConsensusError::Destination(
+                    DestinationError::SectionBeforeActivation
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn block_at_or_above_j_without_0xc2_is_refused() {
+        use crate::consensus::destination::{DestinationError, DestinationSection};
+        let parent = header(J - 1);
+        for height in [J, J + 1, J + 960] {
+            let mut block = Block {
+                header: header(height),
+                transactions: vec![coinbase(&parent)],
+                client_objects: Vec::new(),
+                destination: None,
+            };
+            assert_eq!(
+                validate_block_resource_preflight_with_v1_7(&block, Some(J)),
+                Err(ConsensusError::Destination(DestinationError::SectionMissing)),
+                "height {height}"
+            );
+            // A v1.6 block's bytes at that height decode without the section,
+            // and are refused for it.
+            let decoded = Block::from_bytes_with_activations(&block.to_bytes(), None, Some(J))
+                .expect("a v1.6 wire still decodes");
+            assert_eq!(decoded.destination, None);
+            assert_eq!(
+                validate_block_resource_preflight_with_v1_7(&decoded, Some(J)),
+                Err(ConsensusError::Destination(DestinationError::SectionMissing))
+            );
+            // The same block with an empty section passes this rule.
+            block.destination = Some(DestinationSection::default());
+            assert!(validate_block_resource_preflight_with_v1_7(&block, Some(J)).is_ok());
+        }
+        // Below the height, and with the clock dormant, no section is needed.
+        let block = Block {
+            header: header(J - 1),
+            transactions: vec![coinbase(&parent)],
+            client_objects: Vec::new(),
+            destination: None,
+        };
+        assert!(validate_block_resource_preflight_with_v1_7(&block, Some(J)).is_ok());
+        assert!(validate_block_resource_preflight_with_v1_7(&block, None).is_ok());
+        // Under an armed clock, the production rule refuses it too.
+        if let Some(v1_7) = crate::consensus::params::V1_7_ACTIVATION_HEIGHT {
+            let block = Block {
+                header: header(v1_7),
+                transactions: vec![coinbase(&header(v1_7 - 1))],
+                client_objects: Vec::new(),
+                destination: None,
+            };
+            assert_eq!(
+                validate_block_resource_preflight(&block),
+                Err(ConsensusError::Destination(DestinationError::SectionMissing))
+            );
+        }
+    }
+
+    /// D78: the test chain's frontier through the production wire and the
+    /// production rule, no clock injected. Block 8 159 is a 1.6.1 block: a
+    /// destination section is trailing bytes on the wire and refused by the
+    /// rule, none is needed. Blocks 8 160 and 8 161 must carry one.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    #[test]
+    fn the_test_chain_frontier_is_8160_in_the_production_rule() {
+        use crate::consensus::destination::{DestinationError, DestinationSection};
+        let at = |height: u64, destination| Block {
+            header: header(height),
+            transactions: vec![coinbase(&header(height - 1))],
+            client_objects: Vec::new(),
+            destination,
+        };
+        let before = at(8_159, None);
+        assert!(validate_block_resource_preflight(&before).is_ok());
+        assert_eq!(Block::from_bytes(&before.to_bytes()).as_ref(), Ok(&before));
+        let with_section = at(8_159, Some(DestinationSection::default()));
+        assert_eq!(
+            Block::from_bytes(&with_section.to_bytes()),
+            Err(jetsam_tx::wire::WireError::TrailingBytes)
+        );
+        assert_eq!(
+            validate_block_resource_preflight(&with_section),
+            Err(ConsensusError::Destination(
+                DestinationError::SectionBeforeActivation
+            ))
+        );
+        for height in [8_160, 8_161] {
+            assert_eq!(
+                validate_block_resource_preflight(&at(height, None)),
+                Err(ConsensusError::Destination(DestinationError::SectionMissing)),
+                "height {height}"
+            );
+            let block = at(height, Some(DestinationSection::default()));
+            assert_eq!(Block::from_bytes(&block.to_bytes()).as_ref(), Ok(&block));
+            assert!(
+                validate_block_resource_preflight(&block).is_ok(),
+                "height {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_section_over_budget_is_refused() {
+        use crate::consensus::destination::{
+            destination_section_wire_len, DestinationError, DestinationObject,
+            DestinationObjectKind,
+        };
+        use crate::consensus::wire_limits::MAX_DESTINATION_SECTION_BYTES;
+        let parent = header(J - 1);
+        let mut section = largest_measured_destination_section();
+        let room = MAX_DESTINATION_SECTION_BYTES - destination_section_wire_len(&section);
+        // Fill the budget exactly with one more object, then go one byte over.
+        section.objects.push(DestinationObject {
+            kind: DestinationObjectKind::VaultRelease,
+            payload: vec![1u8; room - 5],
+        });
+        assert_eq!(
+            destination_section_wire_len(&section),
+            MAX_DESTINATION_SECTION_BYTES
+        );
+        let mut block = Block {
+            header: header(J),
+            transactions: vec![coinbase(&parent)],
+            client_objects: Vec::new(),
+            destination: Some(section),
+        };
+        assert!(validate_block_resource_preflight_with_v1_7(&block, Some(J)).is_ok());
+        block.destination.as_mut().unwrap().objects[7].payload.push(1);
+        assert_eq!(
+            validate_block_resource_preflight_with_v1_7(&block, Some(J)),
+            Err(ConsensusError::Destination(DestinationError::SectionOverBudget {
+                len: MAX_DESTINATION_SECTION_BYTES + 1,
+                max: MAX_DESTINATION_SECTION_BYTES,
+            }))
+        );
+        // Too many objects, each tiny, is refused as well.
+        let many = crate::consensus::destination::MAX_BLOCK_DESTINATION_OBJECTS + 1;
+        block.destination.as_mut().unwrap().objects = (0..many)
+            .map(|_| DestinationObject {
+                kind: DestinationObjectKind::VaultRelease,
+                payload: vec![1u8],
+            })
+            .collect();
+        assert!(matches!(
+            validate_block_resource_preflight_with_v1_7(&block, Some(J)),
+            Err(ConsensusError::Destination(
+                DestinationError::TooManyObjects { .. }
+            ))
+        ));
+    }
+
+    /// The largest destination section the SPEC measured, with the genesis
+    /// proof A5-8 adds to the account proof (47.6 kB of objects), rides on
+    /// the largest v1.6 block: the section is outside `MAX_BLOCK_BYTES`,
+    /// under its own budget.
+    #[test]
+    fn max_section_47_6_kb_is_accepted() {
+        use crate::consensus::destination::destination_section_wire_len;
+        use crate::consensus::wire_limits::{
+            MAX_BLOCK_BYTES, MAX_DESTINATION_SECTION_BYTES, MAX_V1_7_BLOCK_BYTES,
+        };
+        let parent = header(J - 1);
+        let mut transactions = vec![coinbase(&parent)];
+        transactions.extend((0..255).map(|i| user(i, 4, 2)));
+        let section = largest_measured_destination_section();
+        let payload: usize = section.objects.iter().map(|o| o.payload.len()).sum();
+        assert_eq!(payload, 47_559);
+        let section_len = destination_section_wire_len(&section);
+        assert!(section_len <= MAX_DESTINATION_SECTION_BYTES);
+        let block = Block {
+            header: header(J),
+            transactions,
+            client_objects: Vec::new(),
+            destination: Some(section),
+        };
+        let counts = validate_block_resource_preflight_with_v1_7(&block, Some(J))
+            .expect("the largest measured section is within budget");
+        assert_eq!(counts.user_page_count, 255);
+        let bytes = block.to_bytes();
+        assert_eq!(bytes.len(), 82_905 + section_len);
+        assert_eq!(block.canonical_wire_len(), Ok(bytes.len()));
+        assert!(bytes.len() > MAX_BLOCK_BYTES);
+        assert!(bytes.len() <= MAX_V1_7_BLOCK_BYTES);
+        assert_eq!(
+            Block::from_bytes_with_activations(&bytes, Some(J), Some(J)),
+            Ok(block)
+        );
     }
 
     #[test]
@@ -713,6 +979,7 @@ mod tests {
             header: header(1),
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         };
         assert_eq!(
             validate_block_resource_preflight(&block),
@@ -725,6 +992,7 @@ mod tests {
             header: header(1),
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         };
         assert!(matches!(
             validate_block_resource_preflight(&block),
@@ -742,6 +1010,7 @@ mod tests {
             header: header(1),
             transactions: vec![coinbase(&parent)],
             client_objects: Vec::new(),
+            destination: None,
         };
         assert_eq!(validate_mandatory_coinbase(&block, &parent), Ok(()));
 
@@ -767,6 +1036,7 @@ mod tests {
             header: header(DEVELOPMENT_PAYOUT_INTERVAL_90S),
             transactions: vec![coinbase(&parent), development_payout(&parent, amount)],
             client_objects: Vec::new(),
+            destination: None,
         };
         assert_eq!(amount, share * DEVELOPMENT_PAYOUT_INTERVAL_90S);
         assert_eq!(validate_mandatory_coinbase(&block, &parent), Ok(()));
@@ -800,6 +1070,7 @@ mod tests {
             header: header(1),
             transactions: vec![coinbase(&parent)],
             client_objects: Vec::new(),
+            destination: None,
         };
         let ceiling = max_coinbase_value_from_claimable_fee_sum(1, 5) as u64;
         block.transactions[0].body.outputs[0].amount = ceiling + 7;
@@ -829,6 +1100,7 @@ mod tests {
                 matrix_digest: [1u8; 32],
                 io_commitment: [2u8; 32],
             })],
+            destination: None,
         };
         if ClientObjectRules::CONSENSUS.activation_height.is_none() {
             assert_eq!(
@@ -873,6 +1145,7 @@ mod tests {
             header: header(1),
             transactions: vec![coinbase(&parent), development_payout(&parent, 1)],
             client_objects: Vec::new(),
+            destination: None,
         };
         assert_eq!(
             validate_mandatory_coinbase(&block, &parent),

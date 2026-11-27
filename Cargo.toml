@@ -27,6 +27,16 @@ members = [
     # Prototype: a computed batch of catalogue entry 1 (capacity 128 listed
     # by the test network's catalogue only, as a test entry)
     "jetsam_client_agent_batch",
+    # v1.7 guardian software (T5.1-T5.6): observer, signer, aggregator, ceremony
+    "jetsam_guardian",
+    # v1.7 bridge vault: V4, the deposit rule the node and the proof program share
+    "jetsam_vault_rule",
+    # v1.7 bridge proof program (T4.9): the relations its SP1 guests prove;
+    # the guests themselves build alone for the zkVM target
+    "jetsam_bridge_program/core",
+    "jetsam_bridge_program/towerwalk",
+    # G6 = V4 in CI: the node's gate and the program on the same blocks
+    "jetsam_bridge_program/xtest",
 ]
 resolver = "2"
 
@@ -48,7 +58,11 @@ resolver = "2"
 # 1.6.1 keeps the 1.6.0 consensus rules and activation heights, and pins
 # blocks 46079 and 46080 (the public network's v1.6 crossing): a node
 # installed or re-synced from now on can only follow the real chain.
-version = "1.6.1"
+# 1.7.0 is the first build that knows the v1.7 fork (the bridge vault and
+# its destination rules). It ships dormant on the public network, which
+# carries no v1.7 height yet; the test chain arms it at 8160. Below its
+# profile's v1.7 height it applies the 1.6.1 consensus rules, its pins included.
+version = "1.7.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -69,9 +83,23 @@ thiserror   = "1"
 lto = "thin"
 codegen-units = 1
 
+# I-3 (external audit of the robots, decision D-8): the robots (jetsam_guardian's library and its jg-* binaries)
+# check their arithmetic in release builds too: an overflow stops a robot instead of wrapping a balance, a cap or a
+# count. The node does not depend on jetsam_guardian: its builds are unchanged.
+[profile.release.package.jetsam_guardian]
+overflow-checks = true
+
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# The bridge proof program hashes with software GF(2^128) (it is written for the zkVM): unoptimized, one
+# block of its cross tests takes a quarter of a second. Optimized in test builds too; no other crate is
+# affected.
+[profile.dev.package.jetsam_bridge_towerwalk]
+opt-level = 3
+[profile.dev.package.jetsam_bridge_program]
+opt-level = 3
 
 # The published libmdbx 0.6.6 does not compile for x86_64-pc-windows-gnu: it
 # assumes every Windows build is MSVC, while bindgen picks a different integer
@@ -80,10 +108,3 @@ codegen-units = 1
 # See third_party/libmdbx-0.6.6-mingw/PATCH.md. No effect on other targets.
 [patch.crates-io]
 libmdbx = { path = "third_party/libmdbx-0.6.6-mingw" }
-# GHSA-gc42-3jg7-rxr2 (CVE-2026-33040) / GHSA-xqmp-fxgv-xvq5 (CVE-2026-34219):
-# an unbounded remote-supplied PRUNE backoff duration overflows Instant
-# arithmetic, first at insertion and again on a later heartbeat, panicking
-# the node on a single malicious gossipsub message. Fixed upstream in
-# libp2p-gossipsub 0.49.3/0.49.4; this vendors 0.48.0 (our resolved version)
-# with the same clamp applied locally. See third_party/libp2p-gossipsub-0.48.0/PATCH.md.
-libp2p-gossipsub = { path = "third_party/libp2p-gossipsub-0.48.0" }

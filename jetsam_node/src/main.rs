@@ -86,6 +86,9 @@ enum ExactSuffixApplyError {
     Body {
         sources: Vec<libp2p::PeerId>,
         error: String,
+        /// v1.7 gate 1: the body (these exact bytes) carries no destination
+        /// section at or above the v1.7 height ([`refused_branch_body`]).
+        refused_branch_body: Option<jetsam_p2p::object_protocol::BlockBodyObjectId>,
     },
     /// A block proved invalid (M3.10): its terminal verified (or verified up
     /// to a lane whose matrix no honest node can hold) and a native rule
@@ -112,6 +115,40 @@ impl ExactSuffixApplyError {
         Self::Body {
             sources: vec![source],
             error: error.into(),
+            refused_branch_body: None,
+        }
+    }
+
+    /// A body fault that is the mark of a branch without v1.7
+    /// ([`refused_branch_body`]): `body` names the exact bytes `source`
+    /// served.
+    fn branch_body(
+        source: libp2p::PeerId,
+        error: impl Into<String>,
+        body: jetsam_p2p::object_protocol::BlockBodyObjectId,
+    ) -> Self {
+        Self::Body {
+            sources: vec![source],
+            error: error.into(),
+            refused_branch_body: Some(body),
+        }
+    }
+
+    /// The source and the exact body of a branch without v1.7, if this is
+    /// such a refusal.
+    fn refused_branch_body(
+        &self,
+    ) -> Option<(
+        libp2p::PeerId,
+        jetsam_p2p::object_protocol::BlockBodyObjectId,
+    )> {
+        match self {
+            Self::Body {
+                sources,
+                refused_branch_body: Some(body),
+                ..
+            } => sources.first().map(|source| (*source, *body)),
+            _ => None,
         }
     }
 
@@ -1527,6 +1564,7 @@ fn prepare_history_step_ghost_authorization() -> Result<
 }
 
 mod config;
+mod inventory_verdict;
 mod peer_chain_evidence;
 mod repeated_warnings;
 mod embedded_history_step_pack;
@@ -1718,13 +1756,31 @@ struct Cli {
     /// Bearer token required for external mining API (getBlockTemplate / submitBlock).
     ///
     /// When set, external callers must include `Authorization: Bearer <TOKEN>` in
-    /// HTTP requests to use the mining methods. Without this flag the mining API
-    /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
+    /// HTTP requests to use the mining methods and the read methods. Without this
+    /// flag the mining API only accepts connections from 127.0.0.1 (enforced by
+    /// --rpc-listen default).
+    ///
+    /// The token never opens the wallet methods, `stop` nor `registerClient`:
+    /// those answer only to the RPC cookie this node writes at every start in
+    /// `rpc.cookie` of its data directory, readable by its user only
+    /// (`Authorization: Bearer <cookie>`; jetsam-cli reads it by itself). A
+    /// pool's miners given the token can mine and read, not spend.
+    ///
+    /// Also read from the JETSAM_MINING_KEY environment variable (its value is
+    /// never shown): the command line of a process is readable by every local
+    /// user, its environment by its own user only. Given both, --mining-key
+    /// wins.
     ///
     /// Pool example:
     ///   jetsam --rpc-listen 0.0.0.0:9701 --mining-key s3cr3t
-    ///   # External miner: Authorization: Bearer s3cr3t
-    #[arg(long, value_name = "TOKEN")]
+    ///   # External miner: Authorization: Bearer s3cr3t (mining and reads)
+    ///   # Payouts, on this machine: Authorization: Bearer <contents of rpc.cookie>
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        env = "JETSAM_MINING_KEY",
+        hide_env_values = true
+    )]
     mining_key: Option<String>,
 
     /// Allow external miners to specify their own coinbase address in getBlockTemplate.
@@ -1747,6 +1803,32 @@ struct Cli {
     /// Use after an incompatible chain-data upgrade or suspected corruption.
     #[arg(long)]
     purge_state: bool,
+
+    /// Compact the chain database of the data directory, then exit. The node
+    /// must be stopped (refused while another process has the database open).
+    ///
+    /// A compact copy is written to `mdbx.dat.compact` in the same directory,
+    /// checked table by table against the database, then put in its place:
+    /// the previous file is kept as `mdbx.dat.old`, with the same owner and
+    /// mode as the new one. Any failure leaves the database as it was. Once
+    /// the node has restarted on the compacted database, free the room with
+    /// --compact-db-remove-old.
+    #[arg(long, conflicts_with = "compact_db_remove_old")]
+    compact_db: bool,
+
+    /// Delete `mdbx.dat.old` (and `mdbx.lck.old`) that --compact-db kept, then
+    /// exit. Run it only once the node works on the compacted database.
+    #[arg(long)]
+    compact_db_remove_old: bool,
+
+    /// H-2: start a release that arms v1.7 without pinning its crossing on a
+    /// stored chain already past J, accepting that crossing: the ids of blocks
+    /// J − 1 and J (64 hex digits each). Refused unless they are the stored
+    /// chain's own blocks; an ALERT at every start while the release pins
+    /// nothing. Install the release that pins the crossing instead whenever it
+    /// exists.
+    #[arg(long, value_name = "J-1_ID:J_ID")]
+    accept_v1_7_crossing: Option<String>,
 
     /// Check production CPU support and exit without touching node data.
     #[arg(long, exclusive = true)]
@@ -1807,6 +1889,25 @@ struct Cli {
 /// DNS setup for format 4:
 ///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9700/p2p/12D3KooW..."
 ///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9700/p2p/12D3KooW..."
+/// A seed in any of the forms below may end in `/p2p/<PeerId>` (audit
+/// 2026-11-10, P-10). A hostname alone lets whoever answers the DNS query
+/// choose a fresh node's first peers; a pinned identity makes the Noise
+/// handshake refuse anyone but that seed, wherever the name points.
+fn split_pinned_seed(seed: &str) -> anyhow::Result<(&str, Option<libp2p::PeerId>)> {
+    if seed.starts_with('/') {
+        return Ok((seed, None));
+    }
+    match seed.rsplit_once("/p2p/") {
+        Some((base, peer)) => {
+            let peer = peer
+                .parse::<libp2p::PeerId>()
+                .with_context(|| format!("invalid pinned PeerId in seed {seed:?}"))?;
+            Ok((base, Some(peer)))
+        }
+        None => Ok((seed, None)),
+    }
+}
+
 fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
     let seed = s.trim();
 
@@ -1814,14 +1915,32 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
     // retain a trailing /p2p/<PeerId>: it cryptographically binds the dial to
     // the identity selected by the operator.
     if seed.starts_with('/') {
-        return seed
+        let addr: libp2p::Multiaddr = seed
             .parse()
-            .with_context(|| format!("parse multiaddr: {seed}"));
+            .with_context(|| format!("parse multiaddr: {seed}"))?;
+        if jetsam_p2p::onion::address::asks_dns_for_an_onion(&addr) {
+            anyhow::bail!("{ONION_NAME_NOT_FOR_DNS}: {seed}");
+        }
+        return Ok(addr);
+    }
+
+    if let (base, Some(peer)) = split_pinned_seed(seed)? {
+        let addr = seed_to_multiaddr(base, default_port)?;
+        if addr
+            .iter()
+            .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
+        {
+            anyhow::bail!("seed {seed:?} names two identities");
+        }
+        return Ok(addr.with(libp2p::multiaddr::Protocol::P2p(peer)));
     }
 
     // Format 4: "dnsaddr:<hostname>" → /dnsaddr/<hostname>
     // Resolves _dnsaddr.<hostname> TXT records (libp2p standard).
     if let Some(host) = seed.strip_prefix("dnsaddr:") {
+        if jetsam_p2p::onion::address::onion_host(host.trim()).is_some() {
+            anyhow::bail!("{ONION_NAME_NOT_FOR_DNS}: {seed}");
+        }
         let ma_str = format!("/dnsaddr/{}", host.trim());
         return ma_str
             .parse()
@@ -1833,12 +1952,407 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
         return seed_host_port_to_multiaddr(seed);
     }
 
+    // An onion name (`<id>.onion`) is never resolved: `/onion3/<id>:<port>`.
+    if let Some(service) = jetsam_p2p::onion::address::onion_host(seed) {
+        let service = service.with_context(|| format!("invalid onion seed {seed:?}"))?;
+        return Ok(service.to_multiaddr(default_port)?);
+    }
+
     // Format 2: bare hostname — use default network port. `/dns/` lets
     // libp2p try both A and AAAA answers (up to its bounded dial limit).
     let ma_str = format!("/dns/{seed}/tcp/{default_port}");
     ma_str
         .parse()
         .with_context(|| format!("build DNS multiaddr for {seed:?}"))
+}
+
+/// Why `/dns*/<x>.onion` and `dnsaddr:<x>.onion` are refused everywhere: the
+/// lookup would name the service in clear to the resolver and the path.
+const ONION_NAME_NOT_FOR_DNS: &str = "an onion name is never looked up through DNS \
+     (write <id>.onion:PORT or /onion3/<id>:PORT)";
+
+/// The `[network.onion]` section, validated (D57, D60). In guardian mode,
+/// every setting that could still expose this host on clearnet stops the
+/// node here, before any database, wallet or socket is opened: a configured
+/// P2P listener (`explicit_listen`), a public address, UPnP, LAN discovery, a
+/// seed that is not an onion address, a JSON-RPC listener beyond loopback.
+#[allow(clippy::too_many_arguments)]
+fn onion_startup(
+    onion: &jetsam_p2p::onion::OnionConfig,
+    explicit_listen: &[libp2p::Multiaddr],
+    public_addresses: &[libp2p::Multiaddr],
+    upnp: bool,
+    lan_discovery: bool,
+    seeds: &[String],
+    default_port: u16,
+    rpc_listen: std::net::SocketAddr,
+) -> anyhow::Result<Option<jetsam_p2p::onion::OnionSettings>> {
+    use jetsam_p2p::onion::{guardian, OnionMode};
+
+    let Some(settings) = onion.validate().context("network.onion")? else {
+        return Ok(None);
+    };
+    match settings.mode {
+        OnionMode::Guardian => {
+            let seeds = seeds
+                .iter()
+                .map(|seed| {
+                    seed_to_multiaddr(seed, default_port)
+                        .with_context(|| format!("guardian mode (onion only): seed {seed:?}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            guardian::refuse_clearnet_exposure(
+                &settings,
+                &guardian::ClearnetExposure {
+                    listen: explicit_listen,
+                    public_addresses,
+                    upnp,
+                    lan_discovery,
+                    seeds: &seeds,
+                    rpc_listen: Some(rpc_listen),
+                },
+            )?;
+            if seeds.is_empty() {
+                tracing::warn!(
+                    "guardian mode: no .onion seed configured; this node can only be \
+                     reached, or reach peers it already knows"
+                );
+            }
+            tracing::info!(
+                socks = %settings.socks,
+                control = %settings.control,
+                "guardian mode (onion only): P2P listens only on the onion service's \
+                 loopback target, dials only through Tor's SOCKS port and announces only \
+                 its onion address; no DNS, AutoNAT, relay, DCUtR, UPnP or mDNS"
+            );
+        }
+        OnionMode::Additional => tracing::warn!(
+            "onion service in dual mode: this node stays on clearnet and keeps announcing \
+             its IP address under the same identity; the onion address adds a way in and \
+             does not hide this host (mode = \"guardian\" is onion only)"
+        ),
+    }
+    Ok(Some(settings))
+}
+
+/// The embedded DNS bootstrap names this node may resolve and dial. None for
+/// a guardian: resolving them would put the host on clearnet DNS, and it has
+/// no clearnet transport to dial the answers with.
+fn embedded_dns_seeds<'a>(
+    seeds: &'a [&'a str],
+    disabled: bool,
+    onion: Option<&jetsam_p2p::onion::OnionSettings>,
+) -> &'a [&'a str] {
+    if onion.is_some_and(|settings| settings.mode == jetsam_p2p::onion::OnionMode::Guardian) {
+        tracing::info!(
+            "guardian mode: the embedded DNS seeds are not used; only the configured \
+             .onion seeds are dialled"
+        );
+        return &[];
+    }
+    if disabled {
+        tracing::debug!("embedded DNS bootstrap disabled for isolated protocol test");
+        return &[];
+    }
+    seeds
+}
+
+#[cfg(test)]
+mod rpc_access_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    fn long_help(id: &str) -> String {
+        Cli::command()
+            .get_arguments()
+            .find(|arg| arg.get_id() == id)
+            .and_then(|arg| arg.get_long_help())
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
+    /// R-2 (audit 2026-11-10): the help told pool operators to hand the
+    /// mining key to their external miners while the key opened every method,
+    /// `walletSend` and `stop` included. It says what the key opens now, and
+    /// that the wallet and `stop` answer only to the cookie.
+    /// R-1 (audit 2026-11-10): the key can come from `JETSAM_MINING_KEY`,
+    /// out of the command line every local user reads in /proc/<pid>/cmdline;
+    /// given both, the command line wins; the help names the variable and never
+    /// shows its value; `--allow-custom-coinbase` is satisfied by it.
+    #[test]
+    fn the_mining_key_is_read_from_the_environment_and_never_shown() {
+        use clap::Parser;
+        std::env::set_var("JETSAM_MINING_KEY", "from-the-environment-0123");
+        let from_env = Cli::try_parse_from(["jetsam", "--mode", "extminer"]);
+        let both = Cli::try_parse_from([
+            "jetsam",
+            "--mode",
+            "extminer",
+            "--mining-key",
+            "from-the-command-line",
+        ]);
+        let custom =
+            Cli::try_parse_from(["jetsam", "--mode", "extminer", "--allow-custom-coinbase"]);
+        let help = Cli::command().render_long_help().to_string();
+        std::env::remove_var("JETSAM_MINING_KEY");
+        assert_eq!(
+            from_env.unwrap().mining_key.as_deref(),
+            Some("from-the-environment-0123")
+        );
+        assert_eq!(
+            both.unwrap().mining_key.as_deref(),
+            Some("from-the-command-line"),
+            "the command line wins"
+        );
+        assert!(custom.is_ok(), "{:?}", custom.err());
+        assert!(help.contains("JETSAM_MINING_KEY"), "{help}");
+        assert!(
+            !help.contains("from-the-environment-0123"),
+            "the help never shows the key"
+        );
+    }
+
+    #[test]
+    fn the_mining_key_help_never_hands_out_the_wallet() {
+        let help = long_help("mining_key");
+        assert!(help.contains("rpc.cookie"), "{help}");
+        assert!(help.contains("never opens the wallet methods"), "{help}");
+    }
+}
+
+#[cfg(test)]
+mod onion_startup_tests {
+    use super::*;
+    use jetsam_p2p::onion::{OnionConfig, OnionMode};
+
+    const ID: &str = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead";
+
+    fn onion(mode: OnionMode) -> OnionConfig {
+        OnionConfig {
+            enabled: true,
+            mode,
+            ..OnionConfig::default()
+        }
+    }
+
+    fn addrs(texts: &[&str]) -> Vec<libp2p::Multiaddr> {
+        texts.iter().map(|text| text.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn onion_seeds_become_onion3_addresses_and_are_never_resolved() {
+        assert_eq!(
+            seed_to_multiaddr(&format!("{ID}.onion:9700"), 9700)
+                .unwrap()
+                .to_string(),
+            format!("/onion3/{ID}:9700")
+        );
+        assert_eq!(
+            seed_to_multiaddr(&format!("{ID}.onion"), 9701)
+                .unwrap()
+                .to_string(),
+            format!("/onion3/{ID}:9701")
+        );
+        let peer = libp2p::PeerId::random();
+        let explicit = format!("/onion3/{ID}:9700/p2p/{peer}");
+        assert_eq!(
+            seed_to_multiaddr(&explicit, 9700).unwrap().to_string(),
+            explicit
+        );
+        // An onion name handed to DNS is a query in clear naming the service.
+        for refused in [
+            format!("/dns/{ID}.onion/tcp/9700"),
+            format!("/dns4/{ID}.onion/tcp/9700"),
+            format!("/dnsaddr/{ID}.onion"),
+            format!("dnsaddr:{ID}.onion"),
+            "bad.onion:9700".to_string(),
+            "bad.onion".to_string(),
+            format!("{}.onion:9700", &ID[..55]),
+        ] {
+            assert!(
+                seed_to_multiaddr(&refused, 9700).is_err(),
+                "{refused} accepted"
+            );
+        }
+        // Clearnet seeds keep their forms.
+        assert_eq!(
+            seed_to_multiaddr("seed.example:9700", 9700)
+                .unwrap()
+                .to_string(),
+            "/dns/seed.example/tcp/9700"
+        );
+        assert_eq!(
+            seed_to_multiaddr("seed.example", 9700).unwrap().to_string(),
+            "/dns/seed.example/tcp/9700"
+        );
+    }
+
+    #[test]
+    fn a_disabled_or_dual_onion_section_refuses_nothing_a_node_did_before() {
+        let wildcard = addrs(&["/ip4/0.0.0.0/tcp/9700"]);
+        let public = addrs(&["/ip4/8.8.8.8/tcp/9700"]);
+        let seeds = vec!["seed.example:9700".to_string(), "not/a seed".to_string()];
+        let open_rpc: std::net::SocketAddr = "0.0.0.0:9701".parse().unwrap();
+        assert!(onion_startup(
+            &OnionConfig::default(),
+            &wildcard,
+            &public,
+            true,
+            true,
+            &seeds,
+            9700,
+            open_rpc
+        )
+        .unwrap()
+        .is_none());
+        // Even an invalid but disabled section.
+        let disabled = OnionConfig {
+            control: "192.168.1.2:9051".into(),
+            ..OnionConfig::default()
+        };
+        assert!(
+            onion_startup(&disabled, &wildcard, &public, true, true, &seeds, 9700, open_rpc)
+                .unwrap()
+                .is_none()
+        );
+        let dual = onion_startup(
+            &onion(OnionMode::Additional),
+            &wildcard,
+            &public,
+            true,
+            true,
+            &seeds,
+            9700,
+            open_rpc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dual.mode, OnionMode::Additional);
+    }
+
+    #[test]
+    fn a_guardian_refuses_to_start_on_every_clearnet_exposure() {
+        let rpc: std::net::SocketAddr = "127.0.0.1:9701".parse().unwrap();
+        let onion_seeds = vec![format!("{ID}.onion:9700"), format!("/onion3/{ID}:9701")];
+        let guardian = onion_startup(
+            &onion(OnionMode::Guardian),
+            &[],
+            &[],
+            false,
+            false,
+            &onion_seeds,
+            9700,
+            rpc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(guardian.mode, OnionMode::Guardian);
+
+        #[derive(Default)]
+        struct Exposure {
+            listen: Vec<libp2p::Multiaddr>,
+            public: Vec<libp2p::Multiaddr>,
+            upnp: bool,
+            lan: bool,
+            seeds: Vec<String>,
+            rpc: Option<std::net::SocketAddr>,
+        }
+        let with_onion_seeds = || Exposure {
+            seeds: onion_seeds.clone(),
+            ..Exposure::default()
+        };
+        let seeds = |seed: &str| Exposure {
+            seeds: vec![seed.to_string()],
+            ..Exposure::default()
+        };
+        let refusals = [
+            // UPnP is on by default: switching the mode on is not enough.
+            (
+                Exposure {
+                    upnp: true,
+                    ..with_onion_seeds()
+                },
+                "UPnP",
+            ),
+            (
+                Exposure {
+                    listen: addrs(&["/ip4/0.0.0.0/tcp/9700"]),
+                    ..with_onion_seeds()
+                },
+                "listener",
+            ),
+            (
+                Exposure {
+                    listen: addrs(&["/ip4/127.0.0.1/tcp/9700"]),
+                    ..with_onion_seeds()
+                },
+                "listener",
+            ),
+            (
+                Exposure {
+                    public: addrs(&["/ip4/8.8.8.8/tcp/9700"]),
+                    ..with_onion_seeds()
+                },
+                "public address",
+            ),
+            (
+                Exposure {
+                    lan: true,
+                    ..with_onion_seeds()
+                },
+                "LAN discovery",
+            ),
+            (seeds("seed.example:9700"), "seed"),
+            (seeds("seed.example"), "seed"),
+            (seeds("203.0.113.10:9700"), "seed"),
+            (seeds("[2001:db8::10]:9700"), "seed"),
+            (seeds("dnsaddr:seed.example"), "seed"),
+            (seeds("/not-a-protocol/1"), "seed"),
+            (
+                Exposure {
+                    rpc: Some("0.0.0.0:9701".parse().unwrap()),
+                    ..with_onion_seeds()
+                },
+                "JSON-RPC",
+            ),
+        ];
+        for (exposure, needle) in refusals {
+            let error = onion_startup(
+                &onion(OnionMode::Guardian),
+                &exposure.listen,
+                &exposure.public,
+                exposure.upnp,
+                exposure.lan,
+                &exposure.seeds,
+                9700,
+                exposure.rpc.unwrap_or(rpc),
+            )
+            .expect_err("a guardian with a clearnet exposure must not start");
+            let message = format!("{error:#}");
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        // A Tor that is not on this host is refused in either mode.
+        for mode in [OnionMode::Guardian, OnionMode::Additional] {
+            let remote = OnionConfig {
+                control: "192.168.1.2:9051".into(),
+                ..onion(mode)
+            };
+            assert!(onion_startup(&remote, &[], &[], false, false, &[], 9700, rpc).is_err());
+        }
+    }
+
+    #[test]
+    fn a_guardian_never_uses_the_embedded_dns_seeds() {
+        const SEEDS: &[&str] = &["seed1.example", "seed2.example"];
+        let settings = |mode| onion(mode).validate().unwrap().unwrap();
+        assert_eq!(embedded_dns_seeds(SEEDS, false, None), SEEDS);
+        assert!(embedded_dns_seeds(SEEDS, true, None).is_empty());
+        assert_eq!(
+            embedded_dns_seeds(SEEDS, false, Some(&settings(OnionMode::Additional))),
+            SEEDS
+        );
+        assert!(embedded_dns_seeds(SEEDS, false, Some(&settings(OnionMode::Guardian))).is_empty());
+    }
 }
 
 const SYSTEM_SEED_DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1895,8 +2409,14 @@ async fn embedded_seed_multiaddrs(
     default_port: u16,
 ) -> anyhow::Result<Vec<libp2p::Multiaddr>> {
     let original = seed_to_multiaddr(seed, default_port)?;
-    match resolve_embedded_seed_with_system_dns(seed, default_port).await {
+    let (host, pinned) = split_pinned_seed(seed.trim())?;
+    match resolve_embedded_seed_with_system_dns(host, default_port).await {
         Ok(mut addresses) => {
+            if let Some(peer) = pinned {
+                for address in &mut addresses {
+                    address.push(libp2p::multiaddr::Protocol::P2p(peer));
+                }
+            }
             tracing::debug!(
                 seed,
                 addresses = addresses.len(),
@@ -1945,7 +2465,14 @@ fn seed_host_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> 
     let protocol = match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(ip)) => format!("/ip4/{ip}"),
         Ok(std::net::IpAddr::V6(ip)) => format!("/ip6/{ip}"),
-        Err(_) => format!("/dns/{host}"),
+        // `<id>.onion:PORT` → `/onion3/<id>:PORT`, never `/dns/<id>.onion`.
+        Err(_) => match jetsam_p2p::onion::address::onion_host(host) {
+            Some(service) => {
+                let service = service.with_context(|| format!("invalid onion seed {addr:?}"))?;
+                return Ok(service.to_multiaddr(port)?);
+            }
+            None => format!("/dns/{host}"),
+        },
     };
     format!("{protocol}/tcp/{port}")
         .parse()
@@ -2141,6 +2668,79 @@ fn refuse_foreign_chain_data(data_dir: &Path) -> anyhow::Result<()> {
 
 
 
+/// `jetsam --compact-db`: compact the stopped database of `data_dir`.
+fn run_compact_db(data_dir: &Path) -> anyhow::Result<()> {
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    println!("compacting the chain database in {}", data_dir.display());
+    let started = std::time::Instant::now();
+    let report = jetsam_chain::storage::compact_database(data_dir).map_err(|error| {
+        anyhow::anyhow!("--compact-db: {error}\nNothing was changed in {}.", data_dir.display())
+    })?;
+    println!(
+        "mdbx.dat: {} bytes ({:.1} MiB) -> {} bytes ({:.1} MiB), {} tables and {} entries \
+         identical, {:.1} s",
+        report.before_bytes,
+        mib(report.before_bytes),
+        report.after_bytes,
+        mib(report.after_bytes),
+        report.tables,
+        report.entries,
+        started.elapsed().as_secs_f64()
+    );
+    println!(
+        "the previous file is kept as {} ({:.1} MiB): start the node, check it follows the \
+         chain, then run `jetsam --compact-db-remove-old --data-dir {}` to free it",
+        report.old_file.display(),
+        mib(report.before_bytes),
+        data_dir.display()
+    );
+    Ok(())
+}
+
+/// `jetsam --compact-db-remove-old`: delete the file a compaction kept.
+fn run_compact_db_remove_old(data_dir: &Path) -> anyhow::Result<()> {
+    let freed = jetsam_chain::storage::remove_old_database(data_dir)
+        .map_err(|error| anyhow::anyhow!("--compact-db-remove-old: {error}"))?;
+    println!(
+        "deleted the previous database file of {}: {} bytes ({:.1} MiB) freed",
+        data_dir.display(),
+        freed,
+        freed as f64 / (1024.0 * 1024.0)
+    );
+    Ok(())
+}
+
+/// How often the node reads its database health for the journal warning
+/// (the warning itself is written at most once an hour).
+const DATABASE_HEALTH_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// C2 (DATAVOL, 2026-11-19): a WARN in the journal while the data volume is
+/// more than 80 % used or the database file mostly free pages, at most once
+/// an hour. On the mainnet seeds the file reached 11.6 GB for 95 MB of data
+/// and filled the disk with nothing in the journal before the node stopped.
+fn spawn_database_health_watch(store: MdbxStore) {
+    tokio::spawn(async move {
+        let mut warnings = jetsam_chain::storage::HealthWarnings::new();
+        let mut every = tokio::time::interval(DATABASE_HEALTH_CHECK_EVERY);
+        loop {
+            every.tick().await;
+            let reader = store.clone();
+            let health = match tokio::task::spawn_blocking(move || reader.database_health()).await
+            {
+                Ok(Ok(health)) => health,
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "database health unavailable");
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if let Some(warning) = warnings.due(&health, std::time::Instant::now()) {
+                tracing::warn!("{warning}");
+            }
+        }
+    });
+}
+
 fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
     let store = MdbxStore::open(data_dir).context("open MDBX for chain-data reset")?;
     let previous_height = store
@@ -2154,6 +2754,93 @@ fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
     store.clear_all().context("clear MDBX chain state")?;
     drop(store);
     Ok(())
+}
+
+/// H-2 (audit 2026-11-10): a release that arms v1.7 at `j` without pinning its
+/// crossing (blocks J − 1 and J in `pins`) does not start on a stored chain
+/// that already reaches J, where its profile needs the crossing pinned
+/// (`params::V1_7_CROSSING_PIN_REQUIRED`, the public network): restarted past J
+/// without those pins, a node can be held by a heavier minority branch of the
+/// old rules (selected by its work, its bodies refused, selected again). Below
+/// J, with both pins, without J or on a profile that needs none, it starts.
+///
+/// D161, the operator's way out, never a default nor silent: `accepted` (from
+/// `--accept-v1-7-crossing <J−1 id>:<J id>`) is checked, on every profile,
+/// against the stored chain's own blocks at J − 1 and J (`stored`): it must
+/// name them, the stored chain must reach J and v1.7 must be armed, or the node
+/// does not start. When it starts an unpinned release this way, the ALERT it
+/// returns is logged at every start; a release that pins the crossing takes
+/// the same ids silently (and refuses others).
+fn refuse_unpinned_v1_7_crossing(
+    tip_height: u64,
+    j: Option<u64>,
+    pins: &[(u64, [u8; 32])],
+    required: bool,
+    accepted: Option<([u8; 32], [u8; 32])>,
+    stored: &dyn Fn(u64) -> anyhow::Result<Option<[u8; 32]>>,
+) -> anyhow::Result<Option<String>> {
+    let pinned_in = |j: u64| jetsam_chain::consensus::params::v1_7_crossing_pinned_in(pins, Some(j));
+    let Some((before, at)) = accepted else {
+        let Some(j) = j else {
+            return Ok(None);
+        };
+        if !required || tip_height < j || pinned_in(j) {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "this release arms v1.7 at J = {j} but does not pin its crossing (blocks {} and {j}), and the \
+             stored chain already reaches {tip_height}: restarted past J without those pins, a node can be \
+             held by a heavier minority branch of the old rules (audit H-2). Install the release that pins \
+             the crossing, then start again; nothing was changed. Only if that release does not exist yet: \
+             --accept-v1-7-crossing <id of {}>:<id of {j}>, the ids of this chain's own blocks",
+            j - 1,
+            j - 1
+        )
+    };
+    let Some(j) = j else {
+        anyhow::bail!("--accept-v1-7-crossing: this release does not arm v1.7: nothing to accept; start without it")
+    };
+    anyhow::ensure!(
+        tip_height >= j,
+        "--accept-v1-7-crossing: the stored chain does not reach J = {j} (its tip is {tip_height}): nothing to check \
+         the accepted crossing against; start without it"
+    );
+    let (ours_before, ours_at) = (stored(j - 1)?, stored(j)?);
+    anyhow::ensure!(
+        ours_before == Some(before) && ours_at == Some(at),
+        "--accept-v1-7-crossing {}:{} does not match the stored chain (block {} is {}, block {j} is {}): not \
+         started; nothing was changed",
+        hex::encode(before),
+        hex::encode(at),
+        j - 1,
+        ours_before.map(hex::encode).unwrap_or_else(|| "absent".into()),
+        ours_at.map(hex::encode).unwrap_or_else(|| "absent".into()),
+    );
+    if pinned_in(j) {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "ALERT V1_7_CROSSING_UNPINNED: this release arms v1.7 at J = {j} and pins nothing at its crossing; started \
+         on the operator's word (--accept-v1-7-crossing {}:{}, the stored chain's own blocks {} and {j}). Install \
+         the release that pins the crossing as soon as it exists",
+        hex::encode(before),
+        hex::encode(at),
+        j - 1
+    )))
+}
+
+/// `--accept-v1-7-crossing`: `<J−1 id>:<J id>`, 64 hex digits each (`0x` allowed).
+fn parse_accepted_v1_7_crossing(text: &str) -> anyhow::Result<([u8; 32], [u8; 32])> {
+    let id = |part: &str| -> anyhow::Result<[u8; 32]> {
+        let part = part.trim().trim_start_matches("0x");
+        anyhow::ensure!(part.len() == 64, "a block id is 64 hex digits");
+        Ok(hex::decode(part)?.try_into().expect("32 bytes"))
+    };
+    let (before, at) = text
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--accept-v1-7-crossing <J-1 id>:<J id>"))?;
+    anyhow::ensure!(!at.contains(':'), "--accept-v1-7-crossing <J-1 id>:<J id>: two ids");
+    Ok((id(before)?, id(at)?))
 }
 
 /// Open the stored chain and hold it against the pinned blocks
@@ -2227,6 +2914,88 @@ fn open_chain_on_pinned_branch(
          folder. Syncing again from genesis."
     );
     MdbxChainContext::open_or_create(data_dir).context("open MDBX")
+}
+
+#[cfg(test)]
+mod v1_7_crossing_pin_tests {
+    use super::{parse_accepted_v1_7_crossing, refuse_unpinned_v1_7_crossing};
+
+    const J: u64 = 69_120;
+    const BEFORE: [u8; 32] = [3; 32];
+    const AT: [u8; 32] = [4; 32];
+
+    /// The stored chain: `BEFORE` at J − 1, `AT` at J, nothing else asked.
+    fn stored(height: u64) -> anyhow::Result<Option<[u8; 32]>> {
+        Ok(match height {
+            h if h == J - 1 => Some(BEFORE),
+            h if h == J => Some(AT),
+            _ => None,
+        })
+    }
+
+    /// H-2 (audit 2026-11-10): a release that arms v1.7 but does not pin its crossing (J − 1 and J) does not
+    /// start on a stored chain that already reaches J, where its profile needs the crossing pinned (the public
+    /// network): restarted there, it could be held by a heavier minority branch of the old rules. Below J, with
+    /// both pins, without J, or on a profile that needs no pin, it starts.
+    #[test]
+    fn h2_an_armed_release_without_its_crossing_pins_refuses_a_chain_past_j() {
+        let j = J;
+        let unpinned = [(46_079, [1; 32]), (46_080, [2; 32])];
+        let pinned = [(46_079, [1; 32]), (46_080, [2; 32]), (j - 1, BEFORE), (j, AT)];
+        for tip in [0, j - 1] {
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true, None, &stored).unwrap().is_none(), "tip {tip} below J");
+        }
+        for tip in [j, j + 1, j + 10_000] {
+            let e = refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, true, None, &stored).unwrap_err().to_string();
+            assert!(e.contains("69120") && e.contains("69119") && e.contains(&tip.to_string()) && e.contains("pins"), "{e}");
+            assert!(e.contains("--accept-v1-7-crossing"), "the way out is named: {e}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &pinned, true, None, &stored).unwrap().is_none(), "pinned, tip {tip}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, Some(j), &unpinned, false, None, &stored).unwrap().is_none(), "no pin needed, tip {tip}");
+            assert!(refuse_unpinned_v1_7_crossing(tip, None, &unpinned, true, None, &stored).unwrap().is_none(), "v1.7 not armed, tip {tip}");
+        }
+        // J − 1 alone, or J alone, is no pinned crossing
+        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &pinned[..3], true, None, &stored).is_err());
+        assert!(refuse_unpinned_v1_7_crossing(j, Some(j), &[(j, AT)], true, None, &stored).is_err());
+    }
+
+    /// H-2 (D161): the operator's way out is never a default nor silent: `--accept-v1-7-crossing <J−1 id>:<J id>`
+    /// names the crossing the operator accepts; it starts the unpinned release only if both ids are the stored
+    /// chain's own blocks at J − 1 and J, with an ALERT at every start while the release pins nothing.
+    #[test]
+    fn h2_the_accepted_crossing_starts_an_unpinned_release_only_on_its_own_chain_and_alerts() {
+        let unpinned = [(46_079, [1; 32]), (46_080, [2; 32])];
+        let pinned = [(46_079, [1; 32]), (46_080, [2; 32]), (J - 1, BEFORE), (J, AT)];
+        for required in [true, false] {
+            let alert = refuse_unpinned_v1_7_crossing(J + 5, Some(J), &unpinned, required, Some((BEFORE, AT)), &stored)
+                .unwrap()
+                .expect("an ALERT, every start");
+            assert!(alert.starts_with("ALERT V1_7_CROSSING_UNPINNED") && alert.contains(&hex::encode(AT)) && alert.contains("69120"), "{alert}");
+        }
+        // another block at J, or at J − 1: refused, whatever the profile
+        for accepted in [(BEFORE, [9; 32]), ([9; 32], AT), (AT, BEFORE)] {
+            for required in [true, false] {
+                let e = refuse_unpinned_v1_7_crossing(J + 5, Some(J), &unpinned, required, Some(accepted), &stored).unwrap_err().to_string();
+                assert!(e.contains("does not match") && e.contains("--accept-v1-7-crossing"), "{e}");
+            }
+        }
+        // nothing to check it against: the stored chain below J, or a release without J
+        let e = refuse_unpinned_v1_7_crossing(J - 1, Some(J), &unpinned, true, Some((BEFORE, AT)), &stored).unwrap_err().to_string();
+        assert!(e.contains("does not reach"), "{e}");
+        assert!(refuse_unpinned_v1_7_crossing(J + 5, None, &unpinned, true, Some((BEFORE, AT)), &stored).is_err());
+        // a release that pins the crossing: the same ids start without an ALERT, others do not start
+        assert!(refuse_unpinned_v1_7_crossing(J + 5, Some(J), &pinned, true, Some((BEFORE, AT)), &stored).unwrap().is_none());
+        assert!(refuse_unpinned_v1_7_crossing(J + 5, Some(J), &pinned, true, Some(([9; 32], AT)), &stored).is_err());
+    }
+
+    #[test]
+    fn h2_the_accepted_crossing_is_two_ids_of_64_hex_digits() {
+        let text = format!("{}:{}", hex::encode(BEFORE), hex::encode(AT));
+        assert_eq!(parse_accepted_v1_7_crossing(&text).unwrap(), (BEFORE, AT));
+        assert_eq!(parse_accepted_v1_7_crossing(&format!("0x{}:0x{}", hex::encode(BEFORE), hex::encode(AT))).unwrap(), (BEFORE, AT));
+        for bad in [String::new(), hex::encode(AT), format!("{}:", hex::encode(BEFORE)), format!("{}:{}", hex::encode(BEFORE), &hex::encode(AT)[..62]), format!("{}:{}:{}", hex::encode(BEFORE), hex::encode(AT), hex::encode(AT)), format!("{}:{}", hex::encode(BEFORE), "zz".repeat(32))] {
+            assert!(parse_accepted_v1_7_crossing(&bad).is_err(), "{bad}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2381,6 +3150,10 @@ fn run_bench(seconds: u64, cpu_threads: Option<usize>) {
         "{}",
         v1_6_arming_line(jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT)
     );
+    println!(
+        "{}",
+        v1_7_arming_line(jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT)
+    );
 }
 
 /// What `--bench` says of the walked figure. Release checks read its first
@@ -2419,6 +3192,14 @@ fn v1_6_arming_line(activation: Option<u64>) -> String {
     match activation {
         Some(height) => format!("From block {height} the chain runs the v1.6 rules."),
         None => "This build does not arm the v1.6 rules.".to_owned(),
+    }
+}
+
+/// The v1.7 clock as `--bench` reports it, read back the same way.
+fn v1_7_arming_line(activation: Option<u64>) -> String {
+    match activation {
+        Some(height) => format!("From block {height} the chain runs the v1.7 rules."),
+        None => "This build does not arm the v1.7 rules.".to_owned(),
     }
 }
 
@@ -2466,6 +3247,25 @@ mod bench_v1_6_line_tests {
         assert_eq!(
             v1_6_arming_line(None),
             "This build does not arm the v1.6 rules."
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench_v1_7_line_tests {
+    use super::v1_7_arming_line;
+
+    /// The same read-back for the v1.7 clock: a release is checked against
+    /// the height the binary reports (8 640 on the test chain, D75).
+    #[test]
+    fn the_bench_names_the_v1_7_height_or_says_it_is_not_armed() {
+        assert_eq!(
+            v1_7_arming_line(Some(8_640)),
+            "From block 8640 the chain runs the v1.7 rules."
+        );
+        assert_eq!(
+            v1_7_arming_line(None),
+            "This build does not arm the v1.7 rules."
         );
     }
 }
@@ -2545,7 +3345,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Mode validation ---
     if cli.mode == NodeMode::Extminer && cli.mining_key.is_none() {
-        anyhow::bail!("--mode extminer requires --mining-key <TOKEN>");
+        anyhow::bail!("--mode extminer requires --mining-key <TOKEN> (or JETSAM_MINING_KEY)");
     }
     if cli.mode == NodeMode::Miner && cli.mining_key.is_some() {
         tracing::warn!(
@@ -2584,6 +3384,21 @@ async fn main() -> anyhow::Result<()> {
             || cli.allow_custom_coinbase)
     {
         anyhow::bail!("matrix preparation cannot be combined with node or mining actions");
+    }
+    let db_maintenance = cli.compact_db || cli.compact_db_remove_old;
+    if db_maintenance
+        && (wallet_maintenance
+            || cli.import_spend_secret
+            || cli.prepare_history_step_cache.is_some()
+            || cli.mode != NodeMode::Node
+            || cli.genesis
+            || cli.purge_state
+            || cli.miner_address.is_some()
+            || cli.cpu_threads.is_some()
+            || cli.mining_key.is_some()
+            || cli.allow_custom_coinbase)
+    {
+        anyhow::bail!("database compaction cannot be combined with other actions");
     }
     // --- Network ---
     let net = NetworkConfig::mainnet();
@@ -2631,6 +3446,13 @@ async fn main() -> anyhow::Result<()> {
     // also left alone: the old branch threw it away on every first start, and
     // rewrote the default install's jetsam.toml to point at whichever data
     // directory happened to be starting.
+    // Before anything opens the database read-write.
+    if cli.compact_db {
+        return run_compact_db(&data_dir);
+    }
+    if cli.compact_db_remove_old {
+        return run_compact_db_remove_old(&data_dir);
+    }
     refuse_foreign_chain_data(&data_dir)?;
     record_network_storage_epoch(&data_dir)?;
     // CLI flags are authoritative after any first-mainnet reset.
@@ -2685,15 +3507,17 @@ async fn main() -> anyhow::Result<()> {
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
 
     // An RPC endpoint reachable from outside this machine, with no bearer, is
-    // the wallet handed to whoever finds the port: `walletSend` needs no other
-    // secret. The node still starts — an operator may be fronting it with their
-    // own authentication — but it says so, loudly, every time.
+    // this node's reads and mining API handed to whoever finds the port (the
+    // wallet methods and `stop` answer only to the RPC cookie, R-1). The node
+    // still starts — an operator may be fronting it with their own
+    // authentication — but it says so, loudly, every time.
     if !rpc_listen.ip().is_loopback() && cli.mining_key.is_none() {
         tracing::warn!(
             listen = %rpc_listen,
             "the JSON-RPC endpoint is reachable beyond this machine and has no \
-             --mining-key: anyone who can reach it can spend this wallet and stop \
-             this node. Bind 127.0.0.1, or set --mining-key."
+             --mining-key: anyone who can reach it can read it and use its mining \
+             API (the wallet methods and stop still need the RPC cookie). Bind \
+             127.0.0.1, or set --mining-key."
         );
     }
 
@@ -2727,6 +3551,35 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("--seed {raw_seed}"))?;
         cfg.network.seeds.push(ma.to_string());
     }
+    // D60: a guardian refuses here every setting that could expose its host
+    // on clearnet; its only P2P listener is the onion service's loopback
+    // target, bound by the network itself.
+    let listen_is_explicit = !cli.p2p_listen.is_empty()
+        || cfg
+            .network
+            .listen
+            .as_ref()
+            .is_some_and(|listen| !listen.as_slice().is_empty());
+    let onion = onion_startup(
+        &cfg.network.onion,
+        if listen_is_explicit {
+            listen_addrs.as_slice()
+        } else {
+            &[]
+        },
+        &public_p2p_addresses,
+        cfg.network.upnp && !cli.no_upnp,
+        cli.lan_discovery || cfg.network.lan_discovery,
+        &cfg.network.seeds,
+        net.default_p2p_port,
+        rpc_listen,
+    )?;
+    let (listen_addrs, listen_addr) = match onion.as_ref() {
+        Some(settings) if settings.mode == jetsam_p2p::onion::OnionMode::Guardian => {
+            (Vec::new(), settings.local_listen_multiaddr())
+        }
+        _ => (listen_addrs, listen_addr),
+    };
 
     let wallet_path = data_dir.join("wallet.key");
     // Read before anything can create it: this is the only moment at which the
@@ -2838,6 +3691,27 @@ async fn main() -> anyhow::Result<()> {
         jetsam_chain::consensus::params::HARD_CHECKPOINTS,
     )?;
     let tip_height = ctx.tip_height();
+    let accepted_crossing = cli
+        .accept_v1_7_crossing
+        .as_deref()
+        .map(parse_accepted_v1_7_crossing)
+        .transpose()?;
+    let stored_id = |height: u64| -> anyhow::Result<Option<[u8; 32]>> {
+        Ok(ctx
+            .get_header_from_store(height)
+            .context("read a stored header at the v1.7 crossing")?
+            .map(|header| jetsam_chain::block_header::block_id(&header)))
+    };
+    if let Some(alert) = refuse_unpinned_v1_7_crossing(
+        tip_height,
+        jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
+        jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+        jetsam_chain::consensus::params::V1_7_CROSSING_PIN_REQUIRED,
+        accepted_crossing,
+        &stored_id,
+    )? {
+        tracing::error!("{alert}");
+    }
     let state_root = hex::encode(ctx.tip_header().state_root);
     tracing::debug!(height = tip_height, state_root = %state_root, "chain loaded");
     // v1.5 client objects (M3.8): the registered matrices this node holds
@@ -2883,6 +3757,7 @@ async fn main() -> anyhow::Result<()> {
             }
             None => None,
         };
+    spawn_database_health_watch(ctx.store.clone());
     let chain = Arc::new(RwLock::new(ctx));
     let initial_canonical_tip = {
         let ctx = chain.read().await;
@@ -3009,7 +3884,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("not asking the router for a port mapping (UPnP off)");
     }
-    let (p2p, mut p2p_task) = P2PNetwork::start(
+    let (p2p, mut p2p_task) = P2PNetwork::start_with_onion(
         listen_addrs.clone(),
         public_p2p_addresses,
         chain.clone(),
@@ -3020,9 +3895,12 @@ async fn main() -> anyhow::Result<()> {
         p2p_background_capacity,
         cli.lan_discovery || cfg.network.lan_discovery,
         upnp_enabled,
-        client_objects.clone().map(|objects| {
-            objects as Arc<dyn jetsam_p2p::client_object_transport::ClientObjectSource>
-        }),
+        // v1.7 (T7.1): the same protocol serves this node's snapshot annexes.
+        jetsam_node::snapshot_annex::node_object_source(
+            client_objects.clone(),
+            &data_dir.join("snapshot-exports"),
+        ),
+        onion.clone(),
     )
     .context("start P2P network")?;
     let p2p_health_rx = p2p.health_receiver();
@@ -3031,12 +3909,7 @@ async fn main() -> anyhow::Result<()> {
     // Dial seeds: CLI seeds + config seeds + the embedded DNS bootstrap set.
     // Isolated release-binary protocol tests disable only the final source;
     // explicit loopback seeds still exercise the normal P2P dial path.
-    let dns_seeds = if cli.disable_dns_seeds {
-        tracing::debug!("embedded DNS bootstrap disabled for isolated protocol test");
-        &[][..]
-    } else {
-        net.dns_seeds
-    };
+    let dns_seeds = embedded_dns_seeds(net.dns_seeds, cli.disable_dns_seeds, onion.as_ref());
     let mut registered_seed_addrs = std::collections::HashSet::new();
     for seed_addr in &cfg.network.seeds {
         let ma = seed_to_multiaddr(seed_addr, net.default_p2p_port);
@@ -3044,7 +3917,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(addr) => {
                 if registered_seed_addrs.insert(addr.clone()) {
                     tracing::debug!(addr = %addr, "dialing configured seed");
-                    p2p.dial(addr).await;
+                    p2p.dial_seed(addr).await;
                 }
             }
             Err(e) => {
@@ -3102,6 +3975,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_pause_explanations(matches!(cli.mode, NodeMode::Miner | NodeMode::Extminer));
     let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
+    // T3.10b: the record of refused branches, read back from the last run.
+    let branch_observer = jetsam_node::branch_observer_node::SharedBranchObserver::load(
+        data_dir.join(jetsam_node::branch_observer::FILE_NAME),
+        unix_now(),
+    );
+    let p2p_branch_observer = branch_observer.clone();
     let p2p_snapshot_staging_root = snapshot_staging_root.clone();
     let p2p_history_step_runtimes = history_step_runtimes.clone();
     let p2p_external_mining_attempts = external_mining_attempts.clone();
@@ -3123,6 +4002,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_external_mining_attempts,
             p2p_canonical_tip_changes,
             p2p_client_objects,
+            p2p_branch_observer,
         )
         .await
     });
@@ -3138,6 +4018,14 @@ async fn main() -> anyhow::Result<()> {
                 Ok(jetsam_mempool::MempoolEvent::TxAdmitted { intent_bytes, .. }) => {
                     let _ = p2p_tx_relay
                         .send(jetsam_p2p::NetworkCommand::BroadcastTx { intent_bytes })
+                        .await;
+                }
+                // v1.7 (T7.1): a held destination or guardian intent goes to
+                // the peers on the bridge-intent topic (nothing is sent when
+                // this node has no such topic).
+                Ok(jetsam_mempool::MempoolEvent::BridgeIntentAdmitted { intent_bytes }) => {
+                    let _ = p2p_tx_relay
+                        .send(jetsam_p2p::NetworkCommand::BroadcastBridgeIntent { intent_bytes })
                         .await;
                 }
                 Ok(jetsam_mempool::MempoolEvent::TxEvicted { hash, reason }) => {
@@ -3226,6 +4114,18 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    // R-1 (audit 2026-11-10): what the wallet methods, `stop` and
+    // `registerClient` answer to; new at every start, this user's only.
+    let rpc_cookie = jetsam_node::rpc_cookie::write_new(&data_dir).with_context(|| {
+        format!(
+            "write the RPC cookie {}",
+            jetsam_node::rpc_cookie::path_in(&data_dir).display()
+        )
+    })?;
+    tracing::info!(
+        path = %jetsam_node::rpc_cookie::path_in(&data_dir).display(),
+        "RPC cookie written: the wallet methods and stop answer only to it"
+    );
     let (rpc_handle, rpc_stop_rx) = start_rpc_server(
         rpc_listen,
         chain.clone(),
@@ -3254,11 +4154,13 @@ async fn main() -> anyhow::Result<()> {
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
         cli.mining_key,
+        rpc_cookie,
         cli.allow_custom_coinbase,
         rpc_listen.ip().is_loopback(),
         client_objects.clone().map(|objects| {
             objects as jetsam_rpc::client_objects::SharedRpcClientObjects
         }),
+        Arc::new(branch_observer.clone()) as jetsam_rpc::observed_branches::SharedObservedBranches,
     )
     .await
     .context("start RPC server")?;
@@ -3542,6 +4444,9 @@ async fn main() -> anyhow::Result<()> {
     if !p2p_event_task.is_finished() {
         p2p_event_task.abort();
         let _ = (&mut p2p_event_task).await;
+    }
+    if let Err(error) = branch_observer.save(unix_now()) {
+        tracing::warn!(%error, "the branch observer's record could not be saved at shutdown");
     }
     tracing::info!("goodbye — MDBX flushed on drop");
     if let Some(error) = fatal_runtime_error {
@@ -5108,6 +6013,12 @@ fn snapshot_install_failure(
         jetsam_chain::storage::MdbxContextError::Consensus(
             jetsam_chain::consensus::ConsensusError::ClientObject(error),
         ) => SnapshotInstallError::Rejected(format!("snapshot client registry refused: {error}")),
+        // v1.7 (T7.1): the destination state file or the guardian journal
+        // the install refused: the candidate's data.
+        jetsam_chain::storage::MdbxContextError::Consensus(
+            error @ (jetsam_chain::consensus::ConsensusError::DestinationSnapshot(_)
+            | jetsam_chain::consensus::ConsensusError::Guardian(_)),
+        ) => SnapshotInstallError::Rejected(format!("snapshot v1.7 state refused: {error}")),
         error => SnapshotInstallError::BeforeCommit(format!(
             "apply authenticated state snapshot: {error:?}"
         )),
@@ -5499,19 +6410,24 @@ fn exact_suffix_context_error_is_body_peer_fault(
 }
 
 /// Whether a failure to apply a body under a verified terminal proves the
-/// block itself invalid (M3.10): a native v1.5 client-object rule refusing
-/// what the header commits to. Anything else under a verified terminal may be
-/// a relay's corrupted bytes for an honest header, and condemns only the
-/// source.
+/// block itself invalid (M3.10): a native v1.5 client-object rule, or a v1.7
+/// destination or guardian rule (A2 M3, A3-3), refusing what the header
+/// commits to. Anything else under a verified terminal may be a relay's
+/// corrupted bytes for an honest header, and condemns only the source.
 fn exact_suffix_context_error_condemns_block(
     error: &jetsam_chain::storage::MdbxContextError,
 ) -> bool {
-    matches!(
-        error,
-        jetsam_chain::storage::MdbxContextError::Consensus(
-            jetsam_chain::consensus::ConsensusError::ClientObject(error)
-        ) if error.condemns_block()
-    )
+    use jetsam_chain::consensus::ConsensusError;
+    let jetsam_chain::storage::MdbxContextError::Consensus(error) = error else {
+        return false;
+    };
+    match error {
+        ConsensusError::ClientObject(error) => error.condemns_block(),
+        ConsensusError::Destination(error) => error.condemns_block(),
+        ConsensusError::DestinationBlock(error) => error.condemns_block(),
+        ConsensusError::Guardian(error) => error.condemns_block(),
+        _ => false,
+    }
 }
 
 /// A block proved invalid (M3.10) leaves the HeaderDAG with its descendants
@@ -5625,6 +6541,89 @@ fn judge_exact_suffix_client_objects(
     })
 }
 
+/// v1.7 gate 1 (private rehearsal, 2026-10-31). The body `bytes` of
+/// `block`, if it is the mark of a branch that does not carry v1.7: at or
+/// above the v1.7 height, no destination section (`SectionMissing`). That is
+/// what every body of the not-upgraded v1.6 branch looks like, and no honest
+/// v1.7 node ever holds such bytes. The header is not condemned for it (a
+/// relay may strip a section); the object id of these exact bytes is returned
+/// so that whoever serves or advertises them is known.
+fn refused_branch_body(
+    block: &jetsam_chain::Block,
+    bytes: &[u8],
+    v1_7_activation: Option<u64>,
+) -> Option<jetsam_p2p::object_protocol::BlockBodyObjectId> {
+    use jetsam_chain::consensus::destination::{check_destination_section, DestinationError};
+    match check_destination_section(block, v1_7_activation) {
+        Err(DestinationError::SectionMissing) => {
+            jetsam_p2p::object_protocol::BlockBodyObjectId::from_bytes(
+                jetsam_p2p::object_protocol::BlockBodyClaimId {
+                    height: block.header.height,
+                    block_hash: jetsam_chain::block_id(&block.header),
+                },
+                bytes,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Decode one body of an exact suffix and check it against its validated
+/// header. v1.7 gate 1: a body without destination section at or above the
+/// v1.7 height is refused here, before the suffix's terminal is verified
+/// (seconds of proof checking for a verdict the bytes already give), with
+/// the exact body it served ([`refused_branch_body`]).
+fn decode_exact_suffix_body(
+    bytes: &[u8],
+    source: libp2p::PeerId,
+    expected: &jetsam_chain::BlockHeader,
+    v1_7_activation: Option<u64>,
+) -> Result<jetsam_chain::Block, ExactSuffixApplyError> {
+    let block = jetsam_chain::Block::from_bytes(bytes).map_err(|error| {
+        ExactSuffixApplyError::body(source, format!("decode exact suffix body: {error:?}"))
+    })?;
+    if block.header != *expected {
+        return Err(ExactSuffixApplyError::body(
+            source,
+            "exact suffix body header differs from its validated header",
+        ));
+    }
+    if let Some(body) = refused_branch_body(&block, bytes, v1_7_activation) {
+        return Err(ExactSuffixApplyError::branch_body(
+            source,
+            format!(
+                "exact suffix body {} carries no destination section at or above the v1.7 \
+                 height: a branch without v1.7",
+                block.header.height
+            ),
+            body,
+        ));
+    }
+    Ok(block)
+}
+
+/// Every body of an exact suffix, decoded and checked against its validated
+/// header ([`decode_exact_suffix_body`]) under this build's v1.7 clock.
+fn decode_exact_suffix_bodies(
+    body_bytes: &[Vec<u8>],
+    body_sources: &[libp2p::PeerId],
+    headers: &[jetsam_node::networking::header_dag::ValidatedHeader],
+) -> Result<Vec<jetsam_chain::Block>, ExactSuffixApplyError> {
+    body_bytes
+        .iter()
+        .zip(body_sources)
+        .zip(headers)
+        .map(|((bytes, source), expected)| {
+            decode_exact_suffix_body(
+                bytes,
+                *source,
+                &expected.header,
+                jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
+            )
+        })
+        .collect()
+}
+
 fn quarantine_exact_suffix_sources(
     header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
     rejected: &mut std::collections::HashSet<libp2p::PeerId>,
@@ -5698,26 +6697,7 @@ async fn apply_exact_suffix_offthread(
                 "exact suffix body/source count differs from its immutable plan".into(),
             ));
         }
-        let mut blocks = Vec::with_capacity(body_bytes.len());
-        for ((bytes, source), expected) in body_bytes
-            .iter()
-            .zip(&body_sources)
-            .zip(plan.headers())
-        {
-            let block = jetsam_chain::Block::from_bytes(bytes).map_err(|error| {
-                ExactSuffixApplyError::body(
-                    *source,
-                    format!("decode exact suffix body: {error:?}"),
-                )
-            })?;
-            if block.header != expected.header {
-                return Err(ExactSuffixApplyError::body(
-                    *source,
-                    "exact suffix body header differs from its validated header",
-                ));
-            }
-            blocks.push(block);
-        }
+        let blocks = decode_exact_suffix_bodies(&body_bytes, &body_sources, plan.headers())?;
         let tip_header = blocks
             .last()
             .expect("non-empty exact suffix checked above")
@@ -8973,6 +9953,44 @@ mod tests {
         }));
     }
 
+    /// Audit 2026-11-10, P-10: an embedded seed named by hostname alone let a
+    /// lying resolver choose every first peer of a fresh node. A seed entry
+    /// may pin its identity; every address the node dials for it then carries
+    /// that PeerId, and the Noise handshake refuses anyone else.
+    #[tokio::test]
+    async fn a_pinned_embedded_seed_dials_only_its_peer_id() {
+        let peer = libp2p::PeerId::random();
+        let resolved = embedded_seed_multiaddrs(&format!("localhost/p2p/{peer}"), 9700)
+            .await
+            .unwrap();
+        assert!(resolved
+            .iter()
+            .any(|addr| addr.to_string() == format!("/dns/localhost/tcp/9700/p2p/{peer}")));
+        assert!(resolved.iter().any(|addr| {
+            matches!(
+                addr.iter().next(),
+                Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))
+            )
+        }));
+        for addr in &resolved {
+            assert_eq!(
+                addr.iter().last(),
+                Some(libp2p::multiaddr::Protocol::P2p(peer)),
+                "{addr} must name the pinned identity"
+            );
+        }
+        assert_eq!(
+            seed_to_multiaddr(&format!("seed.example:9800/p2p/{peer}"), 9700)
+                .unwrap()
+                .to_string(),
+            format!("/dns/seed.example/tcp/9800/p2p/{peer}")
+        );
+        assert!(
+            seed_to_multiaddr("seed.example/p2p/not-a-peer-id", 9700).is_err(),
+            "a malformed pin is refused, never dialled unpinned"
+        );
+    }
+
     #[test]
     fn snapshot_header_failover_keeps_only_the_exact_candidate_file() {
         let root = tempfile::tempdir().unwrap();
@@ -8992,6 +10010,63 @@ mod tests {
         assert!(!stale_a.exists());
         assert!(!stale_b.exists());
         assert!(unrelated.exists());
+    }
+
+    /// Audit 2026-11-10, S-2: a manifest whose tip is the last u64 height (its
+    /// bridge at the same block) passed every manifest check; header staging
+    /// then found no successor height and returned a local Fatal, which ended
+    /// the P2P event task and stopped the node. Followed here along the
+    /// node's own path: the P2P gate that builds every VerifiedStateManifest,
+    /// then the header staging the node starts for it. A peer's manifest may
+    /// be refused on that path; it may never become a local failure.
+    #[test]
+    fn a_manifest_at_the_last_height_never_stops_the_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let mut manifest = jetsam_p2p::protocol::GetStateManifestResponse {
+            tip_height: u64::MAX,
+            tip_hash: [0x5A; 32],
+            cumulative_chainwork: [0xA5; 32],
+            format_version: jetsam_p2p::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
+            state_root: [0x5B; 32],
+            log_slots: 17,
+            active_slot_count: 9,
+            alloc_counter: 12,
+            eff_log: 16,
+            bridge_tip_height: u64::MAX,
+            bridge_tip_hash: [0x5A; 32],
+            bridge_cumulative_chainwork: [0xA5; 32],
+            segment_ids: vec![0, 1],
+            segment_roots: vec![[3; 32], [4; 32]],
+            segment_lengths: vec![209, 259],
+            ..Default::default()
+        };
+        assert!(manifest.seal_manifest_digest());
+
+        let outcome = match jetsam_p2p::protocol::VerifiedStateManifest::verify(manifest) {
+            None => "refused as a candidate by the P2P manifest gate".to_owned(),
+            Some(verified) => match super::prepare_snapshot_header_sync(
+                &directory.path().join("snapshot-staging"),
+                &ctx.store,
+                libp2p::PeerId::random(),
+                verified,
+                None,
+                None,
+            ) {
+                Err(super::SnapshotHeaderPrepareError::Fatal(error)) => {
+                    panic!("a peer's manifest stops the node: {error}")
+                }
+                Err(super::SnapshotHeaderPrepareError::BaseMoved(error)) => {
+                    format!("staging refused, base moved: {error}")
+                }
+                Ok(_) => "staged".to_owned(),
+            },
+        };
+
+        assert_eq!(outcome, "refused as a candidate by the P2P manifest gate");
     }
 
     #[test]
@@ -9022,6 +10097,36 @@ mod tests {
 
         let error = load_or_create_config(&path, &NodeConfig::default()).unwrap_err();
         assert!(error.to_string().contains("parse node config"));
+    }
+
+    /// The default config is written whole beside its path and only then
+    /// linked into place: a first start killed mid-write leaves no truncated
+    /// jetsam.toml that every later start refuses to parse.
+    #[test]
+    fn the_default_config_appears_whole_and_leaves_no_staged_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("jetsam.toml");
+
+        assert!(super::create_config_whole(&path, b"[rpc]\n").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[rpc]\n");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_config_another_start_created_first_is_never_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("jetsam.toml");
+        std::fs::write(&path, "[network]\n").unwrap();
+
+        assert!(!super::create_config_whole(&path, b"[rpc]\n").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[network]\n");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -9917,6 +11022,48 @@ mod tests {
         String::from_utf8(bytes).expect("log output is utf-8")
     }
 
+    fn rendered_cold_election_close(offered: usize, kept: usize) -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_cold_election_refusals(offered, kept);
+        });
+        let bytes = captured.0.lock().expect("capture buffer").clone();
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    /// Offers refused when a cold node's election closes used to vanish
+    /// without a line: a node whose every offer was refused there sat silent.
+    #[test]
+    fn a_cold_election_whose_every_offer_is_refused_at_the_close_says_so() {
+        let line = rendered_cold_election_close(2, 0);
+        let body = line.split_once("WARN ").expect("a WARN line").1.trim_end();
+        assert_eq!(
+            body,
+            "jetsam: snapshot election closed with every offer refused at the close; \
+             the next offer opens a new election offered=2 refused=2"
+        );
+    }
+
+    #[test]
+    fn a_cold_election_that_refused_some_offers_at_the_close_counts_them() {
+        let line = rendered_cold_election_close(3, 1);
+        let body = line.split_once("INFO ").expect("an INFO line").1.trim_end();
+        assert_eq!(
+            body,
+            "jetsam: snapshot election closed: offers refused at the close, \
+             electing among the rest offered=3 refused=2 kept=1"
+        );
+    }
+
+    #[test]
+    fn a_cold_election_that_kept_every_offer_adds_no_line() {
+        assert_eq!(rendered_cold_election_close(2, 2), "");
+    }
+
     #[test]
     fn a_gap_that_still_looks_transient_renders_its_own_wording_as_the_message() {
         let line = rendered_stale_gap(1);
@@ -10022,6 +11169,7 @@ mod tests {
             header,
             transactions,
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 
@@ -10921,10 +12069,12 @@ async fn handle_p2p_events(
     external_mining_attempts: ExternalMiningAttemptInvalidator,
     mut canonical_tip_changes: tokio::sync::watch::Receiver<jetsam_p2p::object_protocol::ChainPoint>,
     client_objects: Option<Arc<jetsam_node::client_objects::ClientObjects>>,
+    branch_observer: jetsam_node::branch_observer_node::SharedBranchObserver,
 ) -> anyhow::Result<()> {
     use jetsam_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use std::collections::HashMap;
     let mut snapshot_rebase_hint: Option<SnapshotRebaseHint> = None;
+    let snapshot_annex_router = jetsam_node::snapshot_annex::SnapshotAnnexRouter::default();
     {
         let ctx = chain.read().await;
         mining_peer_quorum.set_canonical_tip(ctx.tip_height(), ctx.tip_hash(), false);
@@ -11254,6 +12404,8 @@ async fn handle_p2p_events(
     // The verdicts last handed to the P2P layer, which keeps
     // those peers out of its neighbour slots and seed replacement.
     let mut refused_branch_peers_sent = std::collections::HashSet::new();
+    // T3.10b: the probes of the refused branches (`branch_observer_node`).
+    let mut branch_probes = jetsam_node::branch_observer_node::BranchProbes::new(branch_observer);
     match peer_chain_evidence.load_verdicts(
         &peer_verdicts_path,
         Instant::now(),
@@ -11262,6 +12414,13 @@ async fn handle_p2p_events(
         Ok(0) => {}
         Ok(restored) => tracing::info!(restored, "divergence verdicts restored from the last run"),
         Err(error) => tracing::warn!(%error, "divergence verdicts of the last run unreadable"),
+    }
+    // H-2: the providers whose object bytes failed this node's checks stay out of its object inventory
+    // after a restart, for what is left of their TTL.
+    let restored_quarantine = peer_chain_evidence.object_quarantined_peers(Instant::now());
+    if !restored_quarantine.is_empty() {
+        tracing::info!(restored = restored_quarantine.len(), "object quarantine restored from the last run");
+        rejected_suffix_object_peers.extend(restored_quarantine);
     }
     let mut branch_warnings = repeated_warnings::RepeatedWarnings::new(
         repeated_warnings::REPEATED_WARNINGS_CAPACITY,
@@ -11662,11 +12821,16 @@ async fn handle_p2p_events(
         ($peer:expr, $height:expr) => {{
             let peer = $peer;
             let height: u64 = $height;
-            !snapshot_plan_holds_verified_authority!()
-                && pending_manifest.as_ref().is_some_and(|pending| {
-                    (pending.preferred_peer == peer || pending.providers.contains(&peer))
-                        && height <= pending.manifest.tip_height
-                })
+            let verified = snapshot_plan_holds_verified_authority!();
+            pending_manifest.as_ref().is_some_and(|pending| {
+                provider_refusal_retires_snapshot_plan(
+                    *initial_sync_ready.borrow(),
+                    verified,
+                    pending.preferred_peer == peer || pending.providers.contains(&peer),
+                    height,
+                    pending.manifest.tip_height,
+                )
+            })
         }};
     }
 
@@ -12484,7 +13648,19 @@ async fn handle_p2p_events(
             let install_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
             let install_external_mining_attempts = external_mining_attempts.clone();
             let completion = snapshot_install_completion_tx.clone();
+            // v1.7 (T7.1): the annexes the manifest commits to, by content
+            // from the plan's peer, before the install.
+            let annex_fetcher = jetsam_node::snapshot_annex::NetworkAnnexFetcher::new(
+                p2p_cmd.clone(),
+                snapshot_annex_router.clone(),
+            );
             let install_task = tokio::spawn(async move {
+                let annexes = jetsam_node::snapshot_annex::fetch_manifest_annexes(
+                    &annex_fetcher,
+                    &[source],
+                    &manifest.annexes,
+                )
+                .await;
                 apply_verified_snapshot_boundary(
                     &install_chain,
                     &install_mempool,
@@ -12494,6 +13670,7 @@ async fn handle_p2p_events(
                     history_step,
                     &install_wallet_operation_gate,
                     &install_external_mining_attempts,
+                    annexes,
                 )
                 .await
             });
@@ -13546,6 +14723,20 @@ async fn handle_p2p_events(
                     );
                 }
             }
+            // v1.7 (T7.1): the answers to snapshot annex fetches.
+            Ok(NetworkEvent::ClientObjectFetched { token, bytes, .. })
+                if jetsam_node::snapshot_annex::is_snapshot_annex_token(token) =>
+            {
+                snapshot_annex_router.fetched(token, &bytes);
+            }
+            Ok(NetworkEvent::ClientObjectFetchFailed { token, kind, .. })
+                if jetsam_node::snapshot_annex::is_snapshot_annex_token(token) =>
+            {
+                snapshot_annex_router.failed(
+                    token,
+                    kind == jetsam_p2p::network::RequestFailureKind::InvalidResponse,
+                );
+            }
             Ok(NetworkEvent::ClientObjectFetched {
                 token, from, bytes, ..
             }) => {
@@ -13598,6 +14789,37 @@ async fn handle_p2p_events(
                         tracing::warn!(peer = %from, "peer served bytes failing a client object's identity");
                     }
                 }
+            }
+            // v1.7 (T7.1): an intent a peer relayed on the bridge-intent
+            // topic, admitted with that peer as its source, off the event
+            // loop (its signatures and proofs are checked); only an intent
+            // this node holds is forwarded.
+            Ok(NetworkEvent::BridgeIntentRelayed {
+                from,
+                family,
+                intent_bytes,
+                gossip_message_id,
+            }) => {
+                let mempool_task = mempool.clone();
+                let p2p_cmd_task = p2p_cmd.clone();
+                tokio::spawn(async move {
+                    let result = jetsam_node::bridge_intents::submit_relayed_bridge_intent(
+                        &mempool_task,
+                        from,
+                        family,
+                        &intent_bytes,
+                    )
+                    .await;
+                    if let Err(error) = &result {
+                        tracing::debug!(peer = %from, ?family, %error, "relayed bridge intent not held");
+                    }
+                    resolve_tx_gossip(
+                        &p2p_cmd_task,
+                        from,
+                        Some(gossip_message_id),
+                        jetsam_node::bridge_intents::relayed_intent_acceptance(&result),
+                    );
+                });
             }
             Ok(NetworkEvent::NewTx {
                 from,
@@ -14008,6 +15230,9 @@ async fn handle_p2p_events(
                 records,
                 snapshot_boundary,
             }) => {
+                // T3.10b: an answer to a branch probe is read by the observer
+                // too, off this loop; the batch goes on unchanged.
+                let _ = branch_probes.observe_answer(from, &records, &snapshot_header_store);
                 suffix_inventory_probe_peers.remove(&from);
                 if let Some(boundary) = snapshot_boundary.filter(|boundary| {
                     boundary.height > 0
@@ -14115,6 +15340,30 @@ async fn handle_p2p_events(
                         continue;
                     }
                 }
+                // v1.7 gate 1: the very bytes of a body this node refused
+                // for a branch without v1.7 prove the sender on that branch:
+                // refused before its headers or its inventory count.
+                if let Some(height) = refuse_advertised_branch_body(
+                    &mut header_dag,
+                    &mut peer_chain_evidence,
+                    from,
+                    &records,
+                    probe_now,
+                ) {
+                    mining_peer_quorum.reject_incompatible(from);
+                    retire_snapshot_plan_refused_through!(from, height);
+                    warn_branch_once!(
+                        from,
+                        "body of a branch without v1.7",
+                        peer = %from,
+                        height,
+                        "this peer advertises a block body without the v1.7 destination \
+                         section at or above the v1.7 height: it follows a branch that did not \
+                         upgrade, and supplies nothing to this node any more (kept for {} min)",
+                        peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
+                    );
+                    continue;
+                }
                 // See the announcement path: a rejected source brings no
                 // headers (M3.10).
                 if rejected_suffix_object_peers.contains(&from)
@@ -14201,16 +15450,20 @@ async fn handle_p2p_events(
                     );
                 }
 
-                let plan = plan_header_inventory(
+                // The plan settles the sender's verdict first
+                // (`inventory_verdict`, A3 §4).
+                let plan = inventory_verdict::plan_and_settle(
                     &chain,
                     &snapshot_header_store,
-                    &header_dag,
+                    &mut header_dag,
+                    &mut peer_chain_evidence,
+                    from,
                     records,
+                    Instant::now(),
                 )
                 .await;
                 match plan {
                     Ok(HeaderInventoryPlan::Confirmed { tip }) => {
-                        peer_chain_evidence.confirm_compatible_through(from, tip.height);
                         if active_suffix_sync.is_none() && tip.height >= highest_announced {
                             clear_manifest_round_state!();
                             mark_initial_sync_ready(&initial_sync_ready);
@@ -14255,7 +15508,6 @@ async fn handle_p2p_events(
                         old_tip,
                         target,
                     }) => {
-                        peer_chain_evidence.confirm_compatible_through(from, target.height);
                         if let Err(error) = record_validated_headers(&mut header_dag, &headers) {
                             header_dag_faulted = true;
                             tracing::warn!(
@@ -14736,7 +15988,6 @@ async fn handle_p2p_events(
                     Ok(HeaderInventoryPlan::FinalizedDivergence) => {
                         let finalized_height = header_dag.finalized().height;
                         mining_peer_quorum.reject_incompatible(from);
-                        refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, finalized_height, Instant::now());
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
                         warn_branch_once!(
@@ -14749,10 +16000,9 @@ async fn handle_p2p_events(
                     }
                     Ok(HeaderInventoryPlan::ConsensusFork { height, error }) => {
                         // v1.5.1: a header refused by a rule only a fork
-                        // explains marks its sender, like a missing common
-                        // ancestor does (c3a011c only logged it).
+                        // explains marks its sender (`plan_and_settle`), like
+                        // a missing common ancestor does (c3a011c only logged it).
                         mining_peer_quorum.reject_incompatible(from);
-                        refuse_peer_branch(&mut header_dag, &mut peer_chain_evidence, from, height, Instant::now());
                         manifest_requested_peers.remove(&from);
                         manifest_force_snapshot_peers.remove(&from);
                         warn_branch_once!(
@@ -14814,6 +16064,48 @@ async fn handle_p2p_events(
                     continue;
                 }
                 manifest_requested_peers.remove(&from);
+                // D62: a manifest at or above J without v1.7 annexes is the
+                // mark of a branch that did not upgrade. Its sender is proven
+                // on that branch and the branch leaves the selection
+                // (`refuse_manifest_branch`); the manifest is then ignored as
+                // any refused sender's, below.
+                if let Some(v1_7_height) = branch_without_v1_7_manifest(
+                    &manifest,
+                    jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
+                ) {
+                    let committed = {
+                        let ctx = chain.read().await;
+                        jetsam_node::networking::ChainPoint::new(ctx.tip_height(), ctx.tip_hash())
+                    };
+                    let (height, best_changed) = refuse_manifest_branch(
+                        &mut header_dag,
+                        &mut peer_chain_evidence,
+                        &mut rejected_suffix_object_peers,
+                        from,
+                        &manifest,
+                        v1_7_height,
+                        committed,
+                        Instant::now(),
+                    );
+                    mining_peer_quorum.reject_incompatible(from);
+                    retire_snapshot_plan_refused_through!(from, height);
+                    if best_changed {
+                        highest_announced = committed.height.max(header_dag.best_tip().height);
+                    }
+                    warn_branch_once!(
+                        from,
+                        "manifest of a branch without v1.7",
+                        from = %from,
+                        boundary = manifest.tip_height,
+                        height,
+                        best_changed,
+                        best_height = header_dag.best_tip().height,
+                        "this peer offers a snapshot at or above the v1.7 height without the v1.7 \
+                         annexes: it follows a branch that did not upgrade, which leaves the \
+                         selection, and supplies nothing to this node any more (kept for {} min)",
+                        peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
+                    );
+                }
                 if peer_chain_evidence.is_divergent(&from, Instant::now()) {
                     warn_branch_once!(
                         from,
@@ -15007,6 +16299,7 @@ async fn handle_p2p_events(
                         our_tip,
                         &our_work,
                         validated_view,
+                        (!header_dag_faulted).then_some(&header_dag),
                     ) {
                         ManifestCandidacy::Admit => {
                             admitted_without_validated_view = validated_view.is_none();
@@ -15987,7 +17280,7 @@ async fn handle_p2p_events(
                         }
                     }
                 }
-                tracing::debug!(peer = %peer, "peer disconnected");
+                tracing::info!(peer = %peer, "peer disconnected");
                 let retry_terminal = snapshot_boundary_terminal_inflight
                     .as_mut()
                     .and_then(|pending| {
@@ -16432,6 +17725,42 @@ async fn handle_p2p_events(
                         ));
                     }
                     snapshot_header_pipeline = None;
+                    // S-1 (audit 2026-11-10): the staged chain is complete only
+                    // if its tip is the claimed boundary. Before, a boundary
+                    // claimed on or below the real tip with another block
+                    // reached this point on the real headers, counted as
+                    // verified authority (it no longer yielded nor stalled),
+                    // and was refuted only once a terminal had come and failed.
+                    let mut sync = sync;
+                    if !staged_chain_holds_the_claimed_boundary(&mut sync.staging, &sync.manifest) {
+                        let providers = pending_manifest
+                            .as_ref()
+                            .map(|pending| pending.providers.iter().copied().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let local_height = sync.staging.base().header.height;
+                        learn_from_failed_snapshot_claim(
+                            &mut peer_chain_evidence,
+                            &sync.manifest,
+                            providers.iter().copied(),
+                            Some(&mut sync.staging),
+                            local_height,
+                            false,
+                            Instant::now(),
+                        );
+                        tracing::warn!(
+                            boundary = sync.manifest.tip_height,
+                            claimed_hash = %hex::encode(sync.manifest.tip_hash),
+                            providers = providers.len(),
+                            "the headers this node validated reach the snapshot boundary's height \
+                             with another block or other work — the boundary is refuted, whoever \
+                             offers it"
+                        );
+                        let preferred_peer = sync.preferred_peer;
+                        cleanup_snapshot_header_staging_offthread(sync.staging);
+                        retire_snapshot_plan!();
+                        request_bounded_manifest_failover!(preferred_peer, false);
+                        continue;
+                    }
                     let terminal_height = sync.manifest.tip_height;
                     let terminal_hash = sync.manifest.tip_hash;
                     if let Some(payload) = prefetched_snapshot_boundary_terminal.take() {
@@ -16575,6 +17904,9 @@ async fn handle_p2p_events(
                 Ok(AppliedExactSuffix::Reorg(applied)) => {
                     let reverted = applied.result.reverted_heights.len();
                     let applied_blocks = applied.result.applied_heights.len();
+                    // T3.10b: an accepted reorganization is recorded too.
+                    let _ = branch_probes
+                        .observe_reorg(&applied.result.reverted_heights, &snapshot_header_store);
                     let selected_tip_committed = !header_dag_faulted
                         && header_dag.best_tip() == completed.target;
                     if selected_tip_committed {
@@ -16686,6 +18018,45 @@ async fn handle_p2p_events(
                             best_changed,
                             best_height = header_dag.best_tip().height,
                             "tip whose terminal every provider failed forgotten"
+                        );
+                    }
+                    // v1.7 gate 1: a body of a branch without v1.7. Its
+                    // source and every provider of the same bytes are proven
+                    // on that branch, and the branch leaves the selection
+                    // (`refuse_branch_body`): never a wait on it.
+                    if let Some((source, body)) = error.refused_branch_body() {
+                        let (refused, best_changed) = refuse_branch_body(
+                            &mut header_dag,
+                            &mut peer_chain_evidence,
+                            source,
+                            body,
+                            Instant::now(),
+                        );
+                        for peer in &refused {
+                            mining_peer_quorum.reject_incompatible(*peer);
+                            retire_snapshot_plan_refused_through!(*peer, body.claim.height);
+                            warn_branch_once!(
+                                *peer,
+                                "body of a branch without v1.7",
+                                peer = %peer,
+                                height = body.claim.height,
+                                "this peer serves a block body without the v1.7 destination \
+                                 section at or above the v1.7 height: it follows a branch that \
+                                 did not upgrade, and supplies nothing to this node any more \
+                                 (kept for {} min)",
+                                peer_chain_evidence::PEER_CHAIN_EVIDENCE_TTL.as_secs() / 60
+                            );
+                        }
+                        let committed_height = chain.read().await.tip_height();
+                        highest_announced = committed_height.max(header_dag.best_tip().height);
+                        tracing::warn!(
+                            height = body.claim.height,
+                            hash = %hex::encode(&body.claim.block_hash[..8]),
+                            refused_peers = refused.len(),
+                            best_changed,
+                            best_height = header_dag.best_tip().height,
+                            "branch without v1.7 refused: its block left the selection with its \
+                             descendants"
                         );
                     }
                     tracing::warn!(
@@ -17634,6 +19005,8 @@ async fn handle_p2p_events(
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
             let now = Instant::now();
+            // H-2: the object quarantine is saved with the verdicts (its TTL from the first time it is noted)
+            peer_chain_evidence.note_object_quarantine(rejected_suffix_object_peers.iter(), now);
             if peer_chain_evidence.take_changed() {
                 if let Err(error) = peer_chain_evidence.save_verdicts(
                     &peer_verdicts_path,
@@ -17653,6 +19026,31 @@ async fn handle_p2p_events(
             {
                 refused_branch_peers_sent = refused_branch_peers;
             }
+            // T3.10b: the refused branches are probed and recorded; a probed
+            // peer's connection is kept meanwhile (`ProbingPeers`).
+            branch_probes.heartbeat(
+                peer_chain_evidence.divergence_heights(now),
+                &refused_branch_peers_sent,
+                &manifest_peers,
+                &fetch_in_progress.clone(),
+                unix_now(),
+                |probe| {
+                    try_dispatch_header_fetch(
+                        &p2p_cmd,
+                        &mut fetch_in_progress,
+                        &mut recent_header_fetches,
+                        probe.peer,
+                        probe.start_height,
+                        probe.count,
+                        now,
+                    )
+                },
+                |peers| {
+                    p2p_cmd
+                        .try_send(jetsam_p2p::NetworkCommand::ProbingPeers { peers })
+                        .is_ok()
+                },
+            );
             if let Some(summary) = branch_warnings.summary_due(now) {
                 for (peer, motif, repeats) in summary {
                     tracing::info!(
@@ -18028,8 +19426,23 @@ async fn handle_p2p_events(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                for peer in &claimants {
-                    peer_chain_evidence.mark_unserved_claim(*peer, boundary, now);
+                // S-1 (audit 2026-11-10): the record above is an identity,
+                // which a fresh one erases. What the stall proved is kept for
+                // whoever offers next: this boundary, the headers staged and
+                // validated toward it, and — within direct reach of the tip —
+                // the height past which no connected peer served a header.
+                if let Some(pending) = pending_manifest.as_ref() {
+                    learn_from_failed_snapshot_claim(
+                        &mut peer_chain_evidence,
+                        &pending.manifest,
+                        claimants.iter().copied(),
+                        pending_snapshot_header_sync
+                            .as_mut()
+                            .map(|sync| &mut sync.staging),
+                        our_height,
+                        true,
+                        now,
+                    );
                 }
                 tracing::warn!(
                     boundary,
@@ -18745,22 +20158,60 @@ async fn handle_p2p_events(
                 }
             }
 
-            // A node without a validated header view plans
-            // the boundary most peers offered during its election window,
-            // not the first one admitted.
+            // A node without a validated header view plans, among the
+            // boundaries offered during its election window and still
+            // admitted at its close, one its own headers validated, else the
+            // highest (S-1: never by the number of identities offering it).
             if cold_snapshot_ballot_opened.is_some_and(|opened| {
                 now.saturating_duration_since(opened) >= COLD_SNAPSHOT_ELECTION_WINDOW
             }) {
                 cold_snapshot_ballot_opened = None;
                 let mut ballot = std::mem::take(&mut cold_snapshot_ballot);
-                ballot.retain(|(generation, peer, _, _)| {
-                    *generation == snapshot_sync_generation
-                        && !peer_chain_evidence.is_divergent(peer, now)
-                        && peer_chain_evidence.unserved_claim(peer, now).is_none()
+                // S-1 (audit 2026-11-10): every offer is judged again at the
+                // close, on what this node knows then — tip authority gained
+                // during the window (a restarted seed whose tip a peer has
+                // just confirmed), headers validated since, plans that went
+                // unserved meanwhile. Before, an offer admitted cold stayed
+                // admitted, whatever the node had learnt.
+                let (close_tip, close_work) = {
+                    let ctx = chain.read().await;
+                    (
+                        jetsam_node::networking::ChainPoint::new(ctx.tip_height(), ctx.tip_hash()),
+                        *ctx.tip_chain_work(),
+                    )
+                };
+                let cold_headers = (!header_dag_faulted).then_some(&header_dag);
+                let tip_authority = *initial_sync_ready.borrow() && snapshot_rebase_hint.is_none();
+                let offered = ballot.len();
+                ballot.retain(|(generation, peer, manifest, rebase_anchor)| {
+                    cold_offer_admitted_at_close(
+                        *generation,
+                        peer,
+                        manifest,
+                        rebase_anchor.is_some(),
+                        snapshot_sync_generation,
+                        jetsam_chain::consensus::params::HARD_CHECKPOINTS,
+                        &peer_chain_evidence,
+                        cold_headers,
+                        tip_authority,
+                        close_tip,
+                        &close_work,
+                        now,
+                    )
                 });
+                log_cold_election_refusals(offered, ballot.len());
                 let offers = ballot
                     .iter()
-                    .map(|(_, _, manifest, _)| (manifest.tip_height, manifest.tip_hash))
+                    .map(|(_, _, manifest, _)| ColdSnapshotOffer {
+                        height: manifest.tip_height,
+                        hash: manifest.tip_hash,
+                        validated: snapshot_boundary_validated(
+                            manifest,
+                            &peer_chain_evidence,
+                            cold_headers,
+                            now,
+                        ),
+                    })
                     .collect::<Vec<_>>();
                 if let Some(elected) = elect_cold_snapshot_boundary(&offers) {
                     let (_, from, manifest, rebase_anchor) = ballot.swap_remove(elected);
@@ -18777,16 +20228,13 @@ async fn handle_p2p_events(
                                 .is_some_and(|objects| objects.awaits_matrices()),
                         );
                     if plannable {
-                        let votes = offers
-                            .iter()
-                            .filter(|offer| **offer == offers[elected])
-                            .count();
                         tracing::info!(
                             from = %from,
                             tip = manifest.tip_height,
-                            votes,
+                            validated = offers[elected].validated,
                             offers = offers.len(),
-                            "snapshot election closed: validating the boundary most peers offered"
+                            "snapshot election closed: staging the boundary its own headers \
+                             validated, else the highest offered"
                         );
                         candidate_manifest_providers.clear();
                         candidate_manifest_providers.insert(from);
@@ -19085,6 +20533,7 @@ async fn apply_verified_snapshot_boundary(
     history_step: VerifiedHistoryStepSnapshot,
     wallet_operation_gate: &WalletOperationGate,
     external_mining_attempts: &ExternalMiningAttemptInvalidator,
+    annexes: Result<jetsam_chain::storage::SnapshotAnnexes, String>,
 ) -> Result<AppliedVerifiedSnapshot, SnapshotInstallError> {
     if history_step.height != manifest.tip_height || history_step.block_hash != manifest.tip_hash {
         drop_verified_history_step(history_step);
@@ -19111,6 +20560,15 @@ async fn apply_verified_snapshot_boundary(
                     "snapshot manifest client registry is not canonical".into(),
                 ));
             }
+        }
+    };
+    // v1.7 (T7.1): the annexes fetched for it; what they are worth is decided
+    // by the install, against the installed state and headers.
+    let annexes = match annexes {
+        Ok(annexes) => annexes,
+        Err(error) => {
+            drop_verified_history_step(history_step);
+            return Err(SnapshotInstallError::Rejected(error));
         }
     };
     let VerifiedHistoryStepSnapshot {
@@ -19150,6 +20608,7 @@ async fn apply_verified_snapshot_boundary(
             &mut headers,
             allow_nonfinal_rebase,
             &client_registry,
+            &annexes,
         ) {
             drop(ctx);
             let _ = headers.discard();
@@ -19305,12 +20764,25 @@ enum ManifestCandidacy {
 ///   progress, HeaderDAG sound), the boundary must be on the HeaderDAG's
 ///   selected chain with exactly that work — or beyond the validated view
 ///   while that view is itself a snapshot gap above the local tip;
-/// * otherwise a sender whose last snapshot plan went unserved (it verified
-///   nothing and stalled) offers no candidate while that record holds: a
-///   boundary claimed above the real tip costs the node the staging of the
-///   real headers and the stall delay, once per sender, not once per cycle;
+/// * otherwise (S-1, audit 2026-11-10) a boundary at a point of a header
+///   chain this node validated itself, with exactly that work
+///   ([`snapshot_boundary_validated`]), is admitted whoever sends it: its
+///   work is verified, not announced;
+/// * any other boundary at or below the highest header this node validated
+///   is refused whoever sends it (it would cost a staging to refute, once
+///   per identity);
+/// * so is a boundary whose plan went unserved, or that validated headers
+///   refuted;
+/// * and any boundary above the height where an unverified plan last went
+///   unserved within direct reach of the local tip, while that record holds
+///   and no validated header shows a snapshot gap above it;
+/// * a sender whose last snapshot plan went unserved (it verified
+///   nothing and stalled) offers no candidate while that record holds;
 /// * and its sender must have shown the highest pinned block below the
 ///   boundary, so the boundary cannot descend from a refused branch.
+///
+/// `cold_headers` are the HeaderDAG's validated headers, used without tip
+/// authority: as verified work, and as the highest height validated.
 #[allow(clippy::too_many_arguments)]
 fn judge_snapshot_manifest(
     manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
@@ -19321,6 +20793,7 @@ fn judge_snapshot_manifest(
     local_tip: jetsam_node::networking::ChainPoint,
     local_work: &[u8; 32],
     validated_view: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+    cold_headers: Option<&jetsam_node::networking::header_dag::HeaderDag>,
 ) -> ManifestCandidacy {
     if evidence.is_divergent(sender, now) {
         return ManifestCandidacy::Refuse("its sender follows a branch this node refuses");
@@ -19361,6 +20834,31 @@ fn judge_snapshot_manifest(
             return ManifestCandidacy::Refuse("its boundary is beyond the validated header view");
         }
     }
+    // S-1: from here on the boundary is beyond any view with tip authority.
+    if snapshot_boundary_validated(manifest, evidence, cold_headers, now) {
+        return ManifestCandidacy::Admit;
+    }
+    let validated_top = evidence
+        .highest_validated_point(now)
+        .max(cold_headers.map(|dag| dag.best_tip().height));
+    if validated_top.is_some_and(|top| manifest.tip_height <= top) {
+        return ManifestCandidacy::Refuse(
+            "it is at or below the highest header this node validated, and not one of them",
+        );
+    }
+    if evidence.boundary_unserved(manifest.tip_height, manifest.tip_hash, now) {
+        return ManifestCandidacy::Refuse(
+            "its boundary went unserved or was refuted by validated headers",
+        );
+    }
+    if let Some(ceiling) = evidence.unserved_ceiling(now) {
+        let validated_best = validated_top.unwrap_or(local_tip.height).max(local_tip.height);
+        if manifest.tip_height > ceiling && !gap_requires_snapshot_sync(ceiling, validated_best) {
+            return ManifestCandidacy::Refuse(
+                "it is above the height where the last unverified snapshot plan went unserved",
+            );
+        }
+    }
     if evidence.unserved_claim(sender, now).is_some() {
         return ManifestCandidacy::Refuse("its sender's last snapshot plan went unserved");
     }
@@ -19396,6 +20894,28 @@ fn snapshot_plan_yields_to_tip_extension(
         && !plan_holds_verified_authority
 }
 
+/// v1.5.1 — whether the active snapshot plan is retired because one of its
+/// providers (`provider_of_plan`) was shown at `height` on a branch this node
+/// refuses, at or below the plan's `boundary`: its boundary then descends
+/// from a refused block (2026-10-13: 30 min 46 s behind such a plan).
+///
+/// S-1 (audit 2026-11-10): not without tip authority. There, the provider's
+/// behaviour is the provider's choice: serving one refused header ended its
+/// own plan at once, the next identity's claim won the next election, and the
+/// node never staged the real headers that would have shown the claims
+/// false. A cold node's unverified plan is judged on the headers it stages
+/// instead — refuted when they reach the boundary with another block, retired
+/// after its stall otherwise — and both teach every identity's next claim.
+fn provider_refusal_retires_snapshot_plan(
+    tip_authority: bool,
+    plan_holds_verified_authority: bool,
+    provider_of_plan: bool,
+    height: u64,
+    boundary: u64,
+) -> bool {
+    tip_authority && !plan_holds_verified_authority && provider_of_plan && height <= boundary
+}
+
 /// v1.5.1 — whether one discovery round for the active snapshot plan's
 /// exact generation is complete: a request went out, or no connected peer is
 /// left to ask (every one answered that it does not serve that generation).
@@ -19409,15 +20929,194 @@ fn snapshot_discovery_round_completed(dispatched: usize, askable_peers: usize) -
 /// admitted manifest became the plan at once.
 const COLD_SNAPSHOT_ELECTION_WINDOW: Duration = Duration::from_secs(3);
 
-/// Which of the snapshot boundaries `(height, hash)` offered during a cold
-/// node's election window becomes the plan: the one the most peers offered;
-/// on a tie the lowest (a boundary claimed above the real tip loses to a real
-/// one); then the first offered.
-fn elect_cold_snapshot_boundary(offers: &[(u64, [u8; 32])]) -> Option<usize> {
+/// S-1 (audit 2026-11-10): one snapshot boundary offered during a cold
+/// node's election window, judged again when the window closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColdSnapshotOffer {
+    height: u64,
+    hash: [u8; 32],
+    /// At a point of a header chain this node validated, with exactly the
+    /// claimed work ([`snapshot_boundary_validated`]).
+    validated: bool,
+}
+
+/// What the close of a cold node's election refused: before, offers judged
+/// again at the close and refused there vanished without a line, and a node
+/// whose every offer was refused sat silent until the next offer arrived.
+fn log_cold_election_refusals(offered: usize, kept: usize) {
+    let refused = offered.saturating_sub(kept);
+    if refused == 0 {
+        return;
+    }
+    if kept == 0 {
+        tracing::warn!(
+            offered,
+            refused,
+            "snapshot election closed with every offer refused at the close; \
+             the next offer opens a new election"
+        );
+    } else {
+        tracing::info!(
+            offered,
+            refused,
+            kept,
+            "snapshot election closed: offers refused at the close, electing among the rest"
+        );
+    }
+}
+
+/// Which of the snapshot boundaries offered during a cold node's election
+/// window becomes the plan (S-1, audit 2026-11-10): one this node's own
+/// headers validated, the highest of them; else the highest offered; then the
+/// lower block id; then the first offered. Never by the number of identities
+/// offering it — five Sybil peers outvoted two honest ones — and never the
+/// lower boundary first: one identity offering a fake just below the real
+/// boundary won the tie and walked the node up one claim at a time. The
+/// highest unverified boundary is staged first because its headers, validated
+/// from every connected peer, either reach it or show where the real chain
+/// stands: the plan is then refuted or stalls, and every real boundary below
+/// is validated for the next election.
+fn elect_cold_snapshot_boundary(offers: &[ColdSnapshotOffer]) -> Option<usize> {
     (0..offers.len()).min_by_key(|&index| {
-        let votes = offers.iter().filter(|offer| **offer == offers[index]).count();
-        (std::cmp::Reverse(votes), offers[index].0, index)
+        let offer = offers[index];
+        (
+            std::cmp::Reverse(offer.validated),
+            std::cmp::Reverse(offer.height),
+            offer.hash,
+            index,
+        )
     })
+}
+
+/// S-1 (audit 2026-11-10): whether `manifest`'s boundary is a point of a
+/// header chain this node validated against its own rules — the highest
+/// points of its last snapshot header stagings, or a header of the
+/// HeaderDAG — with exactly the work the manifest claims.
+fn snapshot_boundary_validated<H>(
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    evidence: &peer_chain_evidence::PeerChainEvidence<H>,
+    validated_headers: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+    now: Instant,
+) -> bool {
+    let claimed = (manifest.tip_hash, manifest.cumulative_chainwork);
+    evidence.validated_point(manifest.tip_height, now) == Some(claimed)
+        || validated_headers.is_some_and(|dag| {
+            dag.cumulative_work(jetsam_node::networking::ChainPoint::new(
+                manifest.tip_height,
+                manifest.tip_hash,
+            ))
+            .is_ok_and(|work| work == manifest.cumulative_chainwork)
+        })
+}
+
+/// S-1 (audit 2026-11-10): what a snapshot plan that verified nothing teaches
+/// when it ends without its boundary — it stalled (`stalled`), or the headers
+/// it staged reached the boundary's height with another block. Kept whatever
+/// identity offers next: the boundary itself, the highest points of the
+/// validated `staging`, and, after a stall within direct reach of the local
+/// tip (`local_height`), the height where nobody served a further header.
+/// Its `providers` are remembered too, as before.
+fn learn_from_failed_snapshot_claim<H>(
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    claim: &jetsam_p2p::protocol::GetStateManifestResponse,
+    providers: impl IntoIterator<Item = libp2p::PeerId>,
+    staging: Option<&mut jetsam_node::snapshot_header_staging::SnapshotHeaderStaging>,
+    local_height: u64,
+    stalled: bool,
+    now: Instant,
+) {
+    evidence.mark_unserved_boundary(claim.tip_height, claim.tip_hash, now);
+    for peer in providers {
+        evidence.mark_unserved_claim(peer, claim.tip_height, now);
+    }
+    let Some(staging) = staging else {
+        return;
+    };
+    match staging.recent_points(peer_chain_evidence::VALIDATED_POINT_CAPACITY as u64) {
+        Ok(points) => evidence.learn_validated_points(points, now),
+        Err(error) => tracing::warn!(
+            %error,
+            "the headers a failed snapshot plan validated could not be read back"
+        ),
+    }
+    if !stalled {
+        return;
+    }
+    match staging.next_height() {
+        Ok(next_height) => {
+            let staged_tip = next_height.saturating_sub(1);
+            if stalled_plan_draws_a_ceiling(local_height, staged_tip) {
+                evidence.mark_unserved_ceiling(staged_tip, now);
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "the staged tip of a stalled snapshot plan could not be read"
+        ),
+    }
+}
+
+/// S-1 (audit 2026-11-10): the staged header chain has reached the plan's
+/// boundary height. Whether its tip is the claimed boundary — that block,
+/// that cumulative work. Until v1.7 a complete staged chain counted as
+/// verified authority before its tip was compared with the claim.
+fn staged_chain_holds_the_claimed_boundary(
+    staging: &mut jetsam_node::snapshot_header_staging::SnapshotHeaderStaging,
+    claim: &jetsam_p2p::protocol::GetStateManifestResponse,
+) -> bool {
+    staging
+        .matches_exact_point(claim.tip_height, claim.tip_hash, claim.cumulative_chainwork)
+        .unwrap_or(false)
+}
+
+/// S-1 (audit 2026-11-10): whether an unverified plan that stalled once its
+/// validated headers reached `staged_tip` draws the ceiling of
+/// [`peer_chain_evidence::PeerChainEvidence::mark_unserved_ceiling`]: only
+/// within direct reach of the local tip (`local_height`) — a restarted seed,
+/// which needs no snapshot to catch up. Never a snapshot gap away: a node far
+/// behind needs the snapshot, and the real boundaries it waits for are the
+/// ones its staged headers just validated.
+fn stalled_plan_draws_a_ceiling(local_height: u64, staged_tip: u64) -> bool {
+    !gap_requires_snapshot_sync(local_height, staged_tip)
+}
+
+/// S-1 (audit 2026-11-10): whether an offer of a cold node's election is still
+/// a candidate when the window closes: of the current snapshot generation,
+/// still above the local tip, and admitted by [`judge_snapshot_manifest`] on
+/// what the node knows at the close — with tip authority gained meanwhile
+/// (`tip_authority`: initial sync done, no rebase armed; the offer itself
+/// asked for no rebase anchor), the synced node's rule applies.
+#[allow(clippy::too_many_arguments)]
+fn cold_offer_admitted_at_close(
+    generation: u64,
+    sender: &libp2p::PeerId,
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    asks_a_rebase: bool,
+    current_generation: u64,
+    pins: &[(u64, [u8; 32])],
+    evidence: &peer_chain_evidence::PeerChainEvidence<HeldSnapshotManifest>,
+    validated_headers: Option<&jetsam_node::networking::header_dag::HeaderDag>,
+    tip_authority: bool,
+    close_tip: jetsam_node::networking::ChainPoint,
+    close_work: &[u8; 32],
+    now: Instant,
+) -> bool {
+    let validated_view = (tip_authority && !asks_a_rebase)
+        .then_some(validated_headers)
+        .flatten();
+    generation == current_generation
+        && manifest.tip_height > close_tip.height
+        && judge_snapshot_manifest(
+            manifest,
+            pins,
+            evidence,
+            sender,
+            now,
+            close_tip,
+            close_work,
+            validated_view,
+            validated_headers,
+        ) == ManifestCandidacy::Admit
 }
 
 /// v1.5.1 — how long a snapshot plan that has verified nothing may go
@@ -19458,6 +21157,117 @@ fn refuse_peer_branch<H>(
     header_dag.remove_inventory_provider(peer);
 }
 
+/// v1.7 gate 1 (private rehearsal, 2026-10-31). `source` served `body`, a
+/// body of a branch without v1.7 ([`refused_branch_body`]). The bytes are
+/// remembered; `source` and every provider advertising the same bytes are
+/// proven on that branch ([`refuse_peer_branch`] at its height); and unless a
+/// provider offers another body for that block, the block leaves the
+/// HeaderDAG with all its descendants — beyond the plan's target too — so the
+/// best valid branch is selected again at once. Not condemned: an honest body
+/// of the same block, if it exists, may still be fetched. Returns the peers
+/// refused (ordered) and whether the best tip changed.
+///
+/// Before this, on the private chain, each v1.7 node refused the body of the
+/// v1.6 branch's 96' from one source at a time while its other peers kept the
+/// branch selected, and the heavier, unsuppliable tip held three nodes for
+/// ≈ 30 min (one waiting for a snapshot of that branch, its mining paused).
+fn refuse_branch_body<H>(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    source: libp2p::PeerId,
+    body: jetsam_p2p::object_protocol::BlockBodyObjectId,
+    now: Instant,
+) -> (Vec<libp2p::PeerId>, bool) {
+    evidence.refuse_body(body, now);
+    let mut peers = header_dag.providers_of_body(&body);
+    if !peers.contains(&source) {
+        peers.push(source);
+        peers.sort_by_key(|peer| peer.to_bytes());
+    }
+    for peer in &peers {
+        refuse_peer_branch(header_dag, evidence, *peer, body.claim.height, now);
+    }
+    let best_changed =
+        !header_dag.offers_other_body(&body) && header_dag.forget(&body.claim.block_hash);
+    (peers, best_changed)
+}
+
+/// v1.7 gate 1: a batch from `from` that advertises a body this node refused
+/// ([`refuse_branch_body`]) proves `from` on that branch: refused at the
+/// lowest such height, which is returned; the caller drops the batch.
+fn refuse_advertised_branch_body<H>(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    from: libp2p::PeerId,
+    records: &[jetsam_p2p::header_protocol::HeaderInventoryRecord],
+    now: Instant,
+) -> Option<u64> {
+    let height = evidence.refused_body_advertised(records.iter(), now)?;
+    refuse_peer_branch(header_dag, evidence, from, height, now);
+    Some(height)
+}
+
+/// D62 (decided 2026-11-01), the first contact gate 1 leaves open. At or
+/// above J, a snapshot manifest that carries no v1.7 annex is the mark of a
+/// branch without v1.7: every v1.7 export of a boundary at or above J carries
+/// at least the destination state (`v1_7_annex_files`), while the v1.6 branch
+/// that did not upgrade exports none. Returns J when `manifest` is such a
+/// mark under the v1.7 clock `v1_7_activation`.
+fn branch_without_v1_7_manifest(
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    v1_7_activation: Option<u64>,
+) -> Option<u64> {
+    v1_7_activation.filter(|j| manifest.tip_height >= *j && manifest.annexes.is_empty())
+}
+
+/// D62: `sender` offered `manifest`, the mark of a branch without v1.7 at or
+/// above `v1_7_height` ([`branch_without_v1_7_manifest`]).
+///
+/// The hole it closes: gate 1 knows that branch by the bodies it refused
+/// ([`refuse_branch_body`]). A node that never refused one and meets the
+/// branch when it is already more than 2 × `CONSENSUS_FINALITY_DEPTH` headers
+/// above the fork takes the snapshot path: it fetches no body, asks the peer
+/// that sent the branch for a manifest, and waited for a snapshot of that
+/// branch (private rehearsal P7a, 2026-10-31: miner M1, ≈ 30 min, its mining
+/// paused).
+///
+/// `sender` is proven on that branch ([`refuse_peer_branch`]) at the first
+/// block of the boundary's ancestry at or above J that the committed chain
+/// does not hold; that block leaves the HeaderDAG with all its descendants,
+/// so the best valid branch is selected again at once. Not condemned:
+/// announced again by another peer, the headers may come back. `sender`
+/// joins `rejected`, as the source of a refused body does: it brings no
+/// headers any more, so the branch does not come back through it (replay
+/// D62, 2026-11-01: a divergent sender's next batch brought it back, and a
+/// node at 103 froze there). A boundary the HeaderDAG does not hold, or one
+/// on the committed chain, refuses the sender alone, at the boundary.
+/// Returns the height `sender` is refused at and whether the best tip
+/// changed.
+fn refuse_manifest_branch<H>(
+    header_dag: &mut jetsam_node::networking::header_dag::HeaderDag,
+    evidence: &mut peer_chain_evidence::PeerChainEvidence<H>,
+    rejected: &mut std::collections::HashSet<libp2p::PeerId>,
+    sender: libp2p::PeerId,
+    manifest: &jetsam_p2p::protocol::GetStateManifestResponse,
+    v1_7_height: u64,
+    committed: jetsam_node::networking::ChainPoint,
+    now: Instant,
+) -> (u64, bool) {
+    let boundary =
+        jetsam_node::networking::ChainPoint::new(manifest.tip_height, manifest.tip_hash);
+    let first = header_dag
+        .common_ancestor(committed, boundary)
+        .and_then(|fork| {
+            header_dag.point_at_height(boundary, fork.height.saturating_add(1).max(v1_7_height))
+        })
+        .ok();
+    let height = first.map_or(manifest.tip_height, |point| point.height);
+    refuse_peer_branch(header_dag, evidence, sender, height, now);
+    quarantine_exact_suffix_sources(header_dag, rejected, &[sender]);
+    let best_changed = first.is_some_and(|point| header_dag.forget(&point.hash));
+    (height, best_changed)
+}
+
 #[cfg(test)]
 /// v1.5.1 — the stall of 2026-10-13 (forensic §4-5). A snapshot manifest
 /// from the 1.4.3 branch, which forks at 38 400' and is durably higher than
@@ -19470,7 +21280,7 @@ mod divergent_branch_capture_tests {
         header_dag::{HeaderDag, ValidatedHeader},
         ChainPoint,
     };
-    use peer_chain_evidence::PeerChainEvidence;
+    use peer_chain_evidence::{PeerChainEvidence, UNSERVED_CEILING_TTL};
 
     /// A validated chain from genesis: `len` children, each one block of the
     /// genesis target's work, in a HeaderDAG finalized at genesis.
@@ -19587,7 +21397,7 @@ mod divergent_branch_capture_tests {
             evidence.on_disconnect(&forked);
             let later = now + Duration::from_secs(60 * reconnection);
             assert_eq!(
-                judge_snapshot_manifest(&higher, &[], &evidence, &forked, later, tip, &local_work, None),
+                judge_snapshot_manifest(&higher, &[], &evidence, &forked, later, tip, &local_work, None, None),
                 ManifestCandidacy::Refuse("its sender follows a branch this node refuses"),
                 "reconnection {reconnection}"
             );
@@ -19614,7 +21424,7 @@ mod divergent_branch_capture_tests {
 
         for (peer, offered) in [(forked, &theirs), (honest, &ours)] {
             assert_eq!(
-                judge_snapshot_manifest(offered, &pins, &evidence, &peer, now, cold_tip, &[0; 32], None),
+                judge_snapshot_manifest(offered, &pins, &evidence, &peer, now, cold_tip, &[0; 32], None, None),
                 ManifestCandidacy::AwaitPinProof { pin_height: 16 }
             );
         }
@@ -19623,11 +21433,11 @@ mod divergent_branch_capture_tests {
         evidence.observe_headers(forked, [&their_16], &pins, now);
         evidence.observe_headers(honest, [&headers[15].header], &pins, now);
         assert_eq!(
-            judge_snapshot_manifest(&theirs, &pins, &evidence, &forked, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&theirs, &pins, &evidence, &forked, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Refuse("its sender follows a branch this node refuses")
         );
         assert_eq!(
-            judge_snapshot_manifest(&ours, &pins, &evidence, &honest, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&ours, &pins, &evidence, &honest, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Admit
         );
     }
@@ -19648,31 +21458,231 @@ mod divergent_branch_capture_tests {
         evidence.observe_headers(staller, [&headers[15].header], &pins, now);
         let next = manifest(28, [0xC3; 32], [0xFF; 32]);
         assert_eq!(
-            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Admit,
             "the pin proof alone admits it"
         );
         evidence.mark_unserved_claim(staller, 10_000, now);
         assert_eq!(
-            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&next, &pins, &evidence, &staller, now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::Refuse("its sender's last snapshot plan went unserved")
         );
     }
 
-    /// On a cold node the first admitted manifest was the
-    /// plan. A peer that answers first with a boundary above the real tip
-    /// won every cycle; the peers offering the real boundary now outvote it,
-    /// and a tie goes to the lower boundary.
+    fn offer(height: u64, salt: u8, validated: bool) -> ColdSnapshotOffer {
+        ColdSnapshotOffer {
+            height,
+            hash: [salt; 32],
+            validated,
+        }
+    }
+
+    /// Audit 2026-11-10, S-1. The cold election counted identities: five
+    /// Sybil peers offering a boundary above the real tip outvoted the two
+    /// offering a boundary this node had validated itself. Identities count
+    /// for nothing now: a validated boundary wins.
     #[test]
-    fn a_cold_node_plans_the_boundary_most_peers_offer() {
-        let (fake, real, newer) = ((50_000, [0xF0; 32]), (39_000, [0x39; 32]), (39_024, [0x3A; 32]));
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, real, real]), Some(1));
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, newer, real, newer]), Some(1));
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, real]), Some(1), "tie: the lower");
-        assert_eq!(elect_cold_snapshot_boundary(&[fake, newer, real]), Some(2), "tie: the lower");
-        assert_eq!(elect_cold_snapshot_boundary(&[real, (39_000, [0x40; 32])]), Some(0), "then the first");
-        assert_eq!(elect_cold_snapshot_boundary(&[real]), Some(0));
+    fn s1_sybil_identities_never_outvote_a_boundary_this_node_validated() {
+        let fake = offer(50_000, 0xF0, false);
+        let real = offer(39_000, 0x39, true);
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, fake, fake, fake, fake, real, real]), Some(5));
+        assert_eq!(elect_cold_snapshot_boundary(&[fake, fake, real]), Some(2));
+        let older_real = offer(38_994, 0x38, true);
+        assert_eq!(
+            elect_cold_snapshot_boundary(&[older_real, real, fake]),
+            Some(1),
+            "among validated boundaries, the highest"
+        );
         assert_eq!(elect_cold_snapshot_boundary(&[]), None);
+    }
+
+    /// S-1: on a tie the lower boundary won, so one identity offering a fake
+    /// boundary just below the real one beat it, and walked the node up one
+    /// claim at a time. Among unverified boundaries the highest is staged
+    /// first: its headers, validated from every connected peer, either reach
+    /// it or show where the real chain stands — after which every real
+    /// boundary below is validated and wins. Then the lower block id, then
+    /// the first offered: never a count.
+    #[test]
+    fn s1_a_boundary_offered_just_below_the_real_one_no_longer_wins() {
+        let fake_below = offer(38_994, 0xF0, false);
+        let real = offer(39_000, 0x39, false);
+        assert_eq!(elect_cold_snapshot_boundary(&[fake_below, real]), Some(1));
+        assert_eq!(elect_cold_snapshot_boundary(&[fake_below, fake_below, fake_below, real]), Some(3));
+        let twin = offer(39_000, 0x38, false);
+        assert_eq!(elect_cold_snapshot_boundary(&[real, real, twin]), Some(2), "then the lower id");
+        assert_eq!(elect_cold_snapshot_boundary(&[real, real]), Some(0), "then the first");
+    }
+
+    /// S-1: on a cold node the work a manifest claims was taken on trust
+    /// until its headers were staged, and its sender only had to replay the
+    /// (public) pinned header. A boundary at a point this node validated
+    /// itself, with exactly that work, is admitted whoever sends it — even a
+    /// sender with no pin proof and an unserved plan behind it; the same
+    /// height with any other block or work is not validated by it.
+    #[test]
+    fn s1_a_boundary_this_node_validated_is_admitted_whoever_sends_it() {
+        let (_, headers) = validated_chain(30);
+        let pins = pins_of(&headers, &[16]);
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        evidence.learn_validated_points(
+            headers[23..=29].iter().map(|header| (header.header.height, header.hash, header.cumulative_work)),
+            now,
+        );
+        let replayer = libp2p::PeerId::random();
+        evidence.mark_unserved_claim(replayer, 50_000, now);
+        let real = manifest(24, headers[23].hash, headers[23].cumulative_work);
+        assert!(snapshot_boundary_validated(&real, &evidence, None, now));
+        assert_eq!(
+            judge_snapshot_manifest(&real, &pins, &evidence, &replayer, now, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Admit
+        );
+        let other_block = manifest(24, [0xB2; 32], headers[23].cumulative_work);
+        let other_work = manifest(24, headers[23].hash, more_work(headers[23].cumulative_work, 1));
+        assert!(!snapshot_boundary_validated(&other_block, &evidence, None, now));
+        assert!(!snapshot_boundary_validated(&other_work, &evidence, None, now));
+        // A fresh identity that shows the pin: at or below the highest header
+        // this node validated, a boundary that is none of its points is
+        // refused (it would cost a staging to refute, once per identity).
+        let fresh = libp2p::PeerId::random();
+        evidence.observe_headers(fresh, [&headers[15].header], &pins, now);
+        for claim in [&other_block, &other_work, &manifest(12, [0xB3; 32], [0xFF; 32])] {
+            assert_eq!(
+                judge_snapshot_manifest(claim, &pins, &evidence, &fresh, now, cold_tip, &[0; 32], None, None),
+                ManifestCandidacy::Refuse("it is at or below the highest header this node validated, and not one of them")
+            );
+        }
+        let above = manifest(31, [0xB4; 32], more_work(headers[29].cumulative_work, 1));
+        assert_eq!(
+            judge_snapshot_manifest(&above, &pins, &evidence, &fresh, now, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Admit,
+            "above them, an unverified claim may still be staged"
+        );
+    }
+
+    /// S-1: the headers the HeaderDAG validated are verified work too, with
+    /// or without tip authority (a restarted seed's tip probes).
+    #[test]
+    fn s1_headers_the_dag_validated_verify_a_boundary_on_a_cold_node() {
+        let (dag, headers) = validated_chain(30);
+        let pins = pins_of(&headers, &[16]);
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let unproven = libp2p::PeerId::random();
+        let real = manifest(24, headers[23].hash, headers[23].cumulative_work);
+        assert!(snapshot_boundary_validated(&real, &evidence, Some(&dag), now));
+        assert_eq!(
+            judge_snapshot_manifest(&real, &pins, &evidence, &unproven, now, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::Admit,
+            "no pin proof needed"
+        );
+        let wrong_work = manifest(24, headers[23].hash, more_work(headers[23].cumulative_work, 3));
+        assert!(!snapshot_boundary_validated(&wrong_work, &evidence, Some(&dag), now));
+        assert_eq!(
+            judge_snapshot_manifest(&wrong_work, &pins, &evidence, &unproven, now, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::Refuse("it is at or below the highest header this node validated, and not one of them")
+        );
+        let above = manifest(31, [0xB4; 32], more_work(headers[29].cumulative_work, 1));
+        assert_eq!(
+            judge_snapshot_manifest(&above, &pins, &evidence, &unproven, now, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::AwaitPinProof { pin_height: 16 },
+            "above them, the v1.5.1 pin proof still applies"
+        );
+    }
+
+    /// S-1, along the node's own path: a cold node staged the real headers
+    /// toward a boundary claimed above the real tip; nobody served a header
+    /// past the real tip and the plan was retired after its stall delay. A
+    /// fresh identity, with the pin replayed, then offered the same boundary
+    /// or any other above it, and was a clean candidate (freeze after
+    /// freeze). What the stall taught now holds for every identity.
+    #[test]
+    fn s1_after_an_unserved_plan_no_fresh_identity_restarts_the_freeze() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let base = jetsam_node::snapshot_header_staging::CanonicalHeaderBoundary::load(&ctx.store, 0).unwrap();
+        let mut staging = jetsam_node::snapshot_header_staging::SnapshotHeaderStaging::create_at_canonical_boundary(
+            &directory.path().join("stage"),
+            &ctx.store,
+            base,
+        )
+        .unwrap();
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let cold_tip = ChainPoint::new(0, block_id(&genesis));
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        let (staller, fresh) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        let claim = manifest(50_000, [0xF0; 32], [0xFF; 32]);
+        learn_from_failed_snapshot_claim(&mut evidence, &claim, [staller], Some(&mut staging), 0, true, now);
+
+        let later = now + Duration::from_secs(5);
+        assert_eq!(
+            judge_snapshot_manifest(&claim, &[], &evidence, &fresh, later, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Refuse("its boundary went unserved or was refuted by validated headers"),
+            "the same boundary, from a fresh identity"
+        );
+        let other = manifest(60_000, [0xF1; 32], [0xFF; 32]);
+        assert_eq!(
+            judge_snapshot_manifest(&other, &[], &evidence, &fresh, later, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Refuse("it is above the height where the last unverified snapshot plan went unserved"),
+            "any other boundary above where nobody served a header"
+        );
+        assert_eq!(
+            judge_snapshot_manifest(&other, &[], &evidence, &fresh, now + UNSERVED_CEILING_TTL, cold_tip, &[0; 32], None, None),
+            ManifestCandidacy::Admit,
+            "the ceiling holds for its TTL only"
+        );
+        // A validated header chain a snapshot gap above the ceiling releases it.
+        let (dag, headers) = validated_chain(30);
+        let far = manifest(31, [0xF2; 32], more_work(headers[29].cumulative_work, 1));
+        assert_eq!(
+            judge_snapshot_manifest(&far, &[], &evidence, &fresh, later, cold_tip, &[0; 32], None, Some(&dag)),
+            ManifestCandidacy::Admit
+        );
+    }
+
+    /// S-1: a plan whose staged headers reached its boundary height with
+    /// another block (a boundary claimed on or below the real tip) is refuted
+    /// by those headers — until v1.7 the complete staged chain counted as
+    /// verified authority first. The boundary is refused whoever offers it,
+    /// but no ceiling is drawn: the chain may go on above it.
+    #[test]
+    fn s1_a_boundary_refuted_by_validated_headers_is_refused_whoever_offers_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let base = jetsam_node::snapshot_header_staging::CanonicalHeaderBoundary::load(&ctx.store, 0).unwrap();
+        let mut staging = jetsam_node::snapshot_header_staging::SnapshotHeaderStaging::create_at_canonical_boundary(
+            &directory.path().join("stage"),
+            &ctx.store,
+            base,
+        )
+        .unwrap();
+        let real = manifest(0, base.block_hash, base.cumulative_chainwork);
+        let fake = manifest(0, [0xF0; 32], base.cumulative_chainwork);
+        let heavier = manifest(0, base.block_hash, [0xFF; 32]);
+        assert!(staged_chain_holds_the_claimed_boundary(&mut staging, &real));
+        assert!(!staged_chain_holds_the_claimed_boundary(&mut staging, &fake), "another block");
+        assert!(!staged_chain_holds_the_claimed_boundary(&mut staging, &heavier), "other work");
+
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let claim = manifest(40, [0xF0; 32], [0xFF; 32]);
+        let liar = libp2p::PeerId::random();
+        learn_from_failed_snapshot_claim(&mut evidence, &claim, [liar], Some(&mut staging), 0, false, now);
+        assert!(evidence.boundary_unserved(40, [0xF0; 32], now));
+        assert_eq!(evidence.unserved_claim(&liar, now), Some(40));
+        assert_eq!(evidence.unserved_ceiling(now), None, "a refutation draws no ceiling");
     }
 
     #[test]
@@ -19685,7 +21695,7 @@ mod divergent_branch_capture_tests {
         let cold_tip = ChainPoint::new(0, block_id(&genesis));
         let other_24 = manifest(24, [0xB2; 32], more_work([0; 32], 40));
         assert_eq!(
-            judge_snapshot_manifest(&other_24, &pins, &evidence, &libp2p::PeerId::random(), now, cold_tip, &[0; 32], None),
+            judge_snapshot_manifest(&other_24, &pins, &evidence, &libp2p::PeerId::random(), now, cold_tip, &[0; 32], None, None),
             ManifestCandidacy::ContradictsPin { height: 24 }
         );
     }
@@ -19703,12 +21713,12 @@ mod divergent_branch_capture_tests {
         let peer = libp2p::PeerId::random();
         let taller_but_lighter = manifest(28, [0x01; 32], more_work([0; 32], 10));
         assert_eq!(
-            judge_snapshot_manifest(&taller_but_lighter, &[], &evidence, &peer, now, tip, &local_work, None),
+            judge_snapshot_manifest(&taller_but_lighter, &[], &evidence, &peer, now, tip, &local_work, None, None),
             ManifestCandidacy::Refuse("it carries no more work than the local tip")
         );
         let heavier = manifest(28, [0x01; 32], more_work(local_work, 8));
         assert_eq!(
-            judge_snapshot_manifest(&heavier, &[], &evidence, &peer, now, tip, &local_work, None),
+            judge_snapshot_manifest(&heavier, &[], &evidence, &peer, now, tip, &local_work, None, None),
             ManifestCandidacy::Admit
         );
     }
@@ -19731,22 +21741,22 @@ mod divergent_branch_capture_tests {
         let local_work = headers[19].cumulative_work;
         let on_chain = manifest(36, headers[35].hash, headers[35].cumulative_work);
         assert_eq!(
-            judge_snapshot_manifest(&on_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&on_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Admit
         );
         let off_chain = manifest(36, [0xB2; 32], more_work(headers[35].cumulative_work, 5));
         assert_eq!(
-            judge_snapshot_manifest(&off_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&off_chain, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Refuse("its boundary is not on the validated header chain")
         );
         let wrong_work = manifest(36, headers[35].hash, more_work(headers[35].cumulative_work, 5));
         assert_eq!(
-            judge_snapshot_manifest(&wrong_work, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&wrong_work, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Refuse("its boundary is not on the validated header chain")
         );
         let beyond_far_view = manifest(70, [0xC3; 32], more_work(headers[59].cumulative_work, 20));
         assert_eq!(
-            judge_snapshot_manifest(&beyond_far_view, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&beyond_far_view, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Admit
         );
 
@@ -19756,15 +21766,159 @@ mod divergent_branch_capture_tests {
         let local_work = headers[59].cumulative_work;
         let mseed2 = manifest(68, [0xB2; 32], more_work(local_work, 20));
         assert_eq!(
-            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, Some(&dag)),
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, Some(&dag), None),
             ManifestCandidacy::Refuse("its boundary is beyond the validated header view")
         );
         // Without tip authority (cold bootstrap) the same claim may be staged:
         // staging validates every header against the node's rules.
         assert_eq!(
-            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None),
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None, None),
             ManifestCandidacy::Admit
         );
+    }
+
+    /// S-1, along the node's own path with a header this node really
+    /// validates (the pre-mined child of genesis that the staging tests use):
+    /// a claim naming another block at that height is refuted once staging
+    /// reaches it, and the staged point is learnt — the real boundary there is
+    /// then admitted whoever sends it, any other block there is refused
+    /// whoever sends it. (Added after the red run: its red is mutation m12,
+    /// which stops the learning.)
+    #[test]
+    fn s1_the_headers_a_refuted_plan_staged_judge_every_next_claim() {
+        use jetsam_chain::consensus::{asert_anchor_height, expected_target, AnchorInfo};
+        // As `snapshot_header_staging::tests::FIXTURE_CHAIN_NONCE`.
+        const FIXTURE_CHAIN_NONCE: u128 = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
+            611_542
+        } else {
+            162_878
+        };
+        let genesis = jetsam_chain::consensus::genesis_header();
+        let anchor_height = asert_anchor_height(genesis.height);
+        assert_eq!(anchor_height, 0);
+        let child = jetsam_chain::block_header::BlockHeader {
+            prev_block_hash: jetsam_chain::hash_block_header(&genesis),
+            state_root: [1; 32],
+            tx_root: [0x41; 32],
+            timestamp: genesis.timestamp + jetsam_chain::consensus::params::block_time_at(1),
+            height: 1,
+            miner_address: genesis.miner_address,
+            nonce: FIXTURE_CHAIN_NONCE,
+            difficulty_target: expected_target(
+                &AnchorInfo {
+                    anchor_height,
+                    anchor_timestamp: genesis.timestamp,
+                    anchor_parent_timestamp: genesis.timestamp,
+                    anchor_target: genesis.difficulty_target,
+                },
+                1,
+                genesis.timestamp,
+            ),
+            log_slots: genesis.log_slots,
+            active_slot_count: genesis.active_slot_count,
+            alloc_counter: genesis.alloc_counter,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = jetsam_chain::storage::MdbxChainContext::open_or_create(
+            &directory.path().join("chain"),
+        )
+        .unwrap();
+        let base = jetsam_node::snapshot_header_staging::CanonicalHeaderBoundary::load(&ctx.store, 0).unwrap();
+        let mut staging = jetsam_node::snapshot_header_staging::SnapshotHeaderStaging::create(
+            &directory.path().join("stage"),
+            &ctx.store,
+            base,
+        )
+        .unwrap();
+        staging.append_batch(&ctx.store, &[child]).unwrap();
+        let real_work = jetsam_chain::add_work(
+            &base.cumulative_chainwork,
+            &jetsam_chain::block_work(&child.difficulty_target),
+        );
+        let real = manifest(1, jetsam_chain::hash_block_header(&child), real_work);
+        let fake = manifest(1, [0xF0; 32], more_work(real_work, 40));
+        assert!(staged_chain_holds_the_claimed_boundary(&mut staging, &real));
+        assert!(!staged_chain_holds_the_claimed_boundary(&mut staging, &fake));
+
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::default();
+        let (liar, fresh) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        learn_from_failed_snapshot_claim(&mut evidence, &fake, [liar], Some(&mut staging), 0, false, now);
+        let cold_tip = ChainPoint::new(0, base.block_hash);
+        assert!(snapshot_boundary_validated(&real, &evidence, None, now));
+        assert_eq!(
+            judge_snapshot_manifest(&real, &[], &evidence, &liar, now, cold_tip, &base.cumulative_chainwork, None, None),
+            ManifestCandidacy::Admit,
+            "the real boundary, even from the liar"
+        );
+        for claim in [&fake, &manifest(1, [0xF3; 32], more_work(real_work, 2))] {
+            assert_eq!(
+                judge_snapshot_manifest(claim, &[], &evidence, &fresh, now, cold_tip, &base.cumulative_chainwork, None, None),
+                ManifestCandidacy::Refuse("it is at or below the highest header this node validated, and not one of them")
+            );
+        }
+    }
+
+    /// S-1: a seed restarted on the tip. A peer offered a boundary 8 above
+    /// it during the election window and was admitted cold; meanwhile a tip
+    /// probe confirmed the seed's tip (tip authority), and the offer was
+    /// still planned when the window closed — its staging held the seed's
+    /// imports until its stall. Every offer is judged again at the close, on
+    /// what the node knows then.
+    #[test]
+    fn s1_a_cold_offer_is_judged_again_when_the_election_closes() {
+        let (dag, headers) = validated_chain(60);
+        let tip = headers[59].point();
+        let local_work = headers[59].cumulative_work;
+        let now = Instant::now();
+        let evidence = PeerChainEvidence::default();
+        let peer = libp2p::PeerId::random();
+        let mseed2 = manifest(68, [0xB2; 32], more_work(local_work, 20));
+        assert_eq!(
+            judge_snapshot_manifest(&mseed2, &[], &evidence, &peer, now, tip, &local_work, None, None),
+            ManifestCandidacy::Admit,
+            "admitted while cold"
+        );
+        let at_close = |generation: u64, rebase: bool, authority: bool, close_tip: ChainPoint| {
+            cold_offer_admitted_at_close(
+                generation, &peer, &mseed2, rebase, 7, &[], &evidence, Some(&dag), authority, close_tip,
+                &local_work, now,
+            )
+        };
+        assert!(!at_close(7, false, true, tip), "tip authority gained during the window");
+        assert!(at_close(7, false, false, tip), "still cold: staging will judge it");
+        assert!(at_close(7, true, true, tip), "an offer that asks a rebase is judged as on arrival");
+        assert!(!at_close(6, false, false, tip), "another generation");
+        assert!(!at_close(7, false, false, ChainPoint::new(68, [0xB2; 32])), "no longer above the tip");
+    }
+
+    /// S-1: the ceiling drawn after a stall holds only within direct reach of
+    /// the local tip (a restarted seed, which needs no snapshot). A new node
+    /// a snapshot gap behind gets none: it needs the snapshot, and the real
+    /// boundaries it waits for are just below the headers its stalled plan
+    /// validated.
+    #[test]
+    fn s1_a_stall_a_snapshot_gap_below_the_real_tip_draws_no_ceiling() {
+        let reach = jetsam_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_000), "a seed restarted on the tip");
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_005));
+        assert!(stalled_plan_draws_a_ceiling(46_000, 46_000 + reach));
+        assert!(!stalled_plan_draws_a_ceiling(46_000, 46_000 + reach + 1));
+        assert!(!stalled_plan_draws_a_ceiling(0, 50_000), "a new node");
+    }
+
+    /// S-1: on a cold node a provider ended its own plan whenever it chose,
+    /// by serving one refused header, and a fresh identity's claim took the
+    /// next election — the real headers were never staged, so nothing ever
+    /// showed the claims false. Without tip authority the plan stays and is
+    /// judged on the headers it stages; with it, v1.5.1 holds unchanged.
+    #[test]
+    fn s1_a_provider_cannot_end_a_cold_plan_at_will() {
+        assert!(!provider_refusal_retires_snapshot_plan(false, false, true, 40_000, 50_000), "cold");
+        assert!(provider_refusal_retires_snapshot_plan(true, false, true, 40_000, 50_000));
+        assert!(!provider_refusal_retires_snapshot_plan(true, true, true, 40_000, 50_000), "verified plan");
+        assert!(!provider_refusal_retires_snapshot_plan(true, false, false, 40_000, 50_000), "not a provider");
+        assert!(!provider_refusal_retires_snapshot_plan(true, false, true, 50_001, 50_000), "above the boundary");
     }
 
     /// A validated direct extension of the committed tip is never held behind
@@ -19813,6 +21967,581 @@ mod divergent_branch_capture_tests {
         assert!(unauthenticated_snapshot_plan_stalled(Some(t0), at, false));
         assert!(!unauthenticated_snapshot_plan_stalled(Some(t0), at, true), "local work in flight");
         assert!(!unauthenticated_snapshot_plan_stalled(None, at, false), "no plan");
+    }
+}
+
+#[cfg(test)]
+/// v1.7 gate 1 (private rehearsal P7a, 2026-10-31). The v1.6 branch that did
+/// not upgrade forked at 95 = J − 1 and became heavier inside the reorg
+/// window. Its headers and terminals pass v1.7's rules; only its bodies are
+/// refused, at 96', for the destination section they lack. Every v1.7 node
+/// tried to reorganize onto it, refused that body from one source, kept the
+/// branch selected through the others, and three froze for about thirty
+/// minutes (seed S2 at 99, node V at 100 until restarted, miner M1 at 102
+/// waiting for a snapshot of that branch, its mining paused).
+mod refused_branch_body_tests {
+    use super::*;
+    use jetsam_chain::block_header::block_id;
+    use jetsam_node::networking::{
+        header_dag::{HeaderDag, ValidatedHeader},
+        ChainPoint,
+    };
+    use jetsam_p2p::header_protocol::HeaderInventoryRecord;
+    use jetsam_p2p::object_protocol::{BlockBodyClaimId, BlockBodyObjectId};
+    use peer_chain_evidence::PeerChainEvidence;
+
+    /// The private chain's v1.7 height.
+    const J: u64 = 96;
+
+    fn header_95() -> jetsam_chain::BlockHeader {
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = J - 1;
+        header
+    }
+
+    /// `len` children of `parent` (whose cumulative work is `work`), salted,
+    /// each inserted in `dag`.
+    fn branch(
+        dag: &mut HeaderDag,
+        parent: jetsam_chain::BlockHeader,
+        work: [u8; 32],
+        len: u64,
+        salt: u128,
+    ) -> Vec<ValidatedHeader> {
+        let (mut parent, mut work) = (parent, work);
+        let mut headers = Vec::new();
+        for _ in 0..len {
+            let mut header = parent;
+            header.height = parent.height + 1;
+            header.prev_block_hash = block_id(&parent);
+            header.timestamp += 1;
+            header.nonce = salt + u128::from(header.height);
+            work =
+                jetsam_chain::add_work(&work, &jetsam_chain::block_work(&header.difficulty_target));
+            let validated = ValidatedHeader::new_after_consensus_checks(header, work);
+            dag.insert(validated).unwrap();
+            headers.push(validated);
+            parent = header;
+        }
+        headers
+    }
+
+    /// The body `marker` names for `header` (one marker, one set of bytes).
+    fn body(header: &ValidatedHeader, marker: u8) -> BlockBodyObjectId {
+        BlockBodyObjectId {
+            claim: BlockBodyClaimId {
+                height: header.header.height,
+                block_hash: header.hash,
+            },
+            byte_digest: [marker; 32],
+            encoded_len: 1,
+        }
+    }
+
+    fn offer(headers: &[ValidatedHeader], marker: u8) -> Vec<HeaderInventoryRecord> {
+        headers
+            .iter()
+            .map(|header| HeaderInventoryRecord {
+                header: header.header,
+                body: Some(body(header, marker)),
+                terminal: None,
+            })
+            .collect()
+    }
+
+    fn peers<const N: usize>() -> [libp2p::PeerId; N] {
+        let mut peers = [(); N].map(|_| libp2p::PeerId::random());
+        peers.sort_by_key(|peer| peer.to_bytes());
+        peers
+    }
+
+    /// Our 96..99 (applied) against their 96'..101'. R served the refused
+    /// 96' (its plan stopped at 100'); W advertises the same bytes up to
+    /// 101'. Both are proven on the branch, and the whole branch leaves the
+    /// selection — 101', beyond the refused plan's target, too: the best
+    /// valid branch is selected at once, by work among what remains.
+    #[test]
+    fn a_refused_branch_body_frees_the_selection_from_its_whole_branch() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 4, 0);
+        let theirs = branch(&mut dag, base, [1; 32], 6, 1 << 64);
+        assert_eq!(
+            dag.best_tip(),
+            theirs[5].point(),
+            "the heavier branch is selected"
+        );
+        let [r, w, honest] = peers::<3>();
+        dag.advertise_inventory(honest, &offer(&ours, 1)).unwrap();
+        dag.advertise_inventory(r, &offer(&theirs[..5], 2)).unwrap();
+        dag.advertise_inventory(w, &offer(&theirs, 2)).unwrap();
+        let refused = body(&theirs[0], 2);
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+
+        let (refused_peers, best_changed) =
+            refuse_branch_body(&mut dag, &mut evidence, r, refused, now);
+        assert_eq!(refused_peers, [r, w]);
+        assert!(best_changed);
+        assert_eq!(
+            dag.best_tip(),
+            ours[3].point(),
+            "the best valid branch, at once"
+        );
+        for header in &theirs {
+            assert!(
+                dag.get(&header.hash).is_none(),
+                "{} left the DAG",
+                header.header.height
+            );
+            assert!(!dag.is_invalid(&header.hash), "forgotten, not condemned");
+        }
+        for peer in [r, w] {
+            assert_eq!(
+                evidence.divergence_height(&peer, now),
+                Some(J),
+                "visible to the observer"
+            );
+        }
+        assert!(!evidence.is_divergent(&honest, now));
+        assert!(dag.has_inventory(&ours[3].hash), "our providers are kept");
+        assert_eq!(
+            evidence.refused_body_advertised(offer(&theirs, 2).iter(), now),
+            Some(J)
+        );
+
+        // The source alone, when nobody else advertises the bytes.
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let theirs = branch(&mut dag, base, [1; 32], 2, 1 << 64);
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let (refused_peers, best_changed) =
+            refuse_branch_body(&mut dag, &mut evidence, r, body(&theirs[0], 2), now);
+        assert_eq!(refused_peers, [r]);
+        assert!(best_changed);
+        assert_eq!(dag.best_tip(), finalized);
+        assert!(evidence.is_divergent(&r, now));
+    }
+
+    /// A relay that strips the section of an honest body is refused, and only
+    /// it: the block, the branch and the provider of its real body stay, so
+    /// the node goes on following that branch.
+    #[test]
+    fn a_stripped_copy_of_an_honest_body_refuses_only_its_relay() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let _ours = branch(&mut dag, base, [1; 32], 2, 0);
+        let honest_chain = branch(&mut dag, base, [1; 32], 4, 1 << 64);
+        let [relay, honest] = peers::<2>();
+        dag.advertise_inventory(honest, &offer(&honest_chain, 3))
+            .unwrap();
+        dag.advertise_inventory(relay, &offer(&honest_chain, 4))
+            .unwrap();
+        let best = dag.best_tip();
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+
+        let (refused_peers, best_changed) = refuse_branch_body(
+            &mut dag,
+            &mut evidence,
+            relay,
+            body(&honest_chain[0], 4),
+            now,
+        );
+        assert_eq!(refused_peers, [relay]);
+        assert!(!best_changed);
+        assert_eq!(dag.best_tip(), best);
+        assert!(evidence.is_divergent(&relay, now));
+        assert!(!evidence.is_divergent(&honest, now));
+        assert_eq!(dag.providers_of_body(&body(&honest_chain[0], 3)), [honest]);
+        assert!(dag.providers_of_body(&body(&honest_chain[0], 4)).is_empty());
+    }
+
+    /// A v1.6 peer this node never tried offers the branch again with the
+    /// bytes already refused: proven on it at once, its inventory dropped,
+    /// before its headers count. Other bytes for the block, or a header
+    /// without body, prove nothing.
+    #[test]
+    fn a_peer_advertising_a_refused_body_is_refused_before_its_headers_count() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let theirs = branch(&mut dag, base, [1; 32], 3, 1 << 64);
+        let [o, honest, header_only] = peers::<3>();
+        dag.advertise_inventory(o, &offer(&theirs[1..], 2)).unwrap();
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, o, &offer(&theirs, 2), now),
+            None
+        );
+        assert!(!evidence.is_divergent(&o, now), "nothing refused yet");
+
+        evidence.refuse_body(body(&theirs[0], 2), now);
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, o, &offer(&theirs, 2), now),
+            Some(J)
+        );
+        assert_eq!(evidence.divergence_height(&o, now), Some(J));
+        assert!(
+            dag.inventory_providers(&theirs).is_empty(),
+            "it supplies nothing any more"
+        );
+
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, honest, &offer(&theirs, 3), now),
+            None
+        );
+        let bare = [HeaderInventoryRecord::header_only(theirs[0].header)];
+        assert_eq!(
+            refuse_advertised_branch_body(&mut dag, &mut evidence, header_only, &bare, now),
+            None
+        );
+        assert!(!evidence.is_divergent(&honest, now) && !evidence.is_divergent(&header_only, now));
+    }
+
+    fn block_at(height: u64) -> jetsam_chain::Block {
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = height;
+        jetsam_chain::Block {
+            header,
+            transactions: Vec::new(),
+            client_objects: Vec::new(),
+            destination: None,
+        }
+    }
+
+    /// At or above J a body without destination section is refused when it
+    /// is decoded — before any terminal — as a body fault that names the
+    /// exact bytes served; below J, with v1.7 dormant, or with a section, it
+    /// decodes as before, and other refusals keep their shape.
+    #[test]
+    fn a_body_without_section_at_or_above_j_is_refused_before_its_terminal_with_its_bytes() {
+        let source = libp2p::PeerId::random();
+        for height in [J, J + 1, J + 960] {
+            let block = block_at(height);
+            let bytes = block.to_bytes();
+            let claim = BlockBodyClaimId {
+                height,
+                block_hash: block_id(&block.header),
+            };
+            let expected = BlockBodyObjectId::from_bytes(claim, &bytes).unwrap();
+            assert_eq!(refused_branch_body(&block, &bytes, Some(J)), Some(expected));
+            let error =
+                decode_exact_suffix_body(&bytes, source, &block.header, Some(J)).unwrap_err();
+            assert_eq!(
+                error.refused_branch_body(),
+                Some((source, expected)),
+                "{height}"
+            );
+            assert!(error.is_body_fault() && error.condemned_block().is_none());
+            assert_eq!(error.peer_sources(), &[source][..]);
+        }
+        let below = block_at(J - 1);
+        assert_eq!(
+            refused_branch_body(&below, &below.to_bytes(), Some(J)),
+            None
+        );
+        assert_eq!(
+            decode_exact_suffix_body(&below.to_bytes(), source, &below.header, Some(J)).unwrap(),
+            below
+        );
+        let at = block_at(J);
+        assert_eq!(
+            refused_branch_body(&at, &at.to_bytes(), None),
+            None,
+            "v1.7 dormant"
+        );
+        assert_eq!(
+            decode_exact_suffix_body(&at.to_bytes(), source, &at.header, None).unwrap(),
+            at
+        );
+        let mut with_section = block_at(J);
+        with_section.destination = Some(Default::default());
+        assert_eq!(refused_branch_body(&with_section, b"", Some(J)), None);
+        let mut early = block_at(J - 1);
+        early.destination = Some(Default::default());
+        assert_eq!(
+            refused_branch_body(&early, b"", Some(J)),
+            None,
+            "a section below J is another refusal, the block rules' own"
+        );
+
+        let error =
+            decode_exact_suffix_body(&at.to_bytes(), source, &block_at(J + 1).header, Some(J))
+                .unwrap_err();
+        assert!(error.is_body_fault() && error.refused_branch_body().is_none());
+        let error = decode_exact_suffix_body(b"junk", source, &at.header, Some(J)).unwrap_err();
+        assert!(error.is_body_fault() && error.refused_branch_body().is_none());
+    }
+
+    /// A suffix is decoded under the build's own clock: armed (the private
+    /// rehearsal build), its body at J without section is refused with the
+    /// bytes its source served; dormant (public and test builds), it decodes.
+    #[test]
+    fn a_suffix_is_judged_under_the_builds_v1_7_clock() {
+        let height = jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.unwrap_or(J);
+        // The block before the build's J: 95 on the private clock and while
+        // dormant, 8 639 on the test chain (decoding needs no header DAG).
+        let mut parent = header_95();
+        parent.height = height - 1;
+        let mut blocks = vec![block_at(height - 1), block_at(height), block_at(height + 1)];
+        blocks[0].header = parent;
+        for index in 1..blocks.len() {
+            let mut header = blocks[index - 1].header;
+            header.height += 1;
+            header.prev_block_hash = block_id(&blocks[index - 1].header);
+            blocks[index].header = header;
+        }
+        let headers = blocks
+            .iter()
+            .map(|block| ValidatedHeader::new_after_consensus_checks(block.header, [0; 32]))
+            .collect::<Vec<_>>();
+        let bytes = blocks
+            .iter()
+            .map(jetsam_chain::Block::to_bytes)
+            .collect::<Vec<_>>();
+        let [first, second, third] = peers::<3>();
+        let sources = [first, second, third];
+        let decoded = decode_exact_suffix_bodies(&bytes, &sources, &headers);
+        match jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT {
+            Some(_) => {
+                let error = decoded.unwrap_err();
+                let claim = BlockBodyClaimId {
+                    height,
+                    block_hash: block_id(&blocks[1].header),
+                };
+                let body = BlockBodyObjectId::from_bytes(claim, &bytes[1]).unwrap();
+                assert_eq!(
+                    error.refused_branch_body(),
+                    Some((second, body)),
+                    "the first body at J"
+                );
+            }
+            None => assert_eq!(decoded.unwrap(), blocks),
+        }
+        // A body that does not match its header is refused from its own source.
+        let error = decode_exact_suffix_bodies(&bytes, &sources, &headers[1..]).unwrap_err();
+        assert_eq!(error.peer_sources(), &[first][..]);
+        assert!(error.refused_branch_body().is_none());
+    }
+
+    /// A manifest whose boundary is `point`, with `annexes`.
+    fn manifest_of(
+        point: ChainPoint,
+        annexes: Vec<jetsam_p2p::protocol::SnapshotAnnexRef>,
+    ) -> jetsam_p2p::protocol::GetStateManifestResponse {
+        jetsam_p2p::protocol::GetStateManifestResponse {
+            tip_height: point.height,
+            tip_hash: point.hash,
+            annexes,
+            ..Default::default()
+        }
+    }
+
+    fn annex(kind: jetsam_p2p::protocol::SnapshotAnnexKind) -> jetsam_p2p::protocol::SnapshotAnnexRef {
+        jetsam_p2p::protocol::SnapshotAnnexRef {
+            kind,
+            len: 30,
+            root: [kind.code(); 32],
+        }
+    }
+
+    /// D62 (2026-11-01): at or above J, a manifest without any v1.7 annex is
+    /// the mark of a branch without v1.7 — every v1.7 export there carries
+    /// the destination state, the v1.6 branch that did not upgrade none.
+    /// Below J, with v1.7 dormant, or with an annex, it is not.
+    #[test]
+    fn a_manifest_without_annexes_at_or_above_j_is_the_mark_of_a_branch_without_v1_7() {
+        use jetsam_p2p::protocol::SnapshotAnnexKind::{DestinationState, GuardianJournal};
+        let point = |height: u64| ChainPoint::new(height, [height as u8; 32]);
+        for height in [J, J + 1, J + 960] {
+            assert_eq!(
+                branch_without_v1_7_manifest(&manifest_of(point(height), Vec::new()), Some(J)),
+                Some(J),
+                "{height}"
+            );
+        }
+        for (manifest, why) in [
+            (manifest_of(point(J - 1), Vec::new()), "below J"),
+            (manifest_of(point(0), Vec::new()), "no snapshot offered"),
+        ] {
+            assert_eq!(branch_without_v1_7_manifest(&manifest, Some(J)), None, "{why}");
+        }
+        assert_eq!(
+            branch_without_v1_7_manifest(&manifest_of(point(J), Vec::new()), None),
+            None,
+            "v1.7 dormant"
+        );
+        for annexes in [
+            vec![annex(DestinationState), annex(GuardianJournal)],
+            vec![annex(DestinationState)],
+            vec![annex(GuardianJournal)],
+        ] {
+            assert_eq!(
+                branch_without_v1_7_manifest(&manifest_of(point(J + 6), annexes.clone()), Some(J)),
+                None,
+                "{annexes:?}"
+            );
+        }
+    }
+
+    /// D62, the hole of gate 1 (first contact). Our 96 is committed and the
+    /// v1.6 branch is already 96'..113', 18 headers above the fork: the node
+    /// takes the snapshot path, fetches no body (gate 1 never sees one), and
+    /// asks the peer that sent the branch for a manifest — 102', without
+    /// annex. Its sender is proven on the branch at 96'; the whole branch
+    /// above the fork leaves the selection (102' and above, and 96'..101'
+    /// below it, still heavier than our 96), so our 96 is selected at once.
+    /// Forgotten, not condemned; W, which only advertises the branch, is not
+    /// refused for it. The sender brings no headers any more, as the source
+    /// of a refused body (replay D62, 2026-11-01: otherwise its next batch
+    /// brought the branch back and a node at 103 froze there).
+    #[test]
+    fn a_manifest_without_v1_7_refuses_its_sender_and_forgets_its_branch() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 1, 0);
+        let theirs = branch(&mut dag, base, [1; 32], 18, 1 << 64);
+        assert_eq!(dag.best_tip(), theirs[17].point(), "the heavier branch is selected");
+        let [o, w, honest] = peers::<3>();
+        dag.advertise_inventory(honest, &offer(&ours, 1)).unwrap();
+        dag.advertise_inventory(w, &offer(&theirs, 2)).unwrap();
+        let manifest = manifest_of(theirs[6].point(), Vec::new());
+        assert_eq!(manifest.tip_height, J + 6);
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let mut rejected = std::collections::HashSet::new();
+
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, o, &manifest, J, ours[0].point(), now),
+            (J, true)
+        );
+        assert_eq!(dag.best_tip(), ours[0].point(), "our 96, at once");
+        for header in &theirs {
+            assert!(
+                dag.get(&header.hash).is_none(),
+                "{} left the DAG",
+                header.header.height
+            );
+            assert!(!dag.is_invalid(&header.hash), "forgotten, not condemned");
+        }
+        assert_eq!(
+            evidence.divergence_height(&o, now),
+            Some(J),
+            "visible to the observer"
+        );
+        assert!(!evidence.is_divergent(&w, now), "the sender alone");
+        assert!(!evidence.is_divergent(&honest, now));
+        assert!(dag.has_inventory(&ours[0].hash), "our providers are kept");
+        assert_eq!(
+            rejected,
+            std::collections::HashSet::from([o]),
+            "its sender alone brings no headers any more"
+        );
+    }
+
+    /// The branch leaves from its first block at or above J that the
+    /// committed chain does not hold: just above the fork when the fork is
+    /// at or above J (our 96..100 stay, their 99'.. go), at J when the fork is
+    /// below it (their 93'..95' stay: below J nothing is proven).
+    #[test]
+    fn a_branch_without_v1_7_leaves_from_its_first_block_off_our_chain_at_or_above_j() {
+        let [o] = peers::<1>();
+        let now = Instant::now();
+        let mut rejected = std::collections::HashSet::new();
+
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 5, 0);
+        let fork = ours[2];
+        assert_eq!(fork.header.height, J + 2);
+        let theirs = branch(&mut dag, fork.header, fork.cumulative_work, 20, 1 << 64);
+        let manifest = manifest_of(theirs[11].point(), Vec::new());
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, o, &manifest, J, ours[4].point(), now),
+            (J + 3, true)
+        );
+        assert_eq!(dag.best_tip(), ours[4].point());
+        for header in &ours {
+            assert!(dag.get(&header.hash).is_some(), "our {} stays", header.header.height);
+        }
+        assert!(theirs.iter().all(|header| dag.get(&header.hash).is_none()));
+        assert_eq!(evidence.divergence_height(&o, now), Some(J + 3));
+
+        let mut root = header_95();
+        root.height = J - 6;
+        let finalized = ChainPoint::new(J - 6, block_id(&root));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, root, [1; 32], 6, 0);
+        let fork = ours[1];
+        let theirs = branch(&mut dag, fork.header, fork.cumulative_work, 28, 1 << 64);
+        assert_eq!(theirs[3].header.height, J);
+        let manifest = manifest_of(theirs[9].point(), Vec::new());
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, o, &manifest, J, ours[5].point(), now),
+            (J, true)
+        );
+        assert_eq!(
+            dag.best_tip(),
+            ours[5].point(),
+            "our 96 against what is left of theirs, 95'"
+        );
+        for header in &theirs[..3] {
+            assert!(
+                dag.get(&header.hash).is_some(),
+                "their {} stays: below J",
+                header.header.height
+            );
+        }
+        assert!(theirs[3..].iter().all(|header| dag.get(&header.hash).is_none()));
+        assert_eq!(evidence.divergence_height(&o, now), Some(J));
+        assert_eq!(rejected, std::collections::HashSet::from([o]));
+    }
+
+    /// A boundary the HeaderDAG does not hold (a node without validated
+    /// headers yet) or one on the committed chain (a v1.7 export stripped of
+    /// its annexes): its sender is refused at the boundary, nothing leaves
+    /// the selection.
+    #[test]
+    fn a_manifest_without_v1_7_off_the_header_view_refuses_its_sender_alone() {
+        let base = header_95();
+        let finalized = ChainPoint::new(J - 1, block_id(&base));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 64);
+        let ours = branch(&mut dag, base, [1; 32], 8, 0);
+        let [stranger, stripper] = peers::<2>();
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let mut rejected = std::collections::HashSet::new();
+        let unknown = manifest_of(ChainPoint::new(J + 12, [9; 32]), Vec::new());
+        assert_eq!(
+            refuse_manifest_branch(&mut dag, &mut evidence, &mut rejected, stranger, &unknown, J, ours[7].point(), now),
+            (J + 12, false)
+        );
+        let on_our_chain = manifest_of(ours[6].point(), Vec::new());
+        assert_eq!(
+            refuse_manifest_branch(
+                &mut dag,
+                &mut evidence,
+                &mut rejected,
+                stripper,
+                &on_our_chain,
+                J,
+                ours[7].point(),
+                now
+            ),
+            (J + 6, false)
+        );
+        assert_eq!(dag.best_tip(), ours[7].point());
+        assert_eq!(dag.len(), 8, "nothing forgotten");
+        assert_eq!(evidence.divergence_height(&stranger, now), Some(J + 12));
+        assert_eq!(evidence.divergence_height(&stripper, now), Some(J + 6));
+        assert_eq!(rejected, std::collections::HashSet::from([stranger, stripper]));
     }
 }
 
@@ -20092,31 +22821,11 @@ fn load_or_create_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<(
 
             let encoded =
                 toml::to_string_pretty(defaults).context("serialize default node config")?;
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-
-            match options.open(&expanded) {
-                Ok(mut file) => {
-                    let write_result = file
-                        .write_all(encoded.as_bytes())
-                        .and_then(|()| file.sync_all());
-                    if let Err(error) = write_result {
-                        drop(file);
-                        let _ = std::fs::remove_file(&expanded);
-                        return Err(error).with_context(|| {
-                            format!("write default node config: {}", expanded.display())
-                        });
-                    }
-                    Ok((defaults.clone(), true))
-                }
+            match create_config_whole(&expanded, encoded.as_bytes()) {
+                Ok(true) => Ok((defaults.clone(), true)),
                 // Another node may have created the file after our initial
                 // read. Never overwrite it; load and validate that file.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(false) => {
                     let text = std::fs::read_to_string(&expanded).with_context(|| {
                         format!(
                             "read concurrently created node config: {}",
@@ -20128,13 +22837,49 @@ fn load_or_create_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<(
                     Ok((config, false))
                 }
                 Err(error) => Err(error)
-                    .with_context(|| format!("create node config: {}", expanded.display())),
+                    .with_context(|| format!("write default node config: {}", expanded.display())),
             }
         }
         Err(error) => {
             Err(error).with_context(|| format!("read node config: {}", expanded.display()))
         }
     }
+}
+
+/// Create `path` holding `bytes` whole, or leave a file already there
+/// untouched (`Ok(false)`). The bytes are written and synced under a name of
+/// this process's own beside it, then hard-linked into place, which refuses
+/// an existing path: a start killed mid-write leaves that staged file, never
+/// a truncated config that every later start refuses to parse, and two
+/// first starts never write into the same file. On a file system without
+/// hard links (FAT, exFAT) it is renamed into place instead, only while
+/// nothing is there.
+fn create_config_whole(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let mut staged_name = std::ffi::OsString::from(".");
+    staged_name.push(path.file_name().unwrap_or_default());
+    staged_name.push(format!(".new-{}", std::process::id()));
+    let staged = path.with_file_name(staged_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let placed = options
+        .open(&staged)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| match std::fs::hard_link(&staged, path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(_) if path.exists() => Ok(false),
+            Err(_) => std::fs::rename(&staged, path).map(|()| true),
+        });
+    let _ = std::fs::remove_file(&staged);
+    placed
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
@@ -20236,6 +22981,51 @@ mod condemned_block_tests {
         assert_eq!(ExactSuffixApplyError::terminal(peer, "x").condemned_block(), None);
     }
 
+    /// A2 M3, A3-3 (T7.1): a v1.7 destination or guardian rule refusing
+    /// committed content condemns the block like a client-object rule; a
+    /// refusal that may come from a relay's section bytes, or from this
+    /// node's own state, condemns only the source.
+    #[test]
+    fn a_v1_7_refusal_of_committed_content_condemns_the_block() {
+        use jetsam_chain::consensus::destination::state::DestinationBlockError;
+        use jetsam_chain::consensus::destination::DestinationError;
+        use jetsam_chain::consensus::guardian::GuardianError;
+        use jetsam_chain::consensus::vault::VaultError;
+        let refused = MdbxContextError::Consensus;
+        for error in [
+            ConsensusError::DestinationBlock(DestinationBlockError::Vault(
+                VaultError::SpendFromLockedAddress { group: 0 },
+            )),
+            ConsensusError::DestinationBlock(DestinationBlockError::Vault(
+                VaultError::ReleaseAlreadyPaid { n: 4 },
+            )),
+            ConsensusError::Guardian(GuardianError::GuardianKeyRevoked),
+            ConsensusError::Guardian(GuardianError::MarkerInSystemRecord),
+        ] {
+            assert!(
+                exact_suffix_context_error_condemns_block(&refused(error.clone())),
+                "{error:?} condemns the block"
+            );
+        }
+        for error in [
+            ConsensusError::DestinationBlock(DestinationBlockError::Vault(
+                VaultError::ReleasesDoNotMatchMarkers,
+            )),
+            ConsensusError::DestinationBlock(DestinationBlockError::ObjectsDoNotMatchMarkers),
+            ConsensusError::DestinationBlock(DestinationBlockError::CommitteeKeysUnavailable {
+                root: [1; 32],
+            }),
+            ConsensusError::Destination(DestinationError::SectionMissing),
+            ConsensusError::Guardian(GuardianError::ObjectsDoNotMatchMarkers),
+            ConsensusError::Guardian(GuardianError::BranchUnavailable { height: 9 }),
+        ] {
+            assert!(
+                !exact_suffix_context_error_condemns_block(&refused(error.clone())),
+                "{error:?} condemns only the source"
+            );
+        }
+    }
+
     use jetsam_chain::consensus::client_objects::{
         ClientObject, ClientObjectRules, ClientRegistration, ClientRegistryState,
         TerminalClientView, CLIENT_REGISTRY_CAPACITY,
@@ -20326,6 +23116,7 @@ mod condemned_block_tests {
             header,
             transactions,
             client_objects: objects,
+            destination: None,
         }
     }
 
@@ -20463,5 +23254,49 @@ mod condemned_block_tests {
         )
         .unwrap_err();
         assert!(error.is_body_fault() && error.condemned_block().is_none(), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod compact_db_tests {
+    use super::{run_compact_db, run_compact_db_remove_old, Cli};
+    use clap::Parser;
+
+    #[test]
+    fn compact_db_flags_parse_and_exclude_each_other() {
+        let cli = Cli::try_parse_from(["jetsam", "--compact-db", "--data-dir", "/d"]).unwrap();
+        assert!(cli.compact_db && !cli.compact_db_remove_old);
+        let cli = Cli::try_parse_from(["jetsam", "--compact-db-remove-old"]).unwrap();
+        assert!(cli.compact_db_remove_old && !cli.compact_db);
+        assert!(Cli::try_parse_from(["jetsam", "--compact-db", "--compact-db-remove-old"]).is_err());
+    }
+
+    #[test]
+    fn compact_db_compacts_a_stopped_node_database_and_remove_old_frees_it() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap());
+        std::fs::write(directory.path().join("wallet.key"), b"key").unwrap();
+        run_compact_db(directory.path()).unwrap();
+        assert!(directory.path().join("mdbx.dat").exists());
+        assert!(directory.path().join("mdbx.dat.old").exists());
+        assert_eq!(std::fs::read(directory.path().join("wallet.key")).unwrap(), b"key");
+        // The node opens the compacted database.
+        drop(jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap());
+        // A second compaction is refused while the previous file is kept.
+        assert!(run_compact_db(directory.path()).is_err());
+        run_compact_db_remove_old(directory.path()).unwrap();
+        assert!(!directory.path().join("mdbx.dat.old").exists());
+        assert!(directory.path().join("mdbx.dat").exists());
+        assert!(run_compact_db_remove_old(directory.path()).is_err());
+    }
+
+    #[test]
+    fn compact_db_refuses_a_database_in_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let held = jetsam_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let error = run_compact_db(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("stop the node"), "{error}");
+        drop(held);
+        assert!(!directory.path().join("mdbx.dat.old").exists());
     }
 }

@@ -24,7 +24,8 @@ use crate::block::Block;
 use crate::block_header::semantic_header_id;
 use crate::consensus::pow::block_id;
 use crate::consensus::wire_limits::{
-    history_step_terminal_bytes_limit, MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
+    block_bytes_limit, history_step_terminal_bytes_limit, MAX_BLOCK_TRANSPORT_BYTES,
+    MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
 };
 use crate::history_step::{
     HistoryStepTerminalMetadata, HistoryStepTerminalMetadataError,
@@ -41,7 +42,7 @@ pub const ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES: usize = 4 + 4 + 4;
 
 /// Maximum complete encoded bundle, including its fixed framing header.
 pub const MAX_ACCEPTED_BLOCK_BUNDLE_BYTES: usize = ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
-    + MAX_BLOCK_BYTES
+    + MAX_BLOCK_TRANSPORT_BYTES
     + MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 
 /// One structurally complete, not-yet-cryptographically-decided block bundle.
@@ -78,6 +79,7 @@ impl AcceptedBlockBundle {
             history_step_terminal_bytes.len() as u64,
         )?;
         let height = block.header.height;
+        validate_block_length_at_height(block_bytes.len() as u64, height)?;
         validate_terminal_length_at_height(history_step_terminal_bytes.len() as u64, height)?;
         let block_hash = block_id(&block.header);
         validate_terminal_binding(
@@ -114,6 +116,7 @@ impl AcceptedBlockBundle {
             return Err(AcceptedBlockBundleError::GenesisIsNotTransported);
         }
         let height = block.header.height;
+        validate_block_length_at_height(block_bytes.len() as u64, height)?;
         validate_terminal_length_at_height(history_step_terminal_bytes.len() as u64, height)?;
         let block_hash = block_id(&block.header);
         validate_terminal_binding(
@@ -250,6 +253,7 @@ impl AcceptedBlockBundle {
         height: u64,
     ) -> Result<usize, AcceptedBlockBundleError> {
         let payload_len = validate_payload_lengths(block_len, history_step_terminal_len)?;
+        validate_block_length_at_height(block_len, height)?;
         validate_terminal_length_at_height(history_step_terminal_len, height)?;
         Ok(payload_len)
     }
@@ -262,10 +266,10 @@ fn validate_payload_lengths(
     if block_len == 0 {
         return Err(AcceptedBlockBundleError::MissingBlock);
     }
-    if block_len > MAX_BLOCK_BYTES as u64 {
+    if block_len > MAX_BLOCK_TRANSPORT_BYTES as u64 {
         return Err(AcceptedBlockBundleError::BlockTooLarge {
             actual: block_len,
-            max: MAX_BLOCK_BYTES,
+            max: MAX_BLOCK_TRANSPORT_BYTES,
         });
     }
     if terminal_len <= HISTORY_STEP_TERMINAL_BINDING_BYTES as u64 {
@@ -284,6 +288,22 @@ fn validate_payload_lengths(
     block_len
         .checked_add(terminal_len)
         .ok_or(AcceptedBlockBundleError::LengthOverflow)
+}
+
+/// The block cap in force at one height: `MAX_BLOCK_BYTES`, plus the
+/// destination section's budget from the v1.7 height on.
+fn validate_block_length_at_height(
+    block_len: u64,
+    height: u64,
+) -> Result<(), AcceptedBlockBundleError> {
+    let max = block_bytes_limit(height);
+    if block_len > max as u64 {
+        return Err(AcceptedBlockBundleError::BlockTooLarge {
+            actual: block_len,
+            max,
+        });
+    }
+    Ok(())
 }
 
 /// The consensus cap in force at one block height, which is the rule a peer
@@ -420,6 +440,7 @@ mod tests {
             },
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         }
     }
 
@@ -558,8 +579,9 @@ mod tests {
     fn forged_lengths_fail_before_payload_allocation_or_decode() {
         let mut oversized_block = vec![0u8; ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES];
         oversized_block[..4].copy_from_slice(&ACCEPTED_BLOCK_BUNDLE_MAGIC);
-        oversized_block[4..8]
-            .copy_from_slice(&(u32::try_from(MAX_BLOCK_BYTES).unwrap() + 1).to_le_bytes());
+        oversized_block[4..8].copy_from_slice(
+            &(u32::try_from(MAX_BLOCK_TRANSPORT_BYTES).unwrap() + 1).to_le_bytes(),
+        );
         oversized_block[8..12].copy_from_slice(
             &u32::try_from(HISTORY_STEP_TERMINAL_BINDING_BYTES + 1)
                 .unwrap()

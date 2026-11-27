@@ -11,7 +11,6 @@
 
 use std::{io, sync::Arc};
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use jetsam_chain::consensus::wire_limits::{
@@ -76,7 +75,6 @@ impl MempoolSyncCodec {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for MempoolSyncCodec {
     type Protocol = StreamProtocol;
     type Request = MempoolRequest;

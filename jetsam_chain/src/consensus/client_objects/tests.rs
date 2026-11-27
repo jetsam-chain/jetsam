@@ -147,6 +147,7 @@ fn block_at(height: u64, groups: Vec<Vec<Transaction>>) -> Block {
         header: header(height),
         transactions,
         client_objects: Vec::new(),
+        destination: None,
     }
 }
 

@@ -194,8 +194,10 @@ impl NetworkCommandReceiver {
 fn classify(command: &NetworkCommand) -> CommandClass {
     match command {
         Dial { .. }
+        | DialSeed { .. }
         | BootstrapComplete
         | RefusedBranchPeers { .. }
+        | ProbingPeers { .. }
         | PeerCount { .. }
         | PeerVersions { .. }
         | AdvanceSnapshotGeneration { .. }
@@ -204,6 +206,7 @@ fn classify(command: &NetworkCommand) -> CommandClass {
             CommandClass::Header
         }
         BroadcastTx { .. }
+        | BroadcastBridgeIntent { .. }
         | ResolveTxGossip { .. }
         | FetchObjects { .. }
         | FetchSnapshotHeaders { .. }

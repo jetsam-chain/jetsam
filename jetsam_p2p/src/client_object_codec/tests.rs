@@ -417,3 +417,92 @@ async fn a_batch_bundle_request_round_trips_and_admits_only_its_bytes() {
         assert!(request_round_trip(request).await.is_err());
     }
 }
+
+/// T7.1: a snapshot annex (destination state file, guardian journal) moves
+/// as a content-addressed file: its index and each chunk are refused unless
+/// they are exactly what the manifest's reference commits to; a request for
+/// an annex that no manifest may name is refused.
+#[tokio::test]
+async fn snapshot_annex_index_and_chunks_are_checked_on_reception() {
+    use jetsam_chain::storage::snapshot_annex::snapshot_annex_chunk_digests;
+    use jetsam_chain::storage::{SnapshotAnnexKind, SnapshotAnnexRef, SNAPSHOT_ANNEX_CHUNK_BYTES};
+    let kind = SnapshotAnnexKind::GuardianJournal;
+    let file: Vec<u8> = (0..SNAPSHOT_ANNEX_CHUNK_BYTES + 333)
+        .map(|index| (index % 241) as u8)
+        .collect();
+    let annex = SnapshotAnnexRef::of(kind, &file).unwrap();
+    let digests = snapshot_annex_chunk_digests(kind, &file);
+    let index_request = ClientObjectRequest::SnapshotAnnexIndex(annex);
+    assert_eq!(request_round_trip(index_request).await.unwrap(), index_request);
+    let index = digests.concat();
+    let wire = encode_response(ClientObjectResponse::ready(index_request, index.clone()))
+        .await
+        .unwrap();
+    assert_eq!(decode_response(wire.clone()).await.unwrap().bytes, Some(index));
+    let mut altered = wire;
+    let last = altered.len() - 1;
+    altered[last] ^= 1;
+    assert!(decode_response(altered).await.is_err());
+
+    for (i, chunk) in file.chunks(SNAPSHOT_ANNEX_CHUNK_BYTES).enumerate() {
+        let request = ClientObjectRequest::SnapshotAnnexChunk {
+            annex,
+            index: i as u32,
+            digest: digests[i],
+        };
+        assert_eq!(request_round_trip(request).await.unwrap(), request);
+        let wire = encode_response(ClientObjectResponse::ready(request, chunk.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_response(wire.clone()).await.unwrap().bytes.as_deref(),
+            Some(chunk)
+        );
+        let mut altered = wire;
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        assert!(decode_response(altered).await.is_err());
+    }
+    // The other chunk's bytes under this index: refused at both ends.
+    let swapped = ClientObjectRequest::SnapshotAnnexChunk {
+        annex,
+        index: 1,
+        digest: digests[1],
+    };
+    assert!(
+        encode_response(ClientObjectResponse::ready(swapped, file[..1000].to_vec()))
+            .await
+            .is_err()
+    );
+    // A chunk beyond the file, an empty or oversized annex: no object.
+    let beyond = ClientObjectRequest::SnapshotAnnexChunk {
+        annex,
+        index: 2,
+        digest: digests[1],
+    };
+    assert_eq!(beyond.expected_len(), None);
+    assert!(request_round_trip(beyond).await.is_err());
+    let over = jetsam_chain::consensus::destination::state::MAX_DESTINATION_SNAPSHOT_FILE_BYTES as u32 + 1;
+    for len in [0u32, over] {
+        let bad = ClientObjectRequest::SnapshotAnnexIndex(SnapshotAnnexRef {
+            kind: SnapshotAnnexKind::DestinationState,
+            len,
+            root: [0; 32],
+        });
+        assert_eq!(bad.expected_len(), None, "{len}");
+        assert!(request_round_trip(bad).await.is_err());
+    }
+    // An unknown annex kind on the wire is refused.
+    let mut codec = ClientObjectCodec::default();
+    let mut wire = Cursor::new(Vec::new());
+    codec
+        .write_request(&protocol(), &mut wire, index_request)
+        .await
+        .unwrap();
+    let mut bytes = wire.into_inner();
+    bytes[5] = 9;
+    assert!(codec
+        .read_request(&protocol(), &mut Cursor::new(bytes))
+        .await
+        .is_err());
+}

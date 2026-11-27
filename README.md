@@ -474,6 +474,43 @@ under `~/.jetsam/data/`.
 The current `wallet.key` is not password-encrypted. It is created with
 owner-only permissions; back it up and protect it.
 
+### Reachability: `public_addresses`
+
+A node behind a router or a firewall, or listening on `0.0.0.0`, reaches its
+peers on its own, but peers can dial it back only if its P2P port is open *and*
+the node announces where. Until then, inbound peers arrive only through relays
+and hole punching: the node keeps fewer peers and the blocks it finds take
+longer to reach the network, so a miner or a pool can see more of them
+orphaned.
+
+When UPnP succeeds (`upnp` is on by default), the router maps the port and the
+node announces it by itself; the log says `upnp: router mapped our port`.
+Otherwise:
+
+1. Forward TCP port `9700` (or the port of `network.listen`) to this machine on
+   the router, or open it in the firewall.
+2. Declare the external address in `~/.jetsam/jetsam.toml`, then restart the
+   node:
+
+```toml
+[network]
+public_addresses = ["203.0.113.7:9700"]
+```
+
+Each entry is `IP:PORT` or a libp2p multiaddr (`/ip4/…/tcp/9700`,
+`/ip6/…/tcp/9700`) with a globally routable IP (no host name, no `/p2p`) and a
+non-zero TCP port; the node stops at startup on any other entry. The log then
+shows `registered public P2P address`, and `autonat: peers can dial us` once
+peers have confirmed it. A node that declares a public address no longer asks
+the router for a UPnP mapping, and serves private nodes as a relay, with a
+bounded number of reservations and circuits.
+
+When AutoNAT concludes that peers cannot dial the node and `public_addresses`
+is empty, the node logs one warning, naming the port to forward. A guardian
+(`[network.onion]` with `enabled = true` and `mode = "guardian"`; without
+`enabled = true` the node refuses to start) runs no AutoNAT and refuses any
+public address, so this does not apply to it.
+
 ### CLI
 
 Addresses use bech32m and begin with `j1`. `1 JTM = 1,000,000 μJTM`.

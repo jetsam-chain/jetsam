@@ -1,0 +1,24 @@
+[package]
+name = "jetsam-bridge-claim-guest"
+version = "0.3.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace, built only for riscv64im-succinct-zkvm-elf (../build-guest.sh).
+[workspace]
+
+[features]
+testnet = ["spv-core/testnet"]
+rehearsal-v1-7 = ["spv-core/rehearsal-v1-7"]
+# TEST ONLY: the clock of the node's G6 = V4 vectors; never a deployed program.
+test-clock-j69120 = ["spv-core/test-clock-j69120"]
+
+[dependencies]
+sp1-zkvm = { version = "=6.10.0" }
+spv-core = { package = "jetsam_bridge_program", path = "../core" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

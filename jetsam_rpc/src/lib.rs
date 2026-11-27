@@ -5,7 +5,11 @@
 //! # jetsam_rpc — JSON-RPC Server for the Jetsam Full Node
 
 pub mod api;
+pub mod bridge;
 pub mod client_objects;
+pub mod destination;
+pub mod guardian;
+pub mod observed_branches;
 pub mod server;
 pub mod types;
 pub mod wallet_ops;

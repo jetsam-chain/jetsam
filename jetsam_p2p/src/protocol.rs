@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::{ops::Deref, sync::Arc};
 
 use crate::header_protocol::HeaderInventoryRecord;
+pub use jetsam_chain::storage::{SnapshotAnnexKind, SnapshotAnnexRef};
 use crate::object_protocol::{ChainPoint, DataResponseStatus, SnapshotId};
 
 /// Deterministic finalized heights at which independent nodes build the same
@@ -186,6 +187,13 @@ pub struct GetStateManifestHeader {
     /// the installed state and headers.
     #[serde(default)]
     pub client_registry: Vec<u8>,
+    /// The v1.7 annexes of a boundary at or above J (T7.1): the destination
+    /// state file and the guardian journal, by kind, exact length and root,
+    /// in kind order; empty below J. The manifest digest commits to them;
+    /// they travel as content-addressed files on the client-object protocol,
+    /// and the receiver authenticates their content at the install.
+    #[serde(default)]
+    pub annexes: Vec<SnapshotAnnexRef>,
 }
 
 /// Manifest response: chain metadata + list of active segment IDs.
@@ -233,6 +241,22 @@ pub struct GetStateManifestResponse {
     /// when there is none (M3.8). See [`GetStateManifestHeader::client_registry`].
     #[serde(default)]
     pub client_registry: Vec<u8>,
+    /// The v1.7 annexes of the boundary (T7.1). See
+    /// [`GetStateManifestHeader::annexes`].
+    #[serde(default)]
+    pub annexes: Vec<SnapshotAnnexRef>,
+}
+
+/// At most one annex of each kind.
+pub const MAX_SNAPSHOT_MANIFEST_ANNEXES: usize = SnapshotAnnexKind::ALL.len();
+const SNAPSHOT_MANIFEST_ANNEX_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIFEST/V1.7-ANNEXES/V1";
+
+/// Whether a manifest's annexes are canonical: each kind at most once, in
+/// kind order, each admissible (non-empty, within its kind's bound).
+pub fn snapshot_annexes_are_canonical(annexes: &[SnapshotAnnexRef]) -> bool {
+    annexes.len() <= MAX_SNAPSHOT_MANIFEST_ANNEXES
+        && annexes.iter().all(SnapshotAnnexRef::is_admissible)
+        && annexes.windows(2).all(|pair| pair[0].kind < pair[1].kind)
 }
 
 /// Upper bound of the registry bytes a manifest carries: version, count, and
@@ -242,6 +266,18 @@ const SNAPSHOT_MANIFEST_CLIENT_REGISTRY_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIF
 
 pub const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 2;
 const SNAPSHOT_MANIFEST_DIGEST_DOMAIN: &[u8] = b"JTM/P2P/SNAPSHOT-MANIFEST/V2";
+
+/// Highest boundary a snapshot manifest may name: 2^32 - 1 (audit
+/// 2026-11-10, S-2). At one block every 90 s, the shortest target spacing
+/// this chain has had, a chain reaches it after about 12 000 years, so no
+/// honest manifest is refused. Every height a manifest carries then stays far
+/// from the end of u64: its tip, its bridge at most
+/// `RECENT_BLOCK_RETENTION_DEPTH` above, and the successor heights snapshot
+/// staging derives from them. A manifest at u64::MAX passed every other check
+/// and stopped the node that staged it. A higher claim is the peer's bad
+/// response: refused when its header is read, before any descriptor page is
+/// fetched, and by every constructor of a `VerifiedStateManifest`.
+pub const MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT: u64 = u32::MAX as u64;
 
 impl GetStateManifestHeader {
     pub fn computed_manifest_digest(&self) -> Option<[u8; 32]> {
@@ -278,6 +314,19 @@ impl GetStateManifestHeader {
             hasher.update(SNAPSHOT_MANIFEST_CLIENT_REGISTRY_DOMAIN);
             hasher.update(&(self.client_registry.len() as u16).to_le_bytes());
             hasher.update(&self.client_registry);
+        }
+        // A manifest without annexes hashes exactly as before v1.7.
+        if !self.annexes.is_empty() {
+            if !snapshot_annexes_are_canonical(&self.annexes) {
+                return None;
+            }
+            hasher.update(SNAPSHOT_MANIFEST_ANNEX_DOMAIN);
+            hasher.update(&[self.annexes.len() as u8]);
+            for annex in &self.annexes {
+                hasher.update(&[annex.kind.code()]);
+                hasher.update(&annex.len.to_le_bytes());
+                hasher.update(&annex.root);
+            }
         }
         Some(*hasher.finalize().as_bytes())
     }
@@ -377,6 +426,7 @@ impl GetStateManifestHeader {
             segment_roots,
             segment_lengths,
             client_registry: self.client_registry.clone(),
+            annexes: self.annexes.clone(),
         };
         validate_manifest_descriptors(&response).then_some(response)
     }
@@ -522,6 +572,7 @@ impl GetStateManifestResponse {
             segment_count: u32::try_from(self.segment_ids.len()).ok()?,
             descriptor_pages: refs,
             client_registry: self.client_registry.clone(),
+            annexes: self.annexes.clone(),
         };
         header.seal_manifest_digest().then_some((header, pages))
     }
@@ -553,6 +604,7 @@ fn validate_manifest_descriptors(manifest: &GetStateManifestResponse) -> bool {
     };
 
     if manifest.tip_height == 0
+        || manifest.tip_height > MAX_SNAPSHOT_MANIFEST_TIP_HEIGHT
         || manifest.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION
         || manifest.segment_ids.len() != manifest.segment_roots.len()
         || manifest.segment_ids.len() != manifest.segment_lengths.len()
@@ -796,6 +848,10 @@ pub struct NetworkTopics {
     pub protocol_id: String,
     /// v1.5 client-proof announcements (112 bytes each, M3.8).
     pub client_proofs: String,
+    /// v1.7 destination and guardian intents (T7.1,
+    /// [`crate::bridge_intent_gossip`]): `None` unless the v1.7 height is
+    /// armed, and then nothing is joined or published.
+    pub bridge_intents: Option<String>,
 }
 
 impl NetworkTopics {
@@ -807,6 +863,8 @@ impl NetworkTopics {
             txs: cfg.topic_txs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
             client_proofs: format!("{}/gossip/client-proofs/1", cfg.p2p_protocol_id),
+            bridge_intents: jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT
+                .map(|_| format!("{}/gossip/bridge-intents/1", cfg.p2p_protocol_id)),
         }
     }
 }

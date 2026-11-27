@@ -110,8 +110,10 @@ pub const fn v1_5_activation_is_valid(activation: u64) -> bool {
 
 /// **Private builds only** (`rehearsal-v1-6`): the private v1.5
 /// height ([`crate::consensus::params::REHEARSAL_V1_5_ACTIVATION`]) is not a
-/// payout height of the 960-block cadence; no payout falls inside a
-/// private run (the first one after it is at 516).
+/// payout height of the 960-block cadence. Its schedule is the one the private
+/// v1.5 and v1.6 relations prove (T7.7): payouts on the multiples of 480 above
+/// it (the first at 480), the window closing at `350 400 + ⌊J/2⌋`
+/// ([`payout_after_activation`], [`end_height_after_activation`]).
 #[cfg(feature = "rehearsal-v1-6")]
 pub const fn v1_5_activation_is_valid(activation: u64) -> bool {
     activation == crate::consensus::params::REHEARSAL_V1_5_ACTIVATION
@@ -136,12 +138,25 @@ const _: () = assert!(
 pub const fn development_allocation_end_height_with(activation: Option<u64>) -> u64 {
     match activation {
         None => DEVELOPMENT_ALLOCATION_END_HEIGHT_90S,
-        Some(activation) => {
-            activation
-                + (DEVELOPMENT_ALLOCATION_PAYOUTS - activation / DEVELOPMENT_PAYOUT_INTERVAL_90S)
-                    * DEVELOPMENT_PAYOUT_INTERVAL_180S
-        }
+        Some(activation) => end_height_after_activation(activation),
     }
+}
+
+/// `J + (730 − J/960) × 480`.
+#[cfg(not(feature = "rehearsal-v1-6"))]
+const fn end_height_after_activation(activation: u64) -> u64 {
+    activation
+        + (DEVELOPMENT_ALLOCATION_PAYOUTS - activation / DEVELOPMENT_PAYOUT_INTERVAL_90S)
+            * DEVELOPMENT_PAYOUT_INTERVAL_180S
+}
+
+/// **Private builds only** (T7.7): the end the v1.5 and v1.6 relations prove,
+/// `730 × 480 + ⌊J/2⌋` — the public formula for every `J` a multiple of 960,
+/// and for the private `J` (36) the only one a private chain can carry
+/// (350 418, where the public formula gives 350 436).
+#[cfg(feature = "rehearsal-v1-6")]
+const fn end_height_after_activation(activation: u64) -> u64 {
+    DEVELOPMENT_ALLOCATION_PAYOUTS * DEVELOPMENT_PAYOUT_INTERVAL_180S + activation / 2
 }
 
 /// One maximum fund share is one twentieth (5%) of the block subsidy.
@@ -255,16 +270,33 @@ pub const fn development_payout_due(height: u64) -> bool {
 }
 
 /// Testable twin of [`development_payout_due`] with the v1.5 activation height
-/// injected: every 960 blocks up to and including it, then at `J + 480·k`.
+/// injected: every 960 blocks up to and including it, then at `J + 480·k`
+/// (private builds: [`payout_after_activation`]).
 #[inline]
 pub(crate) const fn development_payout_due_with(height: u64, activation: Option<u64>) -> bool {
     development_allocation_active_with(height, activation)
         && match activation {
-            Some(activation) if height > activation => {
-                (height - activation).is_multiple_of(DEVELOPMENT_PAYOUT_INTERVAL_180S)
-            }
+            Some(activation) if height > activation => payout_after_activation(height, activation),
             _ => height.is_multiple_of(DEVELOPMENT_PAYOUT_INTERVAL_90S),
         }
+}
+
+/// After the v1.5 height, a payout every 480 blocks: at `J + 480·k`.
+#[cfg(not(feature = "rehearsal-v1-6"))]
+#[inline]
+const fn payout_after_activation(height: u64, activation: u64) -> bool {
+    (height - activation).is_multiple_of(DEVELOPMENT_PAYOUT_INTERVAL_180S)
+}
+
+/// **Private builds only** (T7.7): on the multiples of 480, as the v1.5 and
+/// v1.6 relations prove it — they take `J` for a multiple of 960, where these
+/// are the heights `J + 480·k`. For the private `J` (36) the payouts fall at
+/// 480, 960, … and not at 516, 996, …: under the old rule a private chain
+/// stopped at 479, no miner able to prove a block 480 without its payout.
+#[cfg(feature = "rehearsal-v1-6")]
+#[inline]
+const fn payout_after_activation(height: u64, _activation: u64) -> bool {
+    height.is_multiple_of(DEVELOPMENT_PAYOUT_INTERVAL_180S)
 }
 
 /// Blocks the payout at `height` pays for: 960 up to and including the v1.5

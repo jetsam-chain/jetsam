@@ -1,0 +1,27 @@
+[package]
+name = "jetsam_bridge_xtest"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "In CI: G6 = V4 (the node's vault gate and the bridge proof program on the same blocks, differential and exhaustive), the program's clocks against the node's, and the checkpoint frame v3 against the relayer's reference (jetsam_guardian) on real headers. Tests only."
+
+[features]
+# The private rehearsal: the node and the program on their rehearsal clocks.
+rehearsal-v1-7 = ["jetsam_chain/rehearsal-v1-7", "jetsam_bridge_program/rehearsal-v1-7"]
+# The test chain: the node and the program on its clocks (`jetsam_chain/testnet` alone arms the program too,
+# through `jetsam_vault_rule::TESTNET_PROFILE`; this names both, as `rehearsal-v1-7` does).
+testnet = ["jetsam_chain/testnet", "jetsam_bridge_program/testnet"]
+
+[dependencies]
+jetsam_chain = { path = "../../jetsam_chain" }
+jetsam_tx = { path = "../../jetsam_tx" }
+jetsam_poseidon2b = { path = "../../jetsam_poseidon2b" }
+jetsam_vault_rule = { path = "../../jetsam_vault_rule" }
+jetsam_bridge_program = { path = "../core" }
+
+[dev-dependencies]
+# The checkpoint frame v3 against the relayer's reference values (tests/checkpoint_v3.rs).
+jetsam_guardian = { path = "../../jetsam_guardian" }
+tw-core = { package = "jetsam_bridge_towerwalk", path = "../towerwalk" }
+serde_json = { workspace = true }

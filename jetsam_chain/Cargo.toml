@@ -6,27 +6,53 @@ license = "Apache-2.0"
 
 [features]
 # Test-chain identity: distinct genesis, address HRP, protocol namespace,
-# ports and data directory. Never enable for a mainnet release.
-testnet = ["jetsam_poseidon2b/testnet"]
+# ports and data directory. Never enable for a mainnet release. It names the
+# profile to V4's crate too (no rule changes there), which the bridge proof
+# program of the same build follows (M5: the relayer's, the cross tests').
+testnet = ["jetsam_poseidon2b/testnet", "jetsam_vault_rule/testnet"]
 # PRIVATE BUILDS ONLY: the test profile with
 # v1.5 armed at 36 and v1.6 at 64, the short client activation delay from
 # genesis, so a private chain on a loopback-only network crosses both in a
 # few hours. Never in a release build, never on a public network: no
 # released binary, script or pack is built with it.
 rehearsal-v1-6 = ["testnet"]
+# PRIVATE BUILDS ONLY: the private chain of rehearsal-v1-6 with v1.7 armed
+# at 96 (params::REHEARSAL_V1_7_ACTIVATION). Never in a release build, never
+# on a public network.
+rehearsal-v1-7 = ["rehearsal-v1-6", "jetsam_vault_rule/rehearsal-v1-7"]
 
 [dependencies]
 tracing = { workspace = true }
 jetsam_core = { path = "../jetsam_core" }
 jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
 jetsam_tx = { path = "../jetsam_tx" }
+# V4, the deposit rule of the bridge vault, shared with the L1's proof program (G6 = V4).
+jetsam_vault_rule = { path = "../jetsam_vault_rule" }
 jetsam_fri = { path = "../jetsam_fri" }
 jetsam_fri_binius = { path = "../jetsam_fri_binius" }
 rayon = "1.10"
 libmdbx = "0.6"
+# `jetsam --compact-db`: mdbx_env_copy (MDBX_CP_COMPACT), which the libmdbx
+# crate does not wrap. The exact version libmdbx 0.6.6 itself pins.
+mdbx-sys = "=13.11.0"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
+# v1.7 destination module: the L1's sync-committee signatures (BLS12-381),
+# SSZ roots (SHA-256) and state proofs (keccak-256), as in the bench of the
+# return path.
+blst = "=0.3.16"
+sha2 = "=0.10.9"
+tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
+# A5-24: the salt of the segment tree cache's release oracle, drawn once per
+# process from the operating system (the version the workspace already locks).
+getrandom = "0.2"
+
+# Database health: free space of the data volume (statvfs) and the owner of
+# the database file kept across a compaction.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = "3"
 rayon     = "1.10"

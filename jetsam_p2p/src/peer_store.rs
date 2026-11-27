@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 
+use crate::onion::policy::AddressPolicy;
 use crate::peer_diversity::contains_public_ip;
 
 const MAX_PEERS: usize = 500;
@@ -48,6 +49,9 @@ pub(crate) struct CachedPeer {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SuccessfulPeerCache {
     entries: HashMap<PeerId, CachedPeer>,
+    /// Which addresses are kept: public IPs as before, plus validated onion
+    /// addresses when the onion service is enabled (D60).
+    policy: AddressPolicy,
 }
 
 impl SuccessfulPeerCache {
@@ -56,7 +60,7 @@ impl SuccessfulPeerCache {
     }
 
     pub(crate) fn record_success(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        if !contains_public_ip(&addr) {
+        if !self.policy.keeps_cached(&addr, contains_public_ip) {
             return;
         }
         let now = unix_now();
@@ -103,18 +107,30 @@ impl SuccessfulPeerCache {
     }
 }
 
+/// The cache as a node without onion reads it (the node itself calls
+/// [`load_for`] with its policy).
+#[cfg(test)]
 pub(crate) fn load(data_dir: &Path) -> SuccessfulPeerCache {
+    load_for(data_dir, AddressPolicy::Clearnet)
+}
+
+/// [`load`], keeping the addresses `policy` keeps.
+pub(crate) fn load_for(data_dir: &Path, policy: AddressPolicy) -> SuccessfulPeerCache {
+    let empty = SuccessfulPeerCache {
+        policy,
+        ..SuccessfulPeerCache::default()
+    };
     let path = peer_store_path(data_dir);
     let Ok(bytes) = std::fs::read(&path) else {
-        return SuccessfulPeerCache::default();
+        return empty;
     };
     let Ok(mut entries) = serde_json::from_slice::<Vec<PeerEntry>>(&bytes) else {
         tracing::warn!(path = %path.display(), "peer store: failed to parse, starting empty");
-        return SuccessfulPeerCache::default();
+        return empty;
     };
     entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.last_success_unix));
 
-    let mut cache = SuccessfulPeerCache::default();
+    let mut cache = empty;
     for entry in entries.into_iter().take(MAX_PEERS) {
         let Ok(peer_id) = PeerId::from_str(&entry.peer_id) else {
             continue;
@@ -124,7 +140,7 @@ pub(crate) fn load(data_dir: &Path) -> SuccessfulPeerCache {
             .addrs
             .iter()
             .filter_map(|encoded| encoded.parse().ok())
-            .filter(|addr| contains_public_ip(addr))
+            .filter(|addr| policy.keeps_cached(addr, contains_public_ip))
             .filter(|addr| seen.insert(addr.clone()))
             .take(MAX_ADDRS_PER_PEER)
             .collect();
@@ -307,5 +323,76 @@ mod tests {
             .unwrap();
         assert_eq!(version.len(), crate::peer_versions::MAX_AGENT_VERSION_CHARS);
         assert!(version.starts_with("jetsam/1.6.0??z"));
+    }
+}
+
+#[cfg(test)]
+mod onion_tests {
+    use super::*;
+
+    const SYNTHETIC: &str = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead";
+
+    fn onion() -> Multiaddr {
+        format!("/onion3/{SYNTHETIC}:9700").parse().unwrap()
+    }
+
+    fn public() -> Multiaddr {
+        "/ip4/8.8.8.8/tcp/9500".parse().unwrap()
+    }
+
+    #[test]
+    fn onion_peers_are_cached_only_while_the_onion_service_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (onion_peer, public_peer) = (PeerId::random(), PeerId::random());
+
+        let mut dual = load_for(dir.path(), AddressPolicy::ClearnetAndOnion);
+        dual.record_success(onion_peer, onion());
+        dual.record_success(
+            onion_peer,
+            onion().with(libp2p::multiaddr::Protocol::P2p(onion_peer)),
+        );
+        dual.record_success(public_peer, public());
+        save(dir.path(), &dual);
+        let reloaded = load_for(dir.path(), AddressPolicy::ClearnetAndOnion);
+        let mut cached = reloaded
+            .entries()
+            .map(|entry| (entry.peer_id, entry.addrs.clone()))
+            .collect::<Vec<_>>();
+        cached.sort_by_key(|(peer, _)| (*peer != onion_peer, peer.to_string()));
+        assert_eq!(
+            cached,
+            vec![(onion_peer, vec![onion()]), (public_peer, vec![public()])]
+        );
+
+        // Onion off: exactly the pre-D57 cache, onion entries ignored.
+        let clearnet = load(dir.path());
+        assert_eq!(
+            clearnet
+                .entries()
+                .map(|entry| entry.peer_id)
+                .collect::<Vec<_>>(),
+            vec![public_peer]
+        );
+        let mut off = SuccessfulPeerCache::default();
+        off.record_success(onion_peer, onion());
+        assert_eq!(off.entries().count(), 0);
+
+        // A guardian keeps no clearnet address.
+        let guardian = load_for(dir.path(), AddressPolicy::OnionOnly);
+        assert_eq!(
+            guardian
+                .entries()
+                .map(|entry| entry.peer_id)
+                .collect::<Vec<_>>(),
+            vec![onion_peer]
+        );
+        let mut guardian = load_for(
+            tempfile::tempdir().unwrap().path(),
+            AddressPolicy::OnionOnly,
+        );
+        guardian.record_success(public_peer, public());
+        assert_eq!(guardian.entries().count(), 0);
+        guardian.record_success(onion_peer, onion());
+        assert_eq!(guardian.entries().count(), 1);
     }
 }

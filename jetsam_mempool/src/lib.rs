@@ -47,9 +47,11 @@
 //! ```
 
 pub mod config;
+pub mod destination;
 pub mod error;
 pub mod event;
 pub mod floor;
+pub mod guardian;
 pub mod pool;
 pub mod view;
 
@@ -60,7 +62,7 @@ pub mod view;
 pub use config::MempoolConfig;
 pub use error::SubmitError;
 pub use event::{EvictReason, MempoolEvent};
-pub use floor::FeeFloor;
+pub use floor::{FeeFloor, RelayFloor};
 pub use pool::{
     AsyncMempool, AuthorizationVerificationExecutor, AuthorizationVerificationTask,
     MempoolEntryMetadata, MempoolMetadataSnapshot, MempoolUsageSnapshot, SelectedMempoolEntry,

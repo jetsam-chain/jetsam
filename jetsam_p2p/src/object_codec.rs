@@ -6,10 +6,9 @@
 
 use std::{collections::HashSet, io, sync::Arc};
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
-use jetsam_chain::consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES};
+use jetsam_chain::consensus::wire_limits::history_step_terminal_bytes_limit;
 
 use crate::{
     inbound_budget::process_global_inbound_budget,
@@ -71,7 +70,6 @@ impl ObjectCodec {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for ObjectCodec {
     type Protocol = StreamProtocol;
     type Request = GetObjectsRequest;
@@ -290,11 +288,27 @@ fn validate_request(objects: &[ObjectId]) -> io::Result<()> {
 }
 
 fn validate_object_id(object: ObjectId) -> io::Result<()> {
+    validate_object_id_with_v1_7(
+        object,
+        jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
+    )
+}
+
+/// [`validate_object_id`] on an injected v1.7 clock: a block body may exceed
+/// `MAX_BLOCK_BYTES` by the destination section from that height on.
+pub(crate) fn validate_object_id_with_v1_7(
+    object: ObjectId,
+    v1_7_activation: Option<u64>,
+) -> io::Result<()> {
     match object {
         ObjectId::BlockBody(object) => {
             if object.claim.height == 0
                 || object.encoded_len == 0
-                || object.encoded_len as usize > MAX_BLOCK_BYTES
+                || object.encoded_len as usize
+                    > jetsam_chain::consensus::wire_limits::block_bytes_limit_at_activation(
+                        object.claim.height,
+                        v1_7_activation,
+                    )
             {
                 return Err(invalid_data(
                     "block body object id is outside its fixed cap",
@@ -510,6 +524,7 @@ fn invalid_data(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jetsam_chain::consensus::wire_limits::MAX_BLOCK_BYTES;
     use libp2p::request_response::Codec;
 
     fn body(height: u64, byte: u8, bytes: &[u8]) -> ObjectId {

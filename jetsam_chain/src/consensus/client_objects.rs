@@ -1099,11 +1099,42 @@ pub fn client_object_marker_kind_at(
 }
 
 /// [`is_client_locked_address`] at `height`: from the v1.6 height on, a batch
-/// submission marker owner is locked too.
+/// submission marker owner is locked too; from the v1.7 height on, the
+/// bridge's markers (`vault::is_destination_locked_address_at`, rule V5) and
+/// the guardians' (`guardian::is_guardian_locked_address_at`, rule M-5); from
+/// the return-over-Base height on, the advance's markers
+/// (`destination::advance::is_advance_locked_address_at`) and the fast lane's
+/// (`destination::fast::is_fast_locked_address_at`); from the fix height on
+/// (FIXRC), `JTMADV03` (`destination::advance::is_advance_v3_locked_address_at`).
 pub fn is_client_locked_address_at(owner: &Address, height: u64, batch: &ClientBatchRules) -> bool {
     *owner == CLIENT_LICENSE_BURN_ADDRESS
         || *owner == CLIENT_LICENSE_POOL_ADDRESS
         || client_object_marker_kind_at(owner, height, batch).is_some()
+        || crate::consensus::vault::is_destination_locked_address_at(
+            owner,
+            height,
+            crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+        )
+        || crate::consensus::guardian::is_guardian_locked_address_at(
+            owner,
+            height,
+            crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+        )
+        || crate::consensus::destination::advance::is_advance_locked_address_at(
+            owner,
+            height,
+            crate::consensus::params::V1_7_BASE_RETURN_HEIGHT,
+        )
+        || crate::consensus::destination::fast::is_fast_locked_address_at(
+            owner,
+            height,
+            crate::consensus::params::V1_7_BASE_RETURN_HEIGHT,
+        )
+        || crate::consensus::destination::advance::is_advance_v3_locked_address_at(
+            owner,
+            height,
+            crate::consensus::params::V1_7_RETURN_FIX_HEIGHT,
+        )
 }
 
 /// Root of a matrix file: the byte-hash of its 1 MiB chunk digests, in order.
@@ -1168,6 +1199,18 @@ pub fn encode_client_objects_section(objects: &[ClientObject], buf: &mut Vec<u8>
 /// an empty list; a present section is canonical (marker, count in
 /// `1..=MAX_BLOCK_CLIENT_OBJECTS`, objects, nothing after).
 pub fn decode_client_objects_section(src: &mut &[u8]) -> Result<Vec<ClientObject>, WireError> {
+    let objects = decode_client_objects_section_prefix(src)?;
+    if !src.is_empty() {
+        return Err(WireError::TrailingBytes);
+    }
+    Ok(objects)
+}
+
+/// [`decode_client_objects_section`] without its final check: from the v1.7
+/// height on, the destination section follows this one.
+pub fn decode_client_objects_section_prefix(
+    src: &mut &[u8],
+) -> Result<Vec<ClientObject>, WireError> {
     if src.is_empty() {
         return Ok(Vec::new());
     }
@@ -1181,9 +1224,6 @@ pub fn decode_client_objects_section(src: &mut &[u8]) -> Result<Vec<ClientObject
     let mut objects = Vec::with_capacity(count);
     for _ in 0..count {
         objects.push(ClientObject::decode(src)?);
-    }
-    if !src.is_empty() {
-        return Err(WireError::TrailingBytes);
     }
     Ok(objects)
 }

@@ -6,7 +6,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use jetsam_chain::{
@@ -153,7 +152,6 @@ pub struct NetworkProfileResponse {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NetworkProfileCodec;
 
-#[async_trait]
 impl request_response::Codec for NetworkProfileCodec {
     type Protocol = StreamProtocol;
     type Request = NetworkProfileRequest;

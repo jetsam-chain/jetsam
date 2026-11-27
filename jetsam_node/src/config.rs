@@ -98,6 +98,22 @@ pub struct NetworkConfig {
     /// CLI flag: --no-upnp.
     #[serde(default = "default_true")]
     pub upnp: bool,
+    /// Tor onion service, `[network.onion]` (D57, D60). Off by default: a
+    /// node that leaves it off runs, and writes its config, exactly as
+    /// before.
+    ///
+    /// `mode = "additional"` (dual) adds an onion address beside clearnet. It
+    /// does NOT hide this node's IP address, which stays announced under the
+    /// same identity. `mode = "guardian"` is onion only, for guardians: P2P
+    /// listens only on the service's loopback target, dials only through
+    /// Tor's SOCKS port, announces only the onion address, uses no DNS,
+    /// AutoNAT, relay, UPnP or mDNS — and the node refuses to start if any
+    /// setting could still expose it on clearnet.
+    #[serde(
+        default,
+        skip_serializing_if = "jetsam_p2p::onion::OnionConfig::is_default"
+    )]
+    pub onion: jetsam_p2p::onion::OnionConfig,
 }
 
 fn default_true() -> bool {
@@ -137,6 +153,7 @@ impl Default for NodeConfig {
                 public_addresses: vec![],
                 lan_discovery: false, // a broadcast nobody asked for
                 upnp: true,           // a home router serves nobody without it
+                onion: jetsam_p2p::onion::OnionConfig::default(), // off
             },
             storage: StorageConfig {
                 backend: "mdbx".into(),
@@ -182,6 +199,72 @@ miner_address = ""
             cfg.network.listen.as_ref().map(ListenAddresses::as_slice),
             Some(vec!["0.0.0.0:9700"])
         );
+    }
+
+    /// A node that does not enable the onion service writes the config it
+    /// wrote before D57: no `[network.onion]` section appears in it.
+    #[test]
+    fn a_node_without_onion_writes_its_config_exactly_as_before() {
+        let text = toml::to_string_pretty(&NodeConfig::default()).expect("serialize");
+        assert!(!text.contains("onion"), "{text}");
+        let legacy = r#"
+[network]
+listen = "0.0.0.0:9700"
+seeds = []
+public_addresses = []
+
+[storage]
+backend = "mdbx"
+path = '~/.jetsam/data'
+
+[rpc]
+listen = "127.0.0.1:9701"
+
+[mining]
+enabled = false
+miner_address = ""
+"#;
+        let cfg: NodeConfig = toml::from_str(legacy).expect("legacy config must parse");
+        assert_eq!(cfg.network.onion, jetsam_p2p::onion::OnionConfig::default());
+        assert!(!cfg.network.onion.enabled);
+        assert!(!toml::to_string(&cfg).unwrap().contains("onion"));
+    }
+
+    #[test]
+    fn an_onion_section_parses_and_survives_a_rewrite() {
+        let toml = r#"
+[network]
+listen = "0.0.0.0:9700"
+seeds = []
+public_addresses = []
+
+[network.onion]
+enabled = true
+mode = "guardian"
+socks = "127.0.0.1:9150"
+
+[storage]
+backend = "mdbx"
+path = '~/.jetsam/data'
+
+[rpc]
+listen = "127.0.0.1:9701"
+
+[mining]
+enabled = false
+miner_address = ""
+"#;
+        let cfg: NodeConfig = toml::from_str(toml).expect("onion config must parse");
+        assert!(cfg.network.onion.enabled);
+        assert_eq!(
+            cfg.network.onion.mode,
+            jetsam_p2p::onion::OnionMode::Guardian
+        );
+        assert_eq!(cfg.network.onion.socks, "127.0.0.1:9150");
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("[network.onion]"), "{text}");
+        let back: NodeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.network.onion, cfg.network.onion);
     }
 
     #[test]

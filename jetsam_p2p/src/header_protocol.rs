@@ -7,7 +7,8 @@
 use jetsam_chain::{
     block::BLOCK_WIRE_HEADER_OFFSET,
     block_header::{block_id, semantic_header_id},
-    consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES},
+    consensus::params::V1_7_ACTIVATION_HEIGHT,
+    consensus::wire_limits::{block_bytes_limit_at_activation, history_step_terminal_bytes_limit},
     history_step::{HistoryStepTerminalMetadata, HISTORY_STEP_CLASS_COUNT},
     AcceptedBlockBundle, BlockHeader, BLOCK_HEADER_WIRE_SIZE,
 };
@@ -208,12 +209,22 @@ impl HeaderInventoryRecord {
     }
 
     pub fn validate(&self) -> Result<(), HeaderAnnounceError> {
+        self.validate_with_v1_7(V1_7_ACTIVATION_HEIGHT)
+    }
+
+    /// [`Self::validate`] on an injected v1.7 clock: a body may exceed
+    /// `MAX_BLOCK_BYTES` by the destination section from that height on.
+    pub(crate) fn validate_with_v1_7(
+        &self,
+        v1_7_activation: Option<u64>,
+    ) -> Result<(), HeaderAnnounceError> {
         let expected_hash = block_id(&self.header);
         if self.body.is_some_and(|body| {
             body.claim.height != self.header.height
                 || body.claim.block_hash != expected_hash
                 || body.encoded_len == 0
-                || body.encoded_len as usize > MAX_BLOCK_BYTES
+                || body.encoded_len as usize
+                    > block_bytes_limit_at_activation(self.header.height, v1_7_activation)
         }) {
             return Err(HeaderAnnounceError::BodyClaimMismatch);
         }
@@ -391,6 +402,14 @@ impl HeaderAnnouncement {
     }
 
     pub fn validate(&self) -> Result<(), HeaderAnnounceError> {
+        self.validate_with_v1_7(V1_7_ACTIVATION_HEIGHT)
+    }
+
+    /// [`Self::validate`] on an injected v1.7 clock.
+    pub(crate) fn validate_with_v1_7(
+        &self,
+        v1_7_activation: Option<u64>,
+    ) -> Result<(), HeaderAnnounceError> {
         let expected_hash = block_id(&self.header);
         if self.body.claim.height != self.header.height
             || self.body.claim.block_hash != expected_hash
@@ -407,7 +426,10 @@ impl HeaderAnnouncement {
                 self.terminal.claim.proof_class,
             ));
         }
-        if self.body.encoded_len == 0 || self.body.encoded_len as usize > MAX_BLOCK_BYTES {
+        if self.body.encoded_len == 0
+            || self.body.encoded_len as usize
+                > block_bytes_limit_at_activation(self.header.height, v1_7_activation)
+        {
             return Err(HeaderAnnounceError::BodyLength(self.body.encoded_len));
         }
         if self.terminal.encoded_len == 0
@@ -458,9 +480,221 @@ pub enum HeaderAnnounceError {
     NonCanonicalMissingInventory,
 }
 
+/// Retained inventory records memoised by the exact bytes they describe
+/// (audit 2026-11-10, P-3). Building a record decodes the body and hashes it
+/// and the terminal (up to 1 MiB) with Poseidon2b, about 0.15 s of CPU, for a
+/// 16-byte request; the objects are immutable, so a repeated request costs a
+/// lookup. The key carries a SipHash fingerprint and the length of each
+/// object as read from the store, so a changed object is never served from a
+/// stale entry.
+pub(crate) const HEADER_INVENTORY_CACHE_ENTRIES: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct HeaderInventoryKey {
+    height: u64,
+    block_id: [u8; 32],
+    body: Option<(usize, u64)>,
+    terminal: Option<(usize, u64)>,
+}
+
+impl HeaderInventoryKey {
+    pub(crate) fn of(header: &BlockHeader, body: Option<&[u8]>, terminal: Option<&[u8]>) -> Self {
+        fn fingerprint(bytes: &[u8]) -> (usize, u64) {
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(bytes);
+            (bytes.len(), hasher.finish())
+        }
+        Self {
+            height: header.height,
+            block_id: block_id(header),
+            body: body.map(fingerprint),
+            terminal: terminal.map(fingerprint),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HeaderInventoryCache {
+    entries: std::collections::HashMap<HeaderInventoryKey, HeaderInventoryRecord>,
+    order: std::collections::VecDeque<HeaderInventoryKey>,
+}
+
+impl HeaderInventoryCache {
+    /// The record for these exact objects: from the cache, or from `build`
+    /// (run without holding the lock, so workers never queue behind a hash).
+    pub(crate) fn record_through(
+        cache: &std::sync::Mutex<Self>,
+        header: BlockHeader,
+        body: Option<&[u8]>,
+        terminal: Option<&[u8]>,
+        build: impl FnOnce(
+            BlockHeader,
+            Option<&[u8]>,
+            Option<&[u8]>,
+        ) -> Result<HeaderInventoryRecord, HeaderAnnounceError>,
+    ) -> Result<HeaderInventoryRecord, HeaderAnnounceError> {
+        let key = HeaderInventoryKey::of(&header, body, terminal);
+        fn lock(
+            cache: &std::sync::Mutex<HeaderInventoryCache>,
+        ) -> std::sync::MutexGuard<'_, HeaderInventoryCache> {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        if let Some(record) = lock(cache).entries.get(&key).copied() {
+            return Ok(record);
+        }
+        let record = build(header, body, terminal)?;
+        let mut cache = lock(cache);
+        if cache.entries.insert(key, record).is_none() {
+            cache.order.push_back(key);
+            while cache.order.len() > HEADER_INVENTORY_CACHE_ENTRIES {
+                if let Some(oldest) = cache.order.pop_front() {
+                    cache.entries.remove(&oldest);
+                }
+            }
+        }
+        Ok(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// What the gossip reactor may do with a header announcement before the node
+/// has seen it (audit 2026-11-10, P-4). Announcements used to be accepted, and
+/// so relayed network-wide, on their structure alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnnouncementPrecheck {
+    /// Valid proof of work near our tip, under a target a real chain can
+    /// reach from it: relay it.
+    Relay,
+    /// Not judged here (no tip, too far from it, or a target easier than any
+    /// real chain could carry by now): the node still receives it, nobody
+    /// receives it from us. A real block the node accepts still spreads
+    /// through the availability cascade.
+    DeliverOnly,
+    /// The proof of work misses the header's own declared target, which no
+    /// valid header can do on any branch.
+    Invalid,
+}
+
+/// Our canonical tip, read from the store for [`precheck_announcement`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnnouncementReference {
+    pub(crate) tip_height: u64,
+    pub(crate) tip_target: [u8; 32],
+    pub(crate) tip_parent_timestamp: u64,
+}
+
+/// Heights relayed above our tip (a node one block behind still relays).
+pub(crate) const ANNOUNCEMENT_RELAY_AHEAD: u64 = 2;
+/// Heights relayed below our tip: competing branches inside finality.
+pub(crate) const ANNOUNCEMENT_RELAY_BELOW: u64 =
+    2 * jetsam_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+pub(crate) fn precheck_announcement(
+    header: &BlockHeader,
+    reference: Option<&AnnouncementReference>,
+    now_unix: u64,
+) -> AnnouncementPrecheck {
+    use jetsam_chain::consensus::params::{
+        BLOCK_TIME, BLOCK_TIME_V1_5, HALFLIFE, HALFLIFE_V1_5, HALFLIFE_V1_6, MAX_FUTURE_DRIFT,
+    };
+    // The most generous rule any height has used: shortest halflife, longest
+    // block time. Two more bits cover ASERT's fixed-point approximation.
+    const MIN_HALFLIFE: u64 = min_u64(HALFLIFE, min_u64(HALFLIFE_V1_5, HALFLIFE_V1_6));
+    const MAX_BLOCK_TIME: u64 = if BLOCK_TIME > BLOCK_TIME_V1_5 {
+        BLOCK_TIME
+    } else {
+        BLOCK_TIME_V1_5
+    };
+    const TARGET_SLACK_BITS: u64 = 2;
+
+    let Some(reference) = reference else {
+        return AnnouncementPrecheck::DeliverOnly;
+    };
+    if header.height
+        <= reference
+            .tip_height
+            .saturating_sub(ANNOUNCEMENT_RELAY_BELOW)
+        || header.height
+            > reference
+                .tip_height
+                .saturating_add(ANNOUNCEMENT_RELAY_AHEAD)
+    {
+        return AnnouncementPrecheck::DeliverOnly;
+    }
+    if jetsam_chain::consensus::validate_pow(header).is_err() {
+        return AnnouncementPrecheck::Invalid;
+    }
+    // ASERT makes a target a function of its parent's time and its height
+    // alone, whatever the branch: from our tip's target, a valid header can
+    // ease by at most one bit per halflife of time its parent may be younger
+    // than our tip's parent, plus the ideal time of the heights it sits below
+    // our tip. Its parent cannot be younger than our clock's future limit.
+    let below = reference.tip_height.saturating_sub(header.height);
+    let elapsed = now_unix
+        .saturating_add(MAX_FUTURE_DRIFT)
+        .saturating_sub(reference.tip_parent_timestamp)
+        .saturating_add(below.saturating_mul(MAX_BLOCK_TIME));
+    let bits = elapsed
+        .div_ceil(MIN_HALFLIFE)
+        .saturating_add(TARGET_SLACK_BITS);
+    let easiest = le256_shl_saturating(&reference.tip_target, bits);
+    if jetsam_chain::consensus::difficulty::le256_lt(&easiest, &header.difficulty_target) {
+        AnnouncementPrecheck::DeliverOnly
+    } else {
+        AnnouncementPrecheck::Relay
+    }
+}
+
+const fn min_u64(a: u64, b: u64) -> u64 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// `value << bits` for a little-endian 256-bit integer, saturating at the
+/// all-ones value.
+fn le256_shl_saturating(value: &[u8; 32], bits: u64) -> [u8; 32] {
+    let mut limbs = [0u64; 4];
+    for (index, limb) in limbs.iter_mut().enumerate() {
+        *limb = u64::from_le_bytes(value[index * 8..index * 8 + 8].try_into().expect("8 bytes"));
+    }
+    let Some(top) = (0..4).rev().find(|index| limbs[*index] != 0) else {
+        return [0u8; 32];
+    };
+    let highest_bit = top as u64 * 64 + 63 - u64::from(limbs[top].leading_zeros());
+    if highest_bit.saturating_add(bits) >= 256 {
+        return [0xff; 32];
+    }
+    let limb_shift = (bits / 64) as usize;
+    let bit_shift = (bits % 64) as u32;
+    let mut shifted = [0u64; 4];
+    for index in limb_shift..4 {
+        let source = index - limb_shift;
+        shifted[index] = limbs[source] << bit_shift;
+        if bit_shift > 0 && source > 0 {
+            shifted[index] |= limbs[source - 1] >> (64 - bit_shift);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (index, limb) in shifted.iter().enumerate() {
+        out[index * 8..index * 8 + 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jetsam_chain::consensus::wire_limits::MAX_BLOCK_BYTES;
     use jetsam_chain::Block;
 
     fn bundle() -> AcceptedBlockBundle {
@@ -471,6 +705,7 @@ mod tests {
             header,
             transactions: Vec::new(),
             client_objects: Vec::new(),
+            destination: None,
         };
         // The terminal's wire version is a property of its own height, and the
         // activation height that decides it differs between networks: writing
@@ -641,6 +876,262 @@ mod tests {
         assert_eq!(
             announcement.encode(),
             Err(HeaderAnnounceError::BodyClaimMismatch)
+        );
+    }
+    /// From the v1.7 height on, a block body may carry the destination
+    /// section beyond `MAX_BLOCK_BYTES`: the announcement, the inventory and
+    /// the object request of such a body are accepted at its height, and only
+    /// there; below it, or with the clock dormant, the v1.6 cap holds.
+    #[test]
+    fn p2p_accepts_v1_7_block_size() {
+        use jetsam_chain::consensus::wire_limits::{
+            MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES,
+        };
+        const J: u64 = 69_120;
+        let announcement_at = |height: u64, body_len: usize| {
+            let mut header = jetsam_chain::consensus::genesis_header();
+            header.height = height;
+            HeaderAnnouncement {
+                header,
+                body: BlockBodyObjectId {
+                    claim: BlockBodyClaimId {
+                        height,
+                        block_hash: block_id(&header),
+                    },
+                    byte_digest: [1; 32],
+                    encoded_len: body_len as u32,
+                },
+                terminal: TerminalObjectId {
+                    claim: TerminalClaimId {
+                        height,
+                        semantic_header_id: semantic_header_id(&header),
+                        proof_class: 0,
+                    },
+                    byte_digest: [2; 32],
+                    encoded_len: 1_000,
+                },
+                providers: ProviderFlags::new(true, true, false),
+            }
+        };
+        for (height, v1_7, len, ok) in [
+            (J, Some(J), MAX_V1_7_BLOCK_BYTES, true),
+            (J + 1, Some(J), MAX_V1_7_BLOCK_BYTES, true),
+            (J, Some(J), MAX_V1_7_BLOCK_BYTES + 1, false),
+            (J - 1, Some(J), MAX_BLOCK_BYTES + 1, false),
+            (J - 1, Some(J), MAX_BLOCK_BYTES, true),
+            (J, None, MAX_BLOCK_BYTES + 1, false),
+        ] {
+            let announcement = announcement_at(height, len);
+            assert_eq!(
+                announcement.validate_with_v1_7(v1_7).is_ok(),
+                ok,
+                "announcement at {height} of {len} bytes under {v1_7:?}"
+            );
+            let record = HeaderInventoryRecord::from_announcement(announcement);
+            assert_eq!(record.validate_with_v1_7(v1_7).is_ok(), ok, "inventory");
+            assert_eq!(
+                crate::object_codec::validate_object_id_with_v1_7(
+                    crate::object_protocol::ObjectId::BlockBody(announcement.body),
+                    v1_7
+                )
+                .is_ok(),
+                ok,
+                "object request"
+            );
+        }
+        // The production rule follows this build's clock; the transport bound
+        // is the v1.6 one while it is dormant.
+        let at = jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.unwrap_or(J);
+        let largest = announcement_at(at, MAX_V1_7_BLOCK_BYTES);
+        let armed = jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT.is_some();
+        assert_eq!(largest.validate().is_ok(), armed);
+        assert_eq!(
+            MAX_BLOCK_TRANSPORT_BYTES,
+            if armed {
+                MAX_V1_7_BLOCK_BYTES
+            } else {
+                MAX_BLOCK_BYTES
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_2026_11_10_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
+    fn header_at(height: u64) -> BlockHeader {
+        let mut header = jetsam_chain::consensus::genesis_header();
+        header.height = height;
+        header
+    }
+
+    /// P-3: a repeated inventory request used to rehash the body and the
+    /// terminal every time.
+    #[test]
+    fn a_repeated_inventory_request_is_answered_without_rebuilding_the_record() {
+        let cache = Mutex::new(HeaderInventoryCache::default());
+        let builds = Cell::new(0);
+        let build = |header, body: Option<&[u8]>, terminal: Option<&[u8]>| {
+            builds.set(builds.get() + 1);
+            let _ = (body, terminal);
+            Ok(HeaderInventoryRecord::header_only(header))
+        };
+        let header = header_at(7);
+        let body = vec![1u8; 64];
+        let terminal = vec![2u8; 128];
+        for _ in 0..3 {
+            HeaderInventoryCache::record_through(
+                &cache,
+                header,
+                Some(&body),
+                Some(&terminal),
+                build,
+            )
+            .unwrap();
+        }
+        assert_eq!(builds.get(), 1, "the same objects are built once");
+
+        let mut other_terminal = terminal.clone();
+        other_terminal[5] ^= 1;
+        HeaderInventoryCache::record_through(
+            &cache,
+            header,
+            Some(&body),
+            Some(&other_terminal),
+            build,
+        )
+        .unwrap();
+        HeaderInventoryCache::record_through(&cache, header, Some(&body), None, build).unwrap();
+        assert_eq!(builds.get(), 3, "different bytes are a different record");
+    }
+
+    #[test]
+    fn the_inventory_cache_is_bounded_and_never_keeps_a_failure() {
+        let cache = Mutex::new(HeaderInventoryCache::default());
+        for height in 0..(HEADER_INVENTORY_CACHE_ENTRIES as u64 + 10) {
+            HeaderInventoryCache::record_through(
+                &cache,
+                header_at(height),
+                None,
+                None,
+                |h, _, _| Ok(HeaderInventoryRecord::header_only(h)),
+            )
+            .unwrap();
+        }
+        assert_eq!(cache.lock().unwrap().len(), HEADER_INVENTORY_CACHE_ENTRIES);
+
+        let failures = Cell::new(0);
+        for _ in 0..2 {
+            let _ = HeaderInventoryCache::record_through(
+                &cache,
+                header_at(9_999),
+                None,
+                None,
+                |_, _, _| {
+                    failures.set(failures.get() + 1);
+                    Err(HeaderAnnounceError::InvalidBundleHeader)
+                },
+            );
+        }
+        assert_eq!(failures.get(), 2, "an inconsistent object is judged again");
+    }
+
+    /// Half of the 256-bit range, little-endian.
+    fn half_target() -> [u8; 32] {
+        let mut target = [0xff; 32];
+        target[31] = 0x7f;
+        target
+    }
+
+    fn reference(tip_height: u64, tip_target: [u8; 32], now: u64) -> AnnouncementReference {
+        AnnouncementReference {
+            tip_height,
+            tip_target,
+            tip_parent_timestamp: now - 300,
+        }
+    }
+
+    fn mined(mut header: BlockHeader) -> BlockHeader {
+        header.nonce = (0..10_000u128)
+            .find(|nonce| {
+                header.nonce = *nonce;
+                jetsam_chain::consensus::validate_pow(&header).is_ok()
+            })
+            .expect("an easy target is met quickly");
+        header
+    }
+
+    /// P-4: random headers with no proof of work were accepted and relayed.
+    #[test]
+    fn a_header_that_misses_its_own_target_is_never_relayed() {
+        let now = 2_000_000_000;
+        let mut header = header_at(1_001);
+        header.timestamp = now;
+        header.difficulty_target = [0u8; 32];
+        assert_eq!(
+            precheck_announcement(&header, Some(&reference(1_000, half_target(), now)), now),
+            AnnouncementPrecheck::Invalid
+        );
+    }
+
+    /// P-4: a header that declares a trivially easy target meets it, but no
+    /// real chain can carry that target near our tip: not relayed.
+    #[test]
+    fn a_header_with_an_implausibly_easy_target_is_delivered_but_not_relayed() {
+        let now = 2_000_000_000;
+        let mut header = header_at(1_001);
+        header.timestamp = now;
+        header.difficulty_target = [0xff; 32];
+        let mut hard = [0u8; 32];
+        hard[24] = 1;
+        assert_eq!(
+            precheck_announcement(&mined(header), Some(&reference(1_000, hard, now)), now),
+            AnnouncementPrecheck::DeliverOnly
+        );
+    }
+
+    #[test]
+    fn a_mined_header_near_the_tip_is_relayed() {
+        let now = 2_000_000_000;
+        let reference = reference(1_000, half_target(), now);
+        for height in [1_001, 1_002, 1_000, 1_000 - ANNOUNCEMENT_RELAY_BELOW + 1] {
+            let mut header = header_at(height);
+            header.timestamp = now;
+            header.difficulty_target = half_target();
+            assert_eq!(
+                precheck_announcement(&mined(header), Some(&reference), now),
+                AnnouncementPrecheck::Relay,
+                "height {height}"
+            );
+        }
+    }
+
+    /// Far from our tip, or with no tip at all, nothing is judged and nothing
+    /// is relayed; the node still sees it (a syncing node must).
+    #[test]
+    fn an_announcement_far_from_the_tip_is_delivered_but_not_relayed() {
+        let now = 2_000_000_000;
+        let reference = reference(1_000, half_target(), now);
+        for height in [
+            1_000 + ANNOUNCEMENT_RELAY_AHEAD + 1,
+            1_000 - ANNOUNCEMENT_RELAY_BELOW,
+            50_000,
+        ] {
+            let mut header = header_at(height);
+            header.timestamp = now;
+            header.difficulty_target = [0u8; 32];
+            assert_eq!(
+                precheck_announcement(&header, Some(&reference), now),
+                AnnouncementPrecheck::DeliverOnly,
+                "height {height}"
+            );
+        }
+        assert_eq!(
+            precheck_announcement(&header_at(1), None, now),
+            AnnouncementPrecheck::DeliverOnly
         );
     }
 }

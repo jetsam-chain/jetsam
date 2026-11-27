@@ -1,0 +1,436 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 the Jetsam developers.
+
+//! **V4**, the deposit rule of the v1.7 bridge vault, in one place: the node's vault gate
+//! (`jetsam_chain::consensus::vault`) and the L1's proof program (`jetsam_bridge_program`, its G6 and
+//! its deposit claim) both run these functions, so that the program proves exactly the deposits the
+//! nodes accept (SPEC-v3 §6.1 G6, §6.4: "G6 = V4", one implementation).
+//!
+//! What V4 decides, from a block's transactions, its height and the constants below only:
+//!
+//! * **V4-0** — a system record (the coinbase, the development payout) never pays the vault, and never
+//!   carries a v1.7 marker.
+//! * **V5** (value) — a v1.7 marker output (`JTMBRDG1`, `JTMVRL01`, `JTMLCU01`) carries no value.
+//! * **V4** — an output to the vault is valid only in a deposit group or as a release's change: a group
+//!   that does not spend from the vault and pays it carries **exactly one** vault output (**V4-e**) and
+//!   **exactly one** marker `JTMBRDG1 ‖ recipient (20 B) ‖ 4 reserved bytes`, whose reserved bytes are
+//!   zero (**V4-a**) and whose recipient is not zero (**V4-b**), for an amount in
+//!   `[MIN_DEPOSIT, MAX_DEPOSIT]` (**V4-c**), in a block above the bridge opening `F` (**V4-d**); a
+//!   release marker outside a release refuses the group.
+//! * A group that spends from the vault is a release, never a deposit: it must have a release's shape
+//!   (owner, its `JTMVRL01` marker, at most one change to the vault, no other marker), or the block is
+//!   refused.
+//!
+//! What V4 does **not** decide, and these functions therefore do not read: the branch state and the
+//! block's destination section — V1-b (the floor), V2/V3 against the release object, D52 (paid
+//! indices), V6 (caps), V7 (the L1 proof), V8 (`bridge_locked`). The node checks them around these
+//! functions; the proof program cannot (no state), see `jetsam_bridge_program`.
+//!
+//! Owners are the 32-byte `Address` bytes, amounts µJTM.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(feature = "txid")]
+pub mod p2b;
+#[cfg(feature = "txid")]
+pub mod txid;
+
+/// µJTM per JTM.
+pub const MICRO_PER_JTM: u64 = 1_000_000;
+
+/// The vault's published spend secret; [`VAULT_ADDRESS`] is its `ADDRFX` image (checked by the node
+/// against `derive_address`).
+pub const VAULT_SECRET: [u8; 32] = *b"JTM/CONSENSUS/V1.7/VAULT-SECRET/";
+
+/// `ADDRFX(VAULT_SECRET)`.
+pub const VAULT_ADDRESS: [u8; 32] = [
+    0x0e, 0x96, 0x94, 0xb6, 0xeb, 0x00, 0xe3, 0xd9, 0x47, 0x7c, 0x83, 0xc1, 0x31, 0x29, 0x86, 0x5b,
+    0x29, 0x6a, 0x5b, 0xc2, 0xb4, 0x8e, 0xf0, 0xf3, 0xa5, 0xc4, 0x92, 0x41, 0x72, 0x06, 0xc2, 0x64,
+];
+
+/// Smallest deposit (D19).
+pub const MIN_DEPOSIT_MICRO: u64 = MICRO_PER_JTM;
+/// Largest deposit: the L1 contract's per-deposit cap (D28): a larger one could never be minted. D123: the
+/// bridge's largest exposure is the operator's bond, 50 000 JTM (the contract's `SLOW_PER_DEPOSIT` and
+/// `MAX_BURN_AMOUNT`); the test chain keeps 1 000 JTM below its caps height ([`TESTNET_CAPS_HEIGHT`]).
+pub const MAX_DEPOSIT_MICRO: u64 = 50_000 * MICRO_PER_JTM;
+
+/// Blocks between J and the bridge opening `F` (D44): the public network opens ≈ 3 days after J.
+#[cfg(not(any(feature = "testnet", feature = "rehearsal-v1-7")))]
+pub const BRIDGE_OPENING_DELAY: u64 = 1_440;
+/// The test chain opens [`TESTNET_OPENING_DELAY`] blocks after its J (D104), the rehearsal 32 (`F_R = J_R + 32`).
+#[cfg(any(feature = "testnet", feature = "rehearsal-v1-7"))]
+pub const BRIDGE_OPENING_DELAY: u64 = if TESTNET_PROFILE { TESTNET_OPENING_DELAY } else { 32 };
+
+/// Whether this build carries the rehearsal clock (the node checks it against its own feature).
+pub const REHEARSAL_CLOCK: bool = cfg!(feature = "rehearsal-v1-7");
+
+const _: () = assert!(BRIDGE_OPENING_DELAY >= 8, "F ≥ J + 8 (T1.1 §18.1)");
+const _: () = assert!(MIN_DEPOSIT_MICRO <= MAX_DEPOSIT_MICRO);
+
+/// `F` (`BRIDGE_DEPOSITS_FROM_HEIGHT`) of a v1.7 clock: none while J is none; a deposit is valid only
+/// in a block above it (V4-d).
+pub const fn bridge_deposits_from_height(v1_7_activation: Option<u64>) -> Option<u64> {
+    match v1_7_activation {
+        Some(j) => Some(j + BRIDGE_OPENING_DELAY),
+        None => None,
+    }
+}
+
+/// Marker of a deposit: `tag ‖ L1 recipient (20 B) ‖ 4 reserved zero bytes`.
+pub const BRIDGE_DEPOSIT_MARKER_TAG: [u8; 8] = *b"JTMBRDG1";
+/// Marker of a release: `tag ‖ n (8 B, little-endian) ‖ 16 bytes of its object's commitment`.
+pub const VAULT_RELEASE_MARKER_TAG: [u8; 8] = *b"JTMVRL01";
+/// Marker of an L1 committee update: `tag ‖ 24 bytes of its commitment`.
+pub const LIGHT_CLIENT_UPDATE_MARKER_TAG: [u8; 8] = *b"JTMLCU01";
+
+/// The three v1.7 markers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DestinationMarkerKind {
+    Deposit,
+    Release,
+    LightClientUpdate,
+}
+
+/// The v1.7 marker an owner carries, if any (only meaningful from the v1.7 height on; below it these
+/// are ordinary owners).
+pub fn destination_marker_kind(owner: &[u8; 32]) -> Option<DestinationMarkerKind> {
+    let tag = [
+        owner[0], owner[1], owner[2], owner[3], owner[4], owner[5], owner[6], owner[7],
+    ];
+    match tag {
+        BRIDGE_DEPOSIT_MARKER_TAG => Some(DestinationMarkerKind::Deposit),
+        VAULT_RELEASE_MARKER_TAG => Some(DestinationMarkerKind::Release),
+        LIGHT_CLIENT_UPDATE_MARKER_TAG => Some(DestinationMarkerKind::LightClientUpdate),
+        _ => None,
+    }
+}
+
+/// The deposit marker owner for an L1 `recipient`.
+pub fn deposit_marker(recipient: &[u8; 20]) -> [u8; 32] {
+    let mut owner = [0u8; 32];
+    owner[..8].copy_from_slice(&BRIDGE_DEPOSIT_MARKER_TAG);
+    owner[8..28].copy_from_slice(recipient);
+    owner
+}
+
+/// The parameters of V4 for one v1.7 clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepositRule {
+    /// J: below it nothing is read and nothing is refused.
+    pub activation_height: Option<u64>,
+    /// `F`: deposits only in blocks above it (V4-d); none while J is none.
+    pub deposits_from_height: Option<u64>,
+    pub vault: [u8; 32],
+    pub min_deposit: u64,
+    /// The largest deposit, D123's ([`MAX_DEPOSIT_MICRO`]): read it with [`DepositRule::max_deposit_at`].
+    pub max_deposit: u64,
+    /// D123 on a chain that ran v1.7 under the cap of before (the test chain): that cap below its caps
+    /// height; `None` elsewhere (the public network and the rehearsal have D123's from J).
+    pub legacy: Option<LegacyDepositCap>,
+}
+
+/// D123 on a chain that ran v1.7 under the cap of before (the test chain, from J = 8 160): the largest
+/// deposit is `max_deposit` below `raised_at`, and at every height while `raised_at` is `None` (not chosen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyDepositCap {
+    pub raised_at: Option<u64>,
+    pub max_deposit: u64,
+}
+
+/// D123 (10 November 2026): the test chain's caps height. From the block at this height on, the test chain
+/// judges its deposits, releases and vault under D123's caps (50 000 JTM, [`MAX_DEPOSIT_MICRO`] here, V6 and
+/// V8 in the node's vault gate); below it under the caps it ran v1.7 with since J = 8 160 (1 000 / 2 500 /
+/// 10 000 JTM): a hard fork of the test chain. **Chosen: 8 910** (`None` would mean not chosen: every block
+/// judged under the caps of before). The node (`params::V1_7_TESTNET_CAPS_HEIGHT`)
+/// and the proof program (`jetsam_bridge_program::deposit`, its own `testnet` feature) both read this one
+/// constant. The public network and the rehearsal have no such height: D123's caps from their J.
+pub const TESTNET_CAPS_HEIGHT: Option<u64> = Some(8_910);
+/// The test chain's largest deposit below its caps height (D28's 1 000 JTM, the contract's cap of before).
+pub const TESTNET_PRE_D123_MAX_DEPOSIT_MICRO: u64 = 1_000 * MICRO_PER_JTM;
+/// The test chain's deposit cap of before D123, until [`TESTNET_CAPS_HEIGHT`].
+pub const TESTNET_LEGACY_DEPOSIT_CAP: LegacyDepositCap =
+    LegacyDepositCap { raised_at: TESTNET_CAPS_HEIGHT, max_deposit: TESTNET_PRE_D123_MAX_DEPOSIT_MICRO };
+
+/// Whether D123's caps govern the block at `height` of a chain that raises them at `raised_at` (`None`:
+/// not chosen, never).
+pub const fn d123_caps_at(raised_at: Option<u64>, height: u64) -> bool {
+    matches!(raised_at, Some(h) if height >= h)
+}
+
+const _: () = assert!(MIN_DEPOSIT_MICRO <= TESTNET_PRE_D123_MAX_DEPOSIT_MICRO);
+const _: () = assert!(TESTNET_PRE_D123_MAX_DEPOSIT_MICRO <= MAX_DEPOSIT_MICRO);
+
+impl DepositRule {
+    /// V4-c's largest deposit in the block at `height`: D123's, or the cap of before below the caps height of a
+    /// chain that carries one ([`LegacyDepositCap`]).
+    pub const fn max_deposit_at(&self, height: u64) -> u64 {
+        match self.legacy {
+            Some(legacy) if !d123_caps_at(legacy.raised_at, height) => legacy.max_deposit,
+            _ => self.max_deposit,
+        }
+    }
+
+    /// The definitive rule (this build's constants) under the v1.7 clock `activation_height`.
+    pub const fn for_activation(activation_height: Option<u64>) -> Self {
+        Self {
+            activation_height,
+            deposits_from_height: bridge_deposits_from_height(activation_height),
+            vault: VAULT_ADDRESS,
+            min_deposit: MIN_DEPOSIT_MICRO,
+            max_deposit: MAX_DEPOSIT_MICRO,
+            legacy: if TESTNET_PROFILE { Some(TESTNET_LEGACY_DEPOSIT_CAP) } else { None },
+        }
+    }
+
+    /// Whether the v1.7 rules apply at `height`.
+    pub const fn active_at(&self, height: u64) -> bool {
+        matches!(self.activation_height, Some(activation) if height >= activation)
+    }
+
+    /// V4-d: whether a block at `height` may carry a deposit.
+    pub const fn deposits_open_at(&self, height: u64) -> bool {
+        match self.deposits_from_height {
+            Some(opening) => height > opening,
+            None => false,
+        }
+    }
+}
+
+/// Why V4 refuses a block (the node's `VaultError` of the same name; `group` counts the block's user
+/// groups from 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleError {
+    /// A coinbase or development payout carries a v1.7 marker.
+    MarkerInSystemRecord,
+    /// V4-0: a coinbase or development payout pays the vault.
+    VaultOutputInSystemRecord,
+    /// A v1.7 marker output carries value.
+    MarkerCarriesValue { group: usize },
+    /// A group spends from the vault without a release marker.
+    SpendFromLockedAddress { group: usize },
+    /// A group spending from the vault is not owner, release marker, optional change to the vault.
+    ReleaseShape { group: usize },
+    /// A release marker in a group that does not spend from the vault.
+    ReleaseMarkerOutsideRelease { group: usize },
+    /// V4: an output to the vault outside a deposit group or a release's change.
+    VaultOutputOutsideDeposit { group: usize },
+    /// V4: a deposit group of the wrong shape (markers, vault outputs, reserved bytes, recipient).
+    DepositShape { group: usize },
+    /// V4-c: a deposit below `MIN_DEPOSIT` or above `MAX_DEPOSIT`.
+    DepositAmount { group: usize, amount: u64 },
+    /// V4-d: a deposit at a height at or below the bridge opening `F` (`opening` is `F`, `u64::MAX`
+    /// while there is none).
+    DepositBeforeBridgeOpening {
+        group: usize,
+        height: u64,
+        opening: u64,
+    },
+}
+
+/// What one user group is under V4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupClass {
+    /// Neither pays the vault nor spends from it.
+    Plain,
+    /// Spends from the vault with a release's shape (what else a release needs is not V4's).
+    Release,
+    /// A deposit to the L1 `recipient`.
+    Deposit { recipient: [u8; 20], amount: u64 },
+}
+
+/// A deposit of a block: its user group, its logical txid (the slow mint's single key, A5-12), recipient
+/// and amount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deposit {
+    pub group: usize,
+    pub txid: [u8; 32],
+    pub recipient: [u8; 20],
+    pub amount: u64,
+}
+
+/// A user group of a block as V4 reads it: the owner it spends from, its live outputs `(owner, amount)` (all
+/// its pages, in order), and its logical txid (`txid::logical_txid` of its pages, with the feature `txid`),
+/// which its deposit carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub input_owner: [u8; 32],
+    pub outputs: Vec<([u8; 32], u64)>,
+    pub txid: [u8; 32],
+}
+
+/// V4-0 on the owners of the live outputs of a block's system records, in order.
+pub fn check_system_outputs<'a>(
+    owners: impl IntoIterator<Item = &'a [u8; 32]>,
+    rule: &DepositRule,
+) -> Result<(), RuleError> {
+    for owner in owners {
+        if destination_marker_kind(owner).is_some() {
+            return Err(RuleError::MarkerInSystemRecord);
+        }
+        // V4-0.
+        if *owner == rule.vault {
+            return Err(RuleError::VaultOutputInSystemRecord);
+        }
+    }
+    Ok(())
+}
+
+/// The deposit part of V4 on the live outputs `(owner, amount)` of a group that does not spend from
+/// the vault (its markers already checked): `None` when it neither pays the vault nor carries a
+/// deposit marker.
+pub fn deposit_shape(
+    group: usize,
+    outputs: &[([u8; 32], u64)],
+    height: u64,
+    rule: &DepositRule,
+) -> Result<Option<([u8; 20], u64)>, RuleError> {
+    // The deposit markers and the vault outputs: their first, and how many.
+    let (mut markers, mut marker) = (0usize, None);
+    let (mut vault_outputs, mut amount) = (0usize, 0u64);
+    for (owner, value) in outputs {
+        if destination_marker_kind(owner) == Some(DestinationMarkerKind::Deposit) {
+            markers += 1;
+            marker.get_or_insert(*owner);
+        }
+        if *owner == rule.vault {
+            if vault_outputs == 0 {
+                amount = *value;
+            }
+            vault_outputs += 1;
+        }
+    }
+    match (markers, vault_outputs, marker) {
+        (0, 0, _) => Ok(None),
+        (0, _, _) => Err(RuleError::VaultOutputOutsideDeposit { group }),
+        (1, 1, Some(marker)) => {
+            let mut recipient = [0u8; 20];
+            recipient.copy_from_slice(&marker[8..28]);
+            // V4-a, V4-b.
+            if marker[28..] != [0u8; 4] || recipient == [0u8; 20] {
+                return Err(RuleError::DepositShape { group });
+            }
+            // V4-c (D123: the largest deposit of the block's height).
+            if amount < rule.min_deposit || amount > rule.max_deposit_at(height) {
+                return Err(RuleError::DepositAmount { group, amount });
+            }
+            // V4-d.
+            if !rule.deposits_open_at(height) {
+                return Err(RuleError::DepositBeforeBridgeOpening {
+                    group,
+                    height,
+                    opening: match rule.deposits_from_height {
+                        Some(opening) => opening,
+                        None => u64::MAX,
+                    },
+                });
+            }
+            Ok(Some((recipient, amount)))
+        }
+        // V4-e: not exactly one marker and one vault output.
+        _ => Err(RuleError::DepositShape { group }),
+    }
+}
+
+/// V4 on one user group of a block at `height` (from the v1.7 height on): the group spending from
+/// `input_owner` with the live outputs `outputs` (all its pages, in order).
+pub fn classify_group(
+    group: usize,
+    input_owner: &[u8; 32],
+    outputs: &[([u8; 32], u64)],
+    height: u64,
+    rule: &DepositRule,
+) -> Result<GroupClass, RuleError> {
+    // V5: no marker carries value, whatever the group.
+    let (mut markers, mut releases) = (0usize, 0usize);
+    for (owner, amount) in outputs {
+        if let Some(kind) = destination_marker_kind(owner) {
+            if *amount != 0 {
+                return Err(RuleError::MarkerCarriesValue { group });
+            }
+            markers += 1;
+            if kind == DestinationMarkerKind::Release {
+                releases += 1;
+            }
+        }
+    }
+    if *input_owner == rule.vault {
+        // A release: owner, its marker, optional change to the vault; nothing else. (Every marker
+        // here carries no value: checked above. Its marker being the group's only one, the owner and
+        // the change are no markers.)
+        let shape_ok = match outputs {
+            [(payee, _), (marker, _)] | [(payee, _), (marker, _), (_, _)] => {
+                destination_marker_kind(marker) == Some(DestinationMarkerKind::Release)
+                    && *payee != rule.vault
+                    && outputs
+                        .get(2)
+                        .is_none_or(|(change, _)| *change == rule.vault)
+            }
+            _ => false,
+        };
+        if releases == 0 {
+            return Err(RuleError::SpendFromLockedAddress { group });
+        }
+        if !shape_ok || markers != 1 {
+            return Err(RuleError::ReleaseShape { group });
+        }
+        return Ok(GroupClass::Release);
+    }
+    if releases != 0 {
+        return Err(RuleError::ReleaseMarkerOutsideRelease { group });
+    }
+    Ok(match deposit_shape(group, outputs, height, rule)? {
+        Some((recipient, amount)) => GroupClass::Deposit { recipient, amount },
+        None => GroupClass::Plain,
+    })
+}
+
+/// V4 on a whole block at `height`: the owners of its system records' live outputs, then each user
+/// [`Group`] in order. Below the v1.7 height nothing is read and nothing is refused. Its deposits, in
+/// group order, each with its group's logical txid.
+pub fn block_deposits(
+    height: u64,
+    system_owners: &[[u8; 32]],
+    groups: &[Group],
+    rule: &DepositRule,
+) -> Result<Vec<Deposit>, RuleError> {
+    if !rule.active_at(height) {
+        return Ok(Vec::new());
+    }
+    check_system_outputs(system_owners, rule)?;
+    let mut deposits = Vec::new();
+    for (group, g) in groups.iter().enumerate() {
+        if let GroupClass::Deposit { recipient, amount } =
+            classify_group(group, &g.input_owner, &g.outputs, height, rule)?
+        {
+            deposits.push(Deposit {
+                group,
+                txid: g.txid,
+                recipient,
+                amount,
+            });
+        }
+    }
+    Ok(deposits)
+}
+
+/// Whether this build carries the node's test chain profile (`jetsam_chain/testnet`), the private rehearsal's
+/// excepted (its builds name it on both sides): the proof program built without a profile of its own follows it
+/// (`jetsam_bridge_program::rules::PRODUCTION`). V4 reads it for the test chain's bridge opening
+/// ([`BRIDGE_OPENING_DELAY`]) and its deposit cap of before D123 ([`TESTNET_LEGACY_DEPOSIT_CAP`]).
+pub const TESTNET_PROFILE: bool = cfg!(all(feature = "testnet", not(feature = "rehearsal-v1-7")));
+
+/// The test chain's bridge opening delay (D104): `F = J + 544 = 8 160 + 544 = 8 704`, 544 = 17 x 32 blocks (≈ 27 h)
+/// instead of the public 1 440. [`BRIDGE_OPENING_DELAY`] of a build holding `testnet`; the proof program reads it
+/// under its own `testnet` feature, whose guest builds do not hold this crate's (`jetsam_bridge_program::deposit`).
+pub const TESTNET_OPENING_DELAY: u64 = 544;
+
+const _: () = assert!(TESTNET_OPENING_DELAY >= 8, "F ≥ J + 8 (T1.1 §18.1)");

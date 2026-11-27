@@ -16,7 +16,6 @@ use std::io;
 use crate::header_protocol::{HeaderInventoryRecord, HEADER_INVENTORY_RECORD_BYTES};
 use crate::object_protocol::DataResponseStatus;
 use crate::protocol::{GetHeadersRequest, GetHeadersResponse};
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 
@@ -51,7 +50,6 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeaderSyncCodec;
 
-#[async_trait]
 impl request_response::Codec for HeaderSyncCodec {
     type Protocol = StreamProtocol;
     type Request = GetHeadersRequest;

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT;
+use jetsam_chain::consensus::params::{V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT};
 use libp2p::PeerId;
 
 /// Longest announcement kept, in characters (all printable ASCII, so also
@@ -26,15 +26,28 @@ pub const MAX_OBSERVED_PEERS: usize = 1_024;
 pub const UNKNOWN_AGENT_VERSION: &str = "unknown";
 
 /// What this node announces: its release and the v1.6 height it carries,
-/// for example `jetsam/1.6.0 (v1.6=5760)`, or `(v1.6=dormant)` when none.
+/// for example `jetsam/1.6.0 (v1.6=5760)`, or `(v1.6=dormant)` when none;
+/// with the v1.7 height after it once armed, `(v1.6=46080, v1.7=69120)`.
+/// While v1.7 is dormant the announcement is the v1.6 one, byte for byte.
 /// A release that predates this announcement shows libp2p's default,
 /// `rust-libp2p/<version>`.
 pub fn local_agent_version() -> String {
-    let v1_6 = match V1_6_ACTIVATION_HEIGHT {
+    local_agent_version_with(V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT)
+}
+
+/// [`local_agent_version`] for the given heights.
+pub fn local_agent_version_with(v1_6: Option<u64>, v1_7: Option<u64>) -> String {
+    let v1_6 = match v1_6 {
         Some(height) => height.to_string(),
         None => "dormant".to_string(),
     };
-    format!("jetsam/{} (v1.6={v1_6})", env!("CARGO_PKG_VERSION"))
+    match v1_7 {
+        Some(v1_7) => format!(
+            "jetsam/{} (v1.6={v1_6}, v1.7={v1_7})",
+            env!("CARGO_PKG_VERSION")
+        ),
+        None => format!("jetsam/{} (v1.6={v1_6})", env!("CARGO_PKG_VERSION")),
+    }
 }
 
 /// A remote announcement as it is kept: at most [`MAX_AGENT_VERSION_CHARS`]
@@ -180,12 +193,47 @@ mod tests {
             Some(height) => height.to_string(),
             None => "dormant".to_string(),
         };
+        // An armed v1.7 (private builds only, so far) is named after it.
+        let v1_7 = match jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT {
+            Some(height) => format!(", v1.7={height}"),
+            None => String::new(),
+        };
         assert_eq!(
             agent,
-            format!("jetsam/{} (v1.6={height})", env!("CARGO_PKG_VERSION"))
+            format!("jetsam/{} (v1.6={height}{v1_7})", env!("CARGO_PKG_VERSION"))
         );
         // What we announce is exactly what a peer of ours records.
         assert_eq!(sanitize_agent_version(&agent), agent);
+    }
+
+    /// From the release that knows v1.7 on, the announcement names its v1.7
+    /// height beside the v1.6 one; while v1.7 is dormant, it is byte for byte
+    /// the v1.6 announcement.
+    #[test]
+    fn agent_version_announces_v1_7() {
+        let release = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            local_agent_version_with(Some(46_080), Some(69_120)),
+            format!("jetsam/{release} (v1.6=46080, v1.7=69120)")
+        );
+        assert_eq!(
+            local_agent_version_with(Some(46_080), None),
+            format!("jetsam/{release} (v1.6=46080)")
+        );
+        assert_eq!(
+            local_agent_version_with(None, None),
+            format!("jetsam/{release} (v1.6=dormant)")
+        );
+        let armed = local_agent_version_with(Some(46_080), Some(69_120));
+        assert_eq!(sanitize_agent_version(&armed), armed);
+        assert!(armed.len() <= MAX_AGENT_VERSION_CHARS);
+        assert_eq!(
+            local_agent_version(),
+            local_agent_version_with(
+                jetsam_chain::consensus::params::V1_6_ACTIVATION_HEIGHT,
+                jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT
+            )
+        );
     }
 
     #[test]

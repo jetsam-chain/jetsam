@@ -29,6 +29,8 @@ pub mod block_production;
 pub mod client_slot;
 pub mod colour;
 mod cpu_budget;
+pub mod destination_slot;
+pub mod guardian_slot;
 pub mod history_step_artifacts;
 pub mod miner;
 pub mod pow;

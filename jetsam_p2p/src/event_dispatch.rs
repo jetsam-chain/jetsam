@@ -291,6 +291,7 @@ fn classify(event: &NetworkEvent) -> EventClass {
         | NetworkEvent::StateSegmentRequestFailed { .. }
         | NetworkEvent::StateSegmentRequestBusy { .. } => EventClass::Historical,
         NetworkEvent::NewTx { .. }
+        | NetworkEvent::BridgeIntentRelayed { .. }
         | NetworkEvent::MempoolSyncResponse { .. }
         | NetworkEvent::ClientProofAnnounced { .. }
         | NetworkEvent::ClientRegistrationRelayed { .. }

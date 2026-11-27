@@ -9,7 +9,7 @@ jetsam_chain    = { path = "../jetsam_chain" }
 jetsam_tx       = { path = "../jetsam_tx" }
 jetsam_mempool = { path = "../jetsam_mempool" }
 jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
-libp2p       = { version = "0.55", features = [
+libp2p       = { version = "0.57", features = [
     "tokio", "tcp", "noise", "yamux", "dns",
     "gossipsub", "request-response", "cbor", "identify",
     "ping", "macros", "kad", "mdns",
@@ -19,7 +19,7 @@ libp2p       = { version = "0.55", features = [
     "upnp",      # ask the router to map the P2P port — no manual forwarding
     "autonat",   # learn whether this node is actually reachable from outside
 ] }
-libp2p-connection-limits = "0.5"
+libp2p-connection-limits = "0.7"
 futures  = "0.3"
 tokio      = { workspace = true }
 tracing    = { workspace = true }
@@ -27,11 +27,17 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
 anyhow     = { workspace = true }
-async-trait = "0.1"
 libc = "0.2"
 rand = "0.8"
 zstd = "0.13"
 blake3 = "1"
+# SAFECOOKIE authentication to Tor's ControlPort (HMAC-SHA256). Both crates
+# are pinned at versions the workspace already builds (hmac through
+# jetsam_guardian -> hkdf 0.12, sha2 through jetsam_chain), so that no new
+# code enters the build. libp2p-identity 0.3 (libp2p 0.57) moved to hmac 0.13
+# and sha2 0.11: they are not the versions used here.
+hmac = { version = "=0.12.1", default-features = false }
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 tokio = { workspace = true }

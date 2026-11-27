@@ -1,0 +1,55 @@
+[package]
+name = "jetsam_guardian"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+description = "Jetsam v1.7 guardian software (T5.1-T5.6): observer, signer, network side, aggregator, ceremony and keys."
+publish = false
+
+[features]
+# `jg-fill` reads the network's blocks with the build's v1.7 clock (`Block::from_bytes`,
+# `VaultRules::current`): its private-rehearsal build is made with this profile, like the nodes'.
+rehearsal-v1-7 = ["jetsam_chain/rehearsal-v1-7", "jetsam_bridge_program/rehearsal-v1-7"]
+
+[dependencies]
+jetsam_chain = { path = "../jetsam_chain" }
+jetsam_poseidon2b = { path = "../jetsam_poseidon2b" }
+blst = "=0.3.16"
+sha2 = "=0.10.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = "0.4"
+anyhow = { workspace = true }
+toml = "0.8"
+libc = "0.2"
+zeroize = "1"
+getrandom = "0.2"
+ed25519-dalek = "2"
+x25519-dalek = "2"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+argon2 = "0.5"
+bech32 = "0.11"
+# the 323-byte pages of a deposit block, as the checkpoint program reads them (relayer)
+jetsam_tx = { path = "../jetsam_tx" }
+# the checkpoint program v3: its input encoder and its relation, run natively before any proof (relayer)
+jetsam_bridge_program = { path = "../jetsam_bridge_program/core" }
+# A5-12: the one logical txid of a deposit, the program's (jg-fill advances under it)
+jetsam_vault_rule = { path = "../jetsam_vault_rule", features = ["txid"] }
+tw-core = { package = "jetsam_bridge_towerwalk", path = "../jetsam_bridge_program/towerwalk" }
+# Local signing of the robots' L1 transactions (secp256k1 ECDSA, RFC 6979): the relayer and jg-fill hold their
+# own hot key (BRIDGE-REST). RustCrypto, pure Rust; already in the offline registry.
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }
+# The fast lane's release (jg-relay fast-release): the intent's encoding as the node's mempool reads it,
+# and the vault group's spend authorization (the vault's published secret).
+jetsam_mempool = { path = "../jetsam_mempool" }
+jetsam_gkr = { path = "../jetsam_gkr" }
+# C-2 (audit 2026-11-10): https:// through Tor, TLS end to end with the named server (the web's roots); ring as the
+# provider; both already in the offline registry.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.7"
+
+[dev-dependencies]
+tempfile = "3"
+# C-2: a test certificate for the TLS server of the https:// tests (already in the offline registry)
+rcgen = "=0.13.2"

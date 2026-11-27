@@ -157,6 +157,7 @@ async fn spawn_hostile_peer(agent: String) -> (PeerId, u16) {
                 false,
                 false,
                 false,
+                false,
             )?;
             behaviour.identify = identify::Behaviour::new(
                 identify::Config::new("/jetsam/1.0.0".into(), key.public())

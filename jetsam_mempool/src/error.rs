@@ -47,21 +47,56 @@ pub enum SubmitError {
     #[error("invalid auth authorization: {0}")]
     InvalidProof(String),
 
+    /// M-1 (audit 2026-11-10): the template builder never places this group
+    /// (`group_fits_an_empty_template`), so no block of this node would carry
+    /// it. Policy, not consensus: an older node relays such a group.
+    #[error("no block template carries this transaction: {0}")]
+    NoTemplateCarries(String),
+
     /// Internal error (lock poisoned, channel closed, etc).
     #[error("internal: {0}")]
     Internal(String),
+
+    /// v1.7 (A1 m13): one source handed in more attestations and
+    /// equivocations in the last second than the pool verifies; refused
+    /// without any verification.
+    #[error("guardian objects rate-limited for {origin}")]
+    GuardianRateLimited { origin: String },
+
+    /// v1.7: the pool does not hold this guardian object beside what it
+    /// holds (the same object, an attestation of a height already covered,
+    /// a second equivocation, or a block's worth of delegation objects).
+    #[error("guardian object not held: {0}")]
+    GuardianNotHeld(String),
 }
 
 impl SubmitError {
     /// Returns `true` if this error is a soft rejection (no evidence of malice).
     /// Soft rejections can be retried after the on-chain state changes.
+    ///
+    /// v1.7 (A2-M1): a destination intent this node cannot judge yet — it
+    /// lacks the keys of a committee its branch knows, its branch knows no
+    /// committee, or the finality update is signed in a period its branch
+    /// does not know (yet) — is the node's own state, not the intent's fault.
     pub fn is_soft(&self) -> bool {
+        use jetsam_chain::consensus::destination::light_client::LightClientError;
+        use jetsam_chain::consensus::destination::state::DestinationBlockError;
         matches!(
             self,
             SubmitError::AlreadyAdmitted(_)
                 | SubmitError::Full { .. }
                 | SubmitError::BytesFull { .. }
                 | SubmitError::Consensus(ConsensusError::SlotConflict)
+                | SubmitError::GuardianRateLimited { .. }
+                | SubmitError::GuardianNotHeld(_)
+                | SubmitError::NoTemplateCarries(_)
+                | SubmitError::Consensus(ConsensusError::DestinationBlock(
+                    DestinationBlockError::CommitteeKeysUnavailable { .. }
+                        | DestinationBlockError::NoCommitteeKnown
+                        | DestinationBlockError::LightClient(
+                            LightClientError::UnknownCommitteePeriod { .. }
+                        )
+                ))
         )
     }
 }

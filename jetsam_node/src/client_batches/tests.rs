@@ -114,6 +114,7 @@ fn empty_block(height: u64) -> jetsam_chain::Block {
         header: header(height),
         transactions: Vec::new(),
         client_objects: Vec::new(),
+        destination: None,
     }
 }
 
@@ -308,6 +309,57 @@ fn the_reannouncement_interval_is_above_the_gossip_duplicate_window() {
         reannouncements.due(&[(batch_id(1), 7)], start + std::time::Duration::from_secs(2)),
         vec![ClientBatchAnnouncement { id: batch_id(1), fee: 7 }],
         "forgotten when no longer held: held again, it is due at once"
+    );
+}
+
+/// G-1 (audit 2026-11-10): a batch proof is decided over the registry's
+/// leaves, so over an empty registry (mainnet's catalogue is empty) no batch
+/// can ever be decided — yet the native verification (seconds) ran before the
+/// leaves were compared. An empty registry now refuses it first, as `retry:`
+/// (the registry may fill): not fetched again before the tip moves.
+#[test]
+fn a_batch_over_an_empty_registry_is_refused_before_any_decision() {
+    use jetsam_chain::consensus::client_objects::{
+        ClientObjectsEffect, ClientRegistryEntry, LicenseSplit,
+    };
+
+    let refused = refuse_over_an_empty_registry(&ClientRegistryState::new())
+        .expect_err("no batch is decided over an empty registry");
+    assert!(refused.starts_with("retry:"), "{refused}");
+
+    let mut registry = ClientRegistryState::new();
+    registry.apply(&ClientObjectsEffect {
+        registrations: vec![ClientRegistryEntry {
+            index: 0,
+            matrix_digest: [0x11; 32],
+            matrix_file_root: [0x22; 32],
+            matrix_file_len: 1,
+            registered_at: 10,
+            active_from: 12,
+            license: LicenseSplit::default(),
+        }],
+        ..ClientObjectsEffect::default()
+    });
+    assert_eq!(refuse_over_an_empty_registry(&registry), Ok(()));
+
+    // And `decide_and_hold` asks before the native decision.
+    let source = include_str!("../client_batches.rs");
+    let body = source
+        .split("fn decide_and_hold(")
+        .nth(1)
+        .expect("decide_and_hold")
+        .split("\n    }\n")
+        .next()
+        .expect("its body");
+    let screen = body
+        .find("refuse_over_an_empty_registry(tip.registry)")
+        .expect("decide_and_hold screens the registry");
+    let decision = body
+        .find("decide_client_batch_bytes(")
+        .expect("decide_and_hold decides");
+    assert!(
+        screen < decision,
+        "the registry is screened before the native decision"
     );
 }
 

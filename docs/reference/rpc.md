@@ -87,11 +87,16 @@ owner string.
 | `getPeerCount` | `[]` | Connected-peer count |
 | `getPeerVersions` | `[]` | `PeerVersionsInfo`: the version each identified peer announced |
 | `getNodeStatus` | `[]` | `NodeStatus` |
+| `getActivations` | `[]` | `Activations`: the activation heights and keys this node applies |
 | `estimateFee` | `[n_outputs: u32]` | Accepted minimum in μJTM, assuming one input |
 | `estimateFeeDetailed` | `[n_inputs: u32, n_outputs: u32]` | `FeeEstimate` |
 
 Detailed fee counts must be 1–1,020 inputs and 1–256 outputs. The returned fee
 includes the current relay floor.
+
+`getActivations` is a read: it needs no cookie (behind `--mining-key`, the key
+like every read). Its fields are read from the rules the node's own validation
+reads, never from a copy; see `Activations` below.
 
 ## Utility and submission methods
 
@@ -426,6 +431,32 @@ or on an endpoint that requires the bearer.
 `isolated_mining` is status information from a node started in a special
 operator context. Public deployments should not use it as a remote control or
 peer property.
+
+```text
+Activations {
+  network: string                  // id of this build's genesis block (32 bytes hex)
+  v1_5_height: u64 | null          // client object section of a block
+  v1_7_height: u64 | null          // J: destination section, bridge vault
+  deposits_from_height: u64 | null // F: deposits only in blocks above it
+  vault: string                    // the bridge vault's address (32 bytes hex)
+  vault_caps_height: u64 | null    // first height under the 50,000 JTM caps;
+                                   // 0: no caps of before; null: not chosen
+  base_return_height: u64 | null   // H: the return over Base and its fast lane
+  base_return_bridge: string | null // the bridge read from H on (20 bytes hex)
+  fast_release_key: string | null  // the fast lane's relay key (48 bytes hex)
+  fast_revoke_key: string | null   // its cold revocation key (48 bytes hex)
+  guardian_height: u64 | null      // the guardian rules' v1.7 height
+  delegation_height: u64 | null    // J_D
+  guardian_group_key: string | null // 48 bytes hex, none before the ceremony
+}
+```
+
+A height or key is `null` while it is dormant in this build. The guardian
+programs (`jg-relay`, its `fast-run` and `watch`, `jg-fill`) compare this
+record with their own build's before they use a node, and do not start when
+any field differs, when one side has a field the other does not know, or when
+the node has no `getActivations` (a node older than the program): update the
+nodes first, then the guardian programs (`jetsam_guardian/docs/CLES.md`).
 
 ### Fees
 

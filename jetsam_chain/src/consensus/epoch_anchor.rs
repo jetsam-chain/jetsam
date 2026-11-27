@@ -426,6 +426,7 @@ mod tests {
             header: crate::consensus::genesis_header(),
             transactions: vec![page(coinbase_anchor, true), page(user_anchor, false)],
             client_objects: Vec::new(),
+            destination: None,
         };
         let pair = AcceptedEpochAnchors { current, previous };
 

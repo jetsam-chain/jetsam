@@ -40,6 +40,13 @@ use jetsam_poseidon2b::native::poseidon2b_hash_bytes;
 
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"JETSAM_P2P_GOSSIPSUB_MESSAGE_ID";
 
+/// Period of the outbound ping on every connection. yamux and libp2p-tcp
+/// have no keepalive of their own: a flow dropped in silence by a NAT is
+/// noticed only through these pings.
+pub const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// An unanswered ping fails after this long.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(10);
+
 use crate::availability_codec::AvailabilityCodec;
 use crate::client_object_codec::ClientObjectCodec;
 use crate::header_protocol::MAX_HEADER_ANNOUNCE_BYTES;
@@ -60,6 +67,11 @@ use crate::state_segment_codec::StateSegmentCodec;
 /// latency-sensitive gossip and request-response near the front.
 #[derive(NetworkBehaviour)]
 pub struct NodeBehaviour {
+    /// Per-source admission ahead of the global limits (audit 2026-11-10,
+    /// P-1 and P-6): one public IP holds at most a few half-open handshakes,
+    /// and a penalized peer and its direct IP are refused for a while.
+    pub inbound_gate: InboundGate,
+
     /// Hard connection limits — evaluated before every stateful behaviour.
     ///
     /// Limits (production defaults, tunable via config):
@@ -131,7 +143,9 @@ pub struct NodeBehaviour {
     ///
     /// A relay reservation can make the node reachable via:
     ///   /ip4/<relay>/tcp/<port>/p2p/<relay_id>/p2p-circuit/p2p/<our_id>
-    pub relay_client: relay::client::Behaviour,
+    ///
+    /// Absent in onion-only (guardian) mode, as are DCUtR and AutoNAT.
+    pub relay_client: Toggle<relay::client::Behaviour>,
 
     /// Bounded Circuit Relay v2 service, enabled automatically only when this
     /// node declares a globally routable direct address. Private GUI nodes are
@@ -143,7 +157,7 @@ pub struct NodeBehaviour {
     /// Once two NAT'd nodes are connected through a relay, DCUtR coordinates
     /// simultaneous TCP/UDP connection attempts to punch through both NATs.
     /// On success the relay connection is replaced by a direct connection.
-    pub dcutr: dcutr::Behaviour,
+    pub dcutr: Toggle<dcutr::Behaviour>,
 
     /// UPnP / IGD — ask the router to map the listening port outward.
     ///
@@ -164,7 +178,7 @@ pub struct NodeBehaviour {
     /// Without it a node cannot tell a working inbound path from a broken one,
     /// so it reserves relay circuits it may not need and cannot know whether
     /// its UPnP mapping actually worked.
-    pub autonat: autonat::Behaviour,
+    pub autonat: Toggle<autonat::Behaviour>,
 
     /// State manifest sync — small control header only.
     pub state_manifest_sync: request_response::Behaviour<StateManifestCodec>,
@@ -217,6 +231,58 @@ impl NodeBehaviour {
         lan_discovery: bool,
         upnp_enabled: bool,
         client_objects: bool,
+        bridge_intents: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(
+            key,
+            protocol_id,
+            Some(relay_client),
+            background_capacity,
+            serve_relay,
+            lan_discovery,
+            upnp_enabled,
+            client_objects,
+            bridge_intents,
+            false,
+        )
+    }
+
+    /// The behaviour of a guardian (onion only, D60): no relay client or
+    /// server, no DCUtR, no AutoNAT, no UPnP, no mDNS, and Identify announces
+    /// the external (onion) address only, never a listen address.
+    pub fn onion_only(
+        key: &libp2p::identity::Keypair,
+        protocol_id: &str,
+        background_capacity: BackgroundCapacity,
+        client_objects: bool,
+        bridge_intents: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(
+            key,
+            protocol_id,
+            None,
+            background_capacity,
+            false,
+            false,
+            false,
+            client_objects,
+            bridge_intents,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        key: &libp2p::identity::Keypair,
+        protocol_id: &str,
+        relay_client: Option<relay::client::Behaviour>,
+        background_capacity: BackgroundCapacity,
+        serve_relay: bool,
+        lan_discovery: bool,
+        upnp_enabled: bool,
+        client_objects: bool,
+        bridge_intents: bool,
+        onion_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -262,7 +328,13 @@ impl NodeBehaviour {
             .mesh_n_low(2)
             .mesh_n_high(8)
             .mesh_outbound_min(1)
-            .max_transmit_size(MAX_TX_INTENT_BYTES_GLOBAL.max(MAX_HEADER_ANNOUNCE_BYTES))
+            // v1.7 (T7.1): a node on the bridge-intent topic also takes an
+            // intent whole (larger than a transaction); any other node keeps
+            // the limit of v1.6.
+            .max_transmit_size(crate::bridge_intent_gossip::gossip_max_transmit_size(
+                MAX_TX_INTENT_BYTES_GLOBAL.max(MAX_HEADER_ANNOUNCE_BYTES),
+                bridge_intents,
+            ))
             // Hold inbound messages until the network event loop has applied
             // structural, per-peer, and process-global admission. Without
             // manual validation, GossipSub forwards and retains a large block
@@ -523,17 +595,28 @@ impl NodeBehaviour {
                 .with_agent_version(crate::peer_versions::local_agent_version())
                 .with_push_listen_addr_updates(true)
                 // Re-identify periodically so address changes propagate.
-                .with_interval(Duration::from_secs(300)),
+                .with_interval(Duration::from_secs(300))
+                // A guardian announces its onion address (an external
+                // address) and never the loopback target it listens on.
+                .with_hide_listen_addrs(onion_only),
         );
 
-        let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30)));
+        // Liveness of every connection: the network closes a connection whose
+        // pings fail (libp2p-ping reports the second failure in a row).
+        let ping = ping::Behaviour::new(
+            ping::Config::new()
+                .with_interval(PING_INTERVAL)
+                .with_timeout(PING_TIMEOUT),
+        );
 
         // ----------------------------------------------------------------
         // NAT traversal: relay client + DCUtR
         // ----------------------------------------------------------------
         // DCUtR: coordinates simultaneous dial attempts between two NAT'd
         // nodes connected through a relay, upgrading to a direct connection.
-        let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+        let relay_client = Toggle::from(relay_client);
+        let dcutr =
+            Toggle::from((!onion_only).then(|| dcutr::Behaviour::new(key.public().to_peer_id())));
 
         // UPnP: only a node that does NOT already declare a routable address
         // has anything to ask a router for. `serve_relay` is exactly that
@@ -548,18 +631,20 @@ impl NodeBehaviour {
         // AutoNAT client: peers dial us back, and the answer tells us whether
         // the mapping above (or a manual port forward) actually works. The
         // defaults probe rarely enough to cost nothing on a small network.
-        let autonat = autonat::Behaviour::new(
-            key.public().to_peer_id(),
-            autonat::Config {
-                // A young network has few servers; asking three of them keeps
-                // one unlucky peer from deciding our reachability alone.
-                confidence_max: 3,
-                ..autonat::Config::default()
-            },
-        );
+        let autonat = Toggle::from((!onion_only).then(|| {
+            autonat::Behaviour::new(
+                key.public().to_peer_id(),
+                autonat::Config {
+                    // A young network has few servers; asking three of them keeps
+                    // one unlucky peer from deciding our reachability alone.
+                    confidence_max: 3,
+                    ..autonat::Config::default()
+                },
+            )
+        }));
         let relay_server = serve_relay
             .then(|| {
-                relay::Behaviour::new(
+                let mut relay_server = relay::Behaviour::new(
                     key.public().to_peer_id(),
                     relay::Config {
                         max_reservations: background_capacity.relay_max_reservations(),
@@ -580,7 +665,13 @@ impl NodeBehaviour {
                         max_circuit_bytes: 80 * 1024 * 1024,
                         ..relay::Config::default()
                     },
-                )
+                );
+                // libp2p-relay 0.22 serves the hop protocol only once an
+                // external address is confirmed, unless told otherwise. A node
+                // that declares a public address has always served it from the
+                // start, as with libp2p-relay 0.19: keep it so.
+                relay_server.set_status(Some(relay::Status::Enable));
+                relay_server
             })
             .into();
 
@@ -605,6 +696,7 @@ impl NodeBehaviour {
         );
 
         Ok(Self {
+            inbound_gate: InboundGate::default(),
             connection_limits,
             refused_seed_dials: RefusedSeedDials::default(),
             gossipsub,
@@ -700,5 +792,413 @@ impl NetworkBehaviour for RefusedSeedDials {
     ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
     {
         std::task::Poll::Pending
+    }
+}
+
+/// Half-open inbound handshakes one public source IP may hold at once
+/// (audit 2026-11-10, P-1). `connection_limits` counts pending inbound
+/// connections without looking at their source, so 64 sockets from one host
+/// that never finish Noise used to refuse every honest newcomer.
+pub(crate) const MAX_PENDING_INBOUND_PER_IP: usize = 4;
+
+/// How long a penalized peer, and the public IP it reached us from directly,
+/// is refused (audit 2026-11-10, P-6).
+pub(crate) const PEER_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
+
+/// Per-source admission placed before `connection_limits`.
+///
+/// Only a globally routable IP on a direct path is counted or banned: every
+/// onion session arrives from the local Tor process (loopback), a LAN or test
+/// cluster shares private addresses, and a relayed session carries no IP of
+/// its own. Those paths keep exactly the limits they had.
+#[derive(Default)]
+pub struct InboundGate {
+    pending: std::collections::HashMap<libp2p::swarm::ConnectionId, IpAddr>,
+    pending_per_ip: std::collections::HashMap<IpAddr, usize>,
+    banned_ips: std::collections::HashMap<IpAddr, std::time::Instant>,
+    banned_peers: std::collections::HashMap<libp2p::PeerId, std::time::Instant>,
+}
+
+impl InboundGate {
+    /// The IP an inbound path is counted against, if any.
+    fn direct_public_source(remote_addr: &libp2p::Multiaddr) -> Option<IpAddr> {
+        if remote_addr
+            .iter()
+            .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
+        {
+            return None;
+        }
+        crate::peer_diversity::public_ip(remote_addr)
+    }
+
+    pub(crate) fn admit_pending(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        remote_addr: &libp2p::Multiaddr,
+        now: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        let Some(ip) = Self::direct_public_source(remote_addr) else {
+            return Ok(());
+        };
+        if self.is_ip_banned(ip, now) {
+            return Err("penalized source address");
+        }
+        let pending = self.pending_per_ip.get(&ip).copied().unwrap_or(0);
+        if pending >= MAX_PENDING_INBOUND_PER_IP {
+            return Err("too many pending handshakes from one address");
+        }
+        self.pending_per_ip.insert(ip, pending + 1);
+        self.pending.insert(connection_id, ip);
+        Ok(())
+    }
+
+    fn release_pending(&mut self, connection_id: libp2p::swarm::ConnectionId) {
+        let Some(ip) = self.pending.remove(&connection_id) else {
+            return;
+        };
+        if let Some(count) = self.pending_per_ip.get_mut(&ip) {
+            *count -= 1;
+            if *count == 0 {
+                self.pending_per_ip.remove(&ip);
+            }
+        }
+    }
+
+    /// Refuse `peer` on every path, and the public IPs it reached us from
+    /// directly, until `now + PEER_BAN_DURATION`.
+    pub(crate) fn ban(
+        &mut self,
+        peer: libp2p::PeerId,
+        direct_ips: impl IntoIterator<Item = IpAddr>,
+        now: std::time::Instant,
+    ) {
+        // Bans only grow through penalties; expired ones go on every new one.
+        self.banned_peers.retain(|_, until| *until > now);
+        self.banned_ips.retain(|_, until| *until > now);
+        let until = now + PEER_BAN_DURATION;
+        self.banned_peers.insert(peer, until);
+        for ip in direct_ips {
+            if crate::peer_diversity::public_ip(&libp2p::Multiaddr::from(ip)).is_some() {
+                self.banned_ips.insert(ip, until);
+            }
+        }
+    }
+
+    pub(crate) fn is_peer_banned(&mut self, peer: libp2p::PeerId, now: std::time::Instant) -> bool {
+        match self.banned_peers.get(&peer) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                self.banned_peers.remove(&peer);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn is_ip_banned(&mut self, ip: IpAddr, now: std::time::Instant) -> bool {
+        match self.banned_ips.get(&ip) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                self.banned_ips.remove(&ip);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn refuse(reason: &'static str) -> libp2p::swarm::ConnectionDenied {
+        libp2p::swarm::ConnectionDenied::new(std::io::Error::other(reason))
+    }
+}
+
+impl NetworkBehaviour for InboundGate {
+    type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+    type ToSwarm = std::convert::Infallible;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        _: &libp2p::Multiaddr,
+        remote_addr: &libp2p::Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        self.admit_pending(connection_id, remote_addr, std::time::Instant::now())
+            .map_err(Self::refuse)
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        peer: libp2p::PeerId,
+        _: &libp2p::Multiaddr,
+        remote_addr: &libp2p::Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.release_pending(connection_id);
+        let now = std::time::Instant::now();
+        if self.is_peer_banned(peer, now)
+            || Self::direct_public_source(remote_addr).is_some_and(|ip| self.is_ip_banned(ip, now))
+        {
+            return Err(Self::refuse("penalized peer"));
+        }
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        peer: Option<libp2p::PeerId>,
+        _: &[libp2p::Multiaddr],
+        _: libp2p::core::Endpoint,
+    ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+        match peer {
+            Some(peer) if self.is_peer_banned(peer, std::time::Instant::now()) => {
+                Err(Self::refuse("penalized peer"))
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        peer: libp2p::PeerId,
+        _: &libp2p::Multiaddr,
+        _: libp2p::core::Endpoint,
+        _: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        if self.is_peer_banned(peer, std::time::Instant::now()) {
+            return Err(Self::refuse("penalized peer"));
+        }
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
+        // Every pending inbound connection ends in exactly one of these: the
+        // established path (handled above) or a listen failure, including a
+        // denial by a behaviour placed after this one.
+        if let libp2p::swarm::FromSwarm::ListenFailure(failure) = event {
+            self.release_pending(failure.connection_id);
+        }
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        _: libp2p::PeerId,
+        _: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        match event {}
+    }
+
+    fn poll(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
+        std::task::Poll::Pending
+    }
+}
+
+/// Topic score for the block topic (audit 2026-11-10, P-6).
+///
+/// Without topic parameters a `Reject` cost the forwarder nothing. Only the
+/// invalid-delivery term is used, and the reactor rejects a message only when
+/// its signed author handed it over directly and its bytes alone condemn it
+/// (it does not decode, or a header misses its own proof-of-work target).
+/// The delivery-rate terms stay off: on a young network with one block every
+/// few minutes they would punish quiet honest neighbours.
+pub(crate) fn jetsam_topic_score_params() -> gossipsub::TopicScoreParams {
+    gossipsub::TopicScoreParams {
+        topic_weight: 1.0,
+        time_in_mesh_weight: 0.0,
+        first_message_deliveries_weight: 0.0,
+        mesh_message_deliveries_weight: 0.0,
+        mesh_failure_penalty_weight: 0.0,
+        // Per one-second decay interval, one rejected message keeps its
+        // forwarder under the graylist threshold (-80) for about 37 s and
+        // under the gossip threshold (-10) for about six minutes; rejections
+        // add up quadratically.
+        invalid_message_deliveries_weight: -100.0,
+        invalid_message_deliveries_decay: 0.997,
+        ..gossipsub::TopicScoreParams::default()
+    }
+}
+
+/// Install [`jetsam_topic_score_params`] on every given topic.
+pub(crate) fn apply_topic_scores(
+    gossipsub: &mut gossipsub::Behaviour,
+    topics: &[gossipsub::IdentTopic],
+) -> Result<(), &'static str> {
+    for topic in topics {
+        gossipsub.set_topic_params(topic.clone(), jetsam_topic_score_params())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::swarm::ConnectionId;
+    use libp2p::{Multiaddr, PeerId};
+    use std::time::Instant;
+
+    fn addr(value: &str) -> Multiaddr {
+        value.parse().unwrap()
+    }
+
+    /// P-1: one host used to hold every pending slot of the node.
+    #[test]
+    fn one_public_ip_holds_at_most_four_pending_inbound_handshakes() {
+        let mut gate = InboundGate::default();
+        let now = Instant::now();
+        let attacker = addr("/ip4/8.8.8.8/tcp/40000");
+        for id in 0..MAX_PENDING_INBOUND_PER_IP {
+            gate.admit_pending(ConnectionId::new_unchecked(id), &attacker, now)
+                .expect("a few concurrent handshakes from one address stay usable");
+        }
+        assert!(
+            gate.admit_pending(ConnectionId::new_unchecked(100), &attacker, now)
+                .is_err(),
+            "one source IP must not take more pending slots"
+        );
+        gate.admit_pending(
+            ConnectionId::new_unchecked(101),
+            &addr("/ip4/9.9.9.9/tcp/40000"),
+            now,
+        )
+        .expect("another source keeps its own budget");
+
+        // A handshake that ends, by success or by failure, gives its slot back.
+        gate.release_pending(ConnectionId::new_unchecked(0));
+        gate.admit_pending(ConnectionId::new_unchecked(102), &attacker, now)
+            .expect("a released slot is reusable");
+        gate.release_pending(ConnectionId::new_unchecked(0));
+        assert!(
+            gate.admit_pending(ConnectionId::new_unchecked(103), &attacker, now)
+                .is_err(),
+            "releasing the same connection twice frees nothing more"
+        );
+    }
+
+    /// Onion sessions all come from the local Tor process, LAN clusters share
+    /// private addresses and circuits carry no IP: none of them is capped here.
+    #[test]
+    fn loopback_private_and_relayed_sources_keep_their_pending_budget() {
+        let mut gate = InboundGate::default();
+        let now = Instant::now();
+        let relay = PeerId::random();
+        let source = PeerId::random();
+        let mut id = 0;
+        for remote in [
+            addr("/ip4/127.0.0.1/tcp/40000"),
+            addr("/ip6/::1/tcp/40000"),
+            addr("/ip4/10.0.0.7/tcp/40000"),
+            addr(&format!("/p2p/{source}")),
+            addr(&format!(
+                "/ip4/8.8.8.8/tcp/9700/p2p/{relay}/p2p-circuit/p2p/{source}"
+            )),
+        ] {
+            for _ in 0..(MAX_PENDING_INBOUND_PER_IP * 4) {
+                gate.admit_pending(ConnectionId::new_unchecked(id), &remote, now)
+                    .unwrap_or_else(|_| panic!("{remote} is not a direct public source"));
+                id += 1;
+            }
+        }
+    }
+
+    /// P-6: a penalized peer is refused on every path, and the public IP it
+    /// reached us from directly is refused before any handshake, until the
+    /// ban expires.
+    #[test]
+    fn a_penalized_peer_and_its_direct_ip_are_refused_until_the_ban_expires() {
+        let mut gate = InboundGate::default();
+        let now = Instant::now();
+        let peer = PeerId::random();
+        let ip: IpAddr = "8.8.4.4".parse().unwrap();
+        gate.ban(peer, [ip], now);
+
+        assert!(gate.is_peer_banned(peer, now));
+        assert!(!gate.is_peer_banned(PeerId::random(), now));
+        assert!(gate
+            .admit_pending(
+                ConnectionId::new_unchecked(1),
+                &addr("/ip4/8.8.4.4/tcp/40000"),
+                now
+            )
+            .is_err());
+        gate.admit_pending(
+            ConnectionId::new_unchecked(2),
+            &addr("/ip4/8.8.4.5/tcp/40000"),
+            now,
+        )
+        .expect("a neighbouring address is not banned");
+
+        let later = now + PEER_BAN_DURATION + Duration::from_secs(1);
+        assert!(!gate.is_peer_banned(peer, later), "a ban expires");
+        gate.admit_pending(
+            ConnectionId::new_unchecked(3),
+            &addr("/ip4/8.8.4.4/tcp/40000"),
+            later,
+        )
+        .expect("an expired IP ban admits again");
+    }
+
+    /// P-6: never ban a shared non-public source (all onion peers, a LAN).
+    #[test]
+    fn a_ban_never_covers_a_loopback_or_private_address() {
+        let mut gate = InboundGate::default();
+        let now = Instant::now();
+        gate.ban(
+            PeerId::random(),
+            ["127.0.0.1".parse().unwrap(), "10.0.0.7".parse().unwrap()],
+            now,
+        );
+        for remote in ["/ip4/127.0.0.1/tcp/40000", "/ip4/10.0.0.7/tcp/40000"] {
+            gate.admit_pending(ConnectionId::new_unchecked(9), &addr(remote), now)
+                .unwrap_or_else(|_| panic!("{remote} must stay admissible"));
+            gate.release_pending(ConnectionId::new_unchecked(9));
+        }
+    }
+
+    /// P-6: a `Reject` graylists its forwarder at once, the penalty fades,
+    /// and no delivery-rate term can punish a quiet honest neighbour.
+    #[test]
+    fn one_rejected_message_graylists_its_forwarder_for_a_while() {
+        let params = jetsam_topic_score_params();
+        params.validate().expect("valid topic parameters");
+        let thresholds = gossipsub::PeerScoreThresholds::default();
+        let score_after = |invalid: f64, seconds: i32| {
+            let counter = invalid * params.invalid_message_deliveries_decay.powi(seconds);
+            params.topic_weight * params.invalid_message_deliveries_weight * counter * counter
+        };
+        assert!(score_after(1.0, 0) <= thresholds.graylist_threshold);
+        assert!(score_after(1.0, 20) <= thresholds.graylist_threshold);
+        assert!(score_after(1.0, 600) > thresholds.gossip_threshold);
+        assert_eq!(params.mesh_message_deliveries_weight, 0.0);
+        assert_eq!(params.mesh_failure_penalty_weight, 0.0);
+        assert_eq!(params.first_message_deliveries_weight, 0.0);
+        assert_eq!(params.time_in_mesh_weight, 0.0);
+    }
+
+    #[test]
+    fn topic_scores_are_installed_on_every_given_topic() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let mut behaviour = NodeBehaviour::onion_only(
+            &key,
+            "/jetsam/test/1.0.0",
+            BackgroundCapacity::Full,
+            false,
+            false,
+        )
+        .unwrap();
+        let blocks = gossipsub::IdentTopic::new("/jetsam/test/blocks/1");
+        let txs = gossipsub::IdentTopic::new("/jetsam/test/txs/1");
+        apply_topic_scores(&mut behaviour.gossipsub, &[blocks.clone(), txs.clone()]).unwrap();
+        for topic in [&blocks, &txs] {
+            let params = behaviour
+                .gossipsub
+                .get_topic_params(topic)
+                .expect("topic parameters installed");
+            assert!(params.invalid_message_deliveries_weight < 0.0);
+        }
     }
 }

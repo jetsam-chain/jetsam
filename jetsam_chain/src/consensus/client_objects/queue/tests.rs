@@ -326,6 +326,7 @@ fn a_committed_block_settles_its_submission_and_its_conflicts() {
         header: parent(600),
         transactions,
         client_objects: vec![ClientObject::Submission(carried.submission)],
+        destination: None,
     };
     assert_eq!(queue.on_block_committed(&block), 2);
     assert_eq!(queue.len(), 1);

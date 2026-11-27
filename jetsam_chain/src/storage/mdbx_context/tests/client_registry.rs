@@ -52,6 +52,7 @@ fn bundle_with(
         header: parent,
         transactions: transactions.clone(),
         client_objects: Vec::new(),
+        destination: None,
     };
     let segments = context.segment_ids_for_block(&probe);
     context.preload_segment_ids(&segments).unwrap();
@@ -840,6 +841,7 @@ fn a_snapshot_carries_the_exact_registry_and_refuses_a_forged_one() {
             &mut headers,
             false,
             claimed,
+            &crate::storage::snapshot_annex::SnapshotAnnexes::none(),
         );
         let durable = consumer.store.get_client_registry().unwrap();
         (result, consumer.tip_height(), consumer.client_registry().clone(), durable, directory)
@@ -971,6 +973,7 @@ fn locally_proved_with(
         header: parent,
         transactions: transactions.clone(),
         client_objects: Vec::new(),
+        destination: None,
     };
     let segments = context.segment_ids_for_block(&probe);
     context.preload_segment_ids(&segments).unwrap();
@@ -1434,6 +1437,7 @@ fn a_snapshot_registry_outside_the_catalogue_is_refused() {
             &mut headers,
             false,
             &registry,
+            &crate::storage::snapshot_annex::SnapshotAnnexes::none(),
         );
         let durable = consumer.store.get_client_registry().unwrap();
         (

@@ -37,6 +37,18 @@ pub enum MempoolEvent {
     /// Wallet authorization cached for a transaction (background proving cache).
     /// The block assembler can now use the cached proof.
     TxAuthorizationVerified { hash: TxBodyHash },
+
+    /// v1.7: a destination object was admitted with its transaction (the
+    /// release of `release`, or a committee update when `None`). A miner
+    /// builds its template again, even one that already carries
+    /// transactions (SPEC retour §1.3: 2 to 3 min at the p90).
+    DestinationObjectAdmitted { release: Option<u64> },
+
+    /// v1.7 (T7.1): a destination or guardian intent was held, with its
+    /// exact bytes (`DestinationIntent::encode` / `GuardianIntent::encode`),
+    /// for the node to relay it to its peers on the bridge-intent topic. No
+    /// miner is woken by this event.
+    BridgeIntentAdmitted { intent_bytes: Arc<[u8]> },
 }
 
 /// Why a transaction was evicted.
@@ -55,6 +67,24 @@ pub enum EvictReason {
     /// it pays a client-object marker without its object, or spends from a
     /// locked address (`check_plain_transaction` at the next block's height).
     ClientObjectRule,
+    /// From the v1.7 height on no block may carry it as a plain transaction:
+    /// it spends from the bridge vault (a release travels with its object),
+    /// pays a release or committee-update marker without its object, or is a
+    /// deposit of the wrong shape or before the bridge opening
+    /// (`check_plain_vault_transaction` at the next block's height).
+    VaultRule,
+    /// From the v1.7 height on no block may carry it as a plain transaction:
+    /// it spends from or pays the stake vault or the reward pool, spends from
+    /// a guardian marker, or pays a guardian marker without its object.
+    GuardianRule,
+    /// From the return-over-Base height on no block may carry it: it is an
+    /// advance or a transfer of its claim the rule refuses (D107, D114), or
+    /// carries an advance marker without being one.
+    AdvanceRule,
+    /// From the return-over-Base height on no block may carry it as a plain
+    /// transaction: it carries a fast-lane marker (`JTMFCT01`, `JTMFRV01`)
+    /// without the fast lane's object (NO-1).
+    FastLaneRule,
 }
 
 impl EvictReason {
@@ -76,9 +106,7 @@ impl EvictReason {
                 "the pool was full and this fee was among the lowest; \
                  another node may still mine it, or it can be re-sent with a higher fee"
             }
-            Self::InputConsumed => {
-                "the coins it spends were already spent by a confirmed block"
-            }
+            Self::InputConsumed => "the coins it spends were already spent by a confirmed block",
             Self::OutputSlotOccupied => {
                 "a confirmed block took a state slot it had claimed; \
                  the wallet must rebuild it with fresh slot hints"
@@ -86,6 +114,24 @@ impl EvictReason {
             Self::ClientObjectRule => {
                 "from the v1.5 height no block may carry it alone: it pays a client \
                  object without that object, or spends from a locked address"
+            }
+            Self::VaultRule => {
+                "from the v1.7 height no block may carry it alone: it spends from the \
+                 bridge vault, pays a bridge marker without its object, or is a deposit \
+                 of the wrong shape or before the bridge opens"
+            }
+            Self::GuardianRule => {
+                "from the v1.7 height no block may carry it alone: it touches the stake \
+                 vault or the reward pool, or pays a guardian marker without its object"
+            }
+            Self::AdvanceRule => {
+                "from the return-over-Base height no block may carry it: it is an advance \
+                 or a claim transfer the rule refuses (malformed, its burn paid or already \
+                 advanced), or carries an advance marker without being one"
+            }
+            Self::FastLaneRule => {
+                "from the return-over-Base height no block may carry it alone: it carries \
+                 a fast-lane contradiction or revocation marker without that object"
             }
         }
     }
@@ -103,6 +149,10 @@ mod tests {
             EvictReason::InputConsumed,
             EvictReason::OutputSlotOccupied,
             EvictReason::ClientObjectRule,
+            EvictReason::VaultRule,
+            EvictReason::GuardianRule,
+            EvictReason::AdvanceRule,
+            EvictReason::FastLaneRule,
         ];
         let mut seen = std::collections::HashSet::new();
         for reason in &reasons {

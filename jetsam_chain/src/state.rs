@@ -17,6 +17,7 @@
 //! proof, then commits the sealed verifier result atomically.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use jetsam_poseidon2b::primitives::Digest;
 use jetsam_tx::TxBody;
@@ -60,6 +61,10 @@ pub struct ChainState {
     /// plus its upper binary tree.  Raw columns remain an MDBX-backed cache;
     /// exact root updates therefore need only the segments touched by a block.
     exact_roots: ExactSegmentRootCache,
+    /// Local, non-consensus acceleration: every node of the exact tree of the
+    /// few most recently rooted segments, so re-rooting a segment costs the
+    /// leaves that changed, not every live leaf it holds.
+    exact_trees: ExactSegmentTreeCache,
 }
 
 /// O(depth)-memory builder for a sparse Merkle root from sorted non-default
@@ -307,6 +312,258 @@ pub(crate) fn exact_segment_root_from_columns(
     exact_segment_root_with_updates(effective_log_seg, Some(columns), &BTreeMap::new())
 }
 
+/// Segments whose complete exact tree [`ExactSegmentTreeCache`] keeps. Each
+/// entry holds 2^17 nodes (4 MiB at production depth) and keeps alive the
+/// column version they hash (3 MiB, usually the resident one).
+const EXACT_SEGMENT_TREE_CACHE_SEGMENTS: usize = 4;
+
+/// Whether a build of any profile re-checks the cache-served segment root
+/// `root` against the streaming walk (the v1.6.1 method, which stays the
+/// source of truth): one root in 256, those with `keccak(root ‖ salt)[0] ==
+/// 0` under this process's salt.
+///
+/// A5-24: the salt is drawn once per process from the operating system's
+/// random source, so the sample is unpredictable and differs from node to
+/// node: no block content can be ground out of (or into) it, and a defect a
+/// given root triggers is checked by about one node in 256 rather than by
+/// all of them or by none. Within a process it is stable: the final root of
+/// a miner's template, whose cache starts empty with every template, is
+/// checked as often as the root a node computes when it applies a block. A
+/// check costs one streaming walk of the segment, about 1.5 s when the
+/// segment is full.
+fn exact_segment_tree_oracle_samples(root: &StateHash) -> bool {
+    static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        let mut salt = [0u8; 32];
+        getrandom::getrandom(&mut salt)
+            .expect("the operating system's random source for the segment tree oracle's salt");
+        salt
+    });
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(root);
+    preimage[32..].copy_from_slice(salt);
+    crate::consensus::destination::mpt::keccak256(&preimage)[0] == 0
+}
+
+/// Every node of one segment's exact sparse-Merkle tree, together with the
+/// exact column version the nodes were hashed from.
+///
+/// Segment columns are copy-on-write (`Arc::make_mut`): the version held here
+/// can never change under the nodes. Re-rooting a newer version compares it
+/// with this one slot by slot, a plain memory scan, then hashes only the
+/// leaves that differ and their ancestors. The root is the one
+/// [`exact_segment_root_with_updates`] computes: an empty leaf is `Z_0` and a
+/// node whose children are both `Z_{h-1}` is `Z_h`, which is exactly the
+/// value hashing them would give.
+#[derive(Clone)]
+struct ExactSegmentTree {
+    segment_id: u16,
+    log: usize,
+    /// `Z_0..=Z_log`.
+    zero: Vec<StateHash>,
+    columns: Arc<SegmentColumns>,
+    /// 1-indexed heap: `nodes[1]` is the root, local leaf `i` is
+    /// `nodes[2^log + i]`.
+    nodes: Vec<StateHash>,
+}
+
+impl ExactSegmentTree {
+    /// Whether `columns` has the dense geometry of a depth-`log` segment, the
+    /// only shape the tree indexes. Anything else takes the streaming path.
+    fn fits(log: usize, columns: &SegmentColumns) -> bool {
+        if log == 0 || log > LOG_SEGMENT_SIZE {
+            return false;
+        }
+        let len = 1usize << log;
+        columns.values.len() == len
+            && columns.owners_hi.len() == len
+            && columns.owners_lo.len() == len
+    }
+
+    fn leaf(columns: &SegmentColumns, local: usize, empty: StateHash) -> StateHash {
+        let slot = SlotValue {
+            value: columns.values[local],
+            owner_hi: columns.owners_hi[local],
+            owner_lo: columns.owners_lo[local],
+        };
+        if slot.is_empty() {
+            empty
+        } else {
+            slot_leaf_hash(slot)
+        }
+    }
+
+    /// Node `index`, whose subtree has height `height >= 1`, from its children.
+    fn parent(&self, index: usize, height: usize) -> StateHash {
+        let left = self.nodes[2 * index];
+        let right = self.nodes[2 * index + 1];
+        let zero_child = self.zero[height - 1];
+        if left == zero_child && right == zero_child {
+            self.zero[height]
+        } else {
+            state_node_hash(left, right)
+        }
+    }
+
+    fn build(segment_id: u16, log: usize, columns: Arc<SegmentColumns>) -> Self {
+        let len = 1usize << log;
+        let mut tree = Self {
+            segment_id,
+            log,
+            zero: zero_slot_roots(log),
+            columns,
+            nodes: vec![[0u8; 32]; 2 * len],
+        };
+        for local in 0..len {
+            tree.nodes[len + local] = Self::leaf(&tree.columns, local, tree.zero[0]);
+        }
+        for index in (1..len).rev() {
+            let height = log - index.ilog2() as usize;
+            tree.nodes[index] = tree.parent(index, height);
+        }
+        tree
+    }
+
+    fn root(&self) -> StateHash {
+        self.nodes[1]
+    }
+
+    /// Re-root the tree on `current`, a version of the same segment with the
+    /// same geometry.
+    fn refresh(&mut self, current: &Arc<SegmentColumns>) {
+        if Arc::ptr_eq(&self.columns, current) {
+            return;
+        }
+        let len = 1usize << self.log;
+        // Ascending, deduplicated parents of the changed leaves.
+        let mut touched: Vec<usize> = Vec::new();
+        for local in 0..len {
+            if self.columns.values[local] != current.values[local]
+                || self.columns.owners_hi[local] != current.owners_hi[local]
+                || self.columns.owners_lo[local] != current.owners_lo[local]
+            {
+                self.nodes[len + local] = Self::leaf(current, local, self.zero[0]);
+                let parent = (len + local) / 2;
+                if touched.last() != Some(&parent) {
+                    touched.push(parent);
+                }
+            }
+        }
+        let mut height = 1;
+        while !touched.is_empty() {
+            for &index in &touched {
+                let node = self.parent(index, height);
+                self.nodes[index] = node;
+            }
+            if touched[0] == 1 {
+                break;
+            }
+            let mut next: Vec<usize> = Vec::with_capacity(touched.len());
+            for &index in &touched {
+                let parent = index / 2;
+                if next.last() != Some(&parent) {
+                    next.push(parent);
+                }
+            }
+            touched = next;
+            height += 1;
+        }
+        self.columns = Arc::clone(current);
+    }
+}
+
+/// The [`ExactSegmentTree`]s of the last few rooted segments, oldest first.
+///
+/// Correctness never depends on invalidation: a tree is only ever re-rooted
+/// by comparing its own column version with the requested one. Eviction,
+/// expansion or a rollback therefore cost at most one rebuild; the bound only
+/// limits memory.
+#[derive(Clone, Default)]
+struct ExactSegmentTreeCache {
+    entries: Vec<Arc<ExactSegmentTree>>,
+}
+
+impl core::fmt::Debug for ExactSegmentTreeCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list()
+            .entries(self.entries.iter().map(|tree| (tree.segment_id, tree.log)))
+            .finish()
+    }
+}
+
+impl ExactSegmentTreeCache {
+    /// The exact root of segment `segment_id` holding `columns` at depth `log`.
+    fn segment_root(
+        &mut self,
+        segment_id: u16,
+        log: usize,
+        columns: &Arc<SegmentColumns>,
+    ) -> StateHash {
+        if !ExactSegmentTree::fits(log, columns) {
+            self.forget(segment_id);
+            return exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new());
+        }
+        let found = self
+            .entries
+            .iter()
+            .position(|tree| tree.segment_id == segment_id && tree.log == log);
+        let tree = match found {
+            Some(position) => {
+                let mut tree = self.entries.remove(position);
+                Arc::make_mut(&mut tree).refresh(columns);
+                tree
+            }
+            None => {
+                self.forget(segment_id);
+                Arc::new(ExactSegmentTree::build(
+                    segment_id,
+                    log,
+                    Arc::clone(columns),
+                ))
+            }
+        };
+        let root = tree.root();
+        // The streaming walk this cache replaces stays the oracle of every
+        // debug build, so each test that roots a segment through the cache
+        // also checks it. Compiled out of release builds. Before the release
+        // sample (A5-24): a divergence the sample would repair asserts here.
+        debug_assert_eq!(
+            root,
+            exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new()),
+            "segment tree cache diverged from the streaming root of segment {segment_id}"
+        );
+        // Release builds have no other oracle: a sampled root is compared
+        // with the streaming walk. On a divergence every tree is suspect, so
+        // the cache is emptied, and the state gets the streaming root.
+        if exact_segment_tree_oracle_samples(&root) {
+            let streamed = exact_segment_root_with_updates(log, Some(columns), &BTreeMap::new());
+            if streamed != root {
+                let hex = |hash: &StateHash| -> String {
+                    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+                };
+                tracing::error!(
+                    segment = segment_id,
+                    depth = log,
+                    cached = %hex(&root),
+                    streamed = %hex(&streamed),
+                    "exact segment tree cache diverged from the streaming root: cache emptied, streaming root used"
+                );
+                self.entries.clear();
+                return streamed;
+            }
+        }
+        self.entries.push(tree);
+        if self.entries.len() > EXACT_SEGMENT_TREE_CACHE_SEGMENTS {
+            self.entries.remove(0);
+        }
+        root
+    }
+
+    fn forget(&mut self, segment_id: u16) {
+        self.entries.retain(|tree| tree.segment_id != segment_id);
+    }
+}
+
 #[derive(Debug)]
 pub enum ExactFrontierError {
     SparseMerkle(SparseMerkleError),
@@ -392,6 +649,7 @@ impl ChainState {
             alloc_counter: 0,
             circulating_supply_micro_jtm: 0,
             exact_roots: ExactSegmentRootCache::empty(log_slots),
+            exact_trees: ExactSegmentTreeCache::default(),
         }
     }
 
@@ -404,6 +662,7 @@ impl ChainState {
             alloc_counter: self.alloc_counter,
             circulating_supply_micro_jtm: self.circulating_supply_micro_jtm,
             exact_roots: self.exact_roots.clone(),
+            exact_trees: ExactSegmentTreeCache::default(),
         })
     }
 
@@ -422,6 +681,7 @@ impl ChainState {
             alloc_counter,
             circulating_supply_micro_jtm,
             exact_roots,
+            exact_trees: ExactSegmentTreeCache::default(),
         };
         out.rebuild_exact_utxo_root_loaded()?;
         Ok(out)
@@ -455,6 +715,7 @@ impl ChainState {
             alloc_counter,
             circulating_supply_micro_jtm,
             exact_roots,
+            exact_trees: ExactSegmentTreeCache::default(),
         })
     }
 
@@ -642,17 +903,31 @@ impl ChainState {
         }
         if self.exact_roots.log_slots > self.state.log_slots() {
             self.exact_roots.shrink_to(self.state.log_slots());
+            // The dropped upper segments are never rooted again at this
+            // depth: their trees would only pin their last columns.
+            let segments = self.state.num_segments();
+            self.exact_trees
+                .entries
+                .retain(|tree| usize::from(tree.segment_id) < segments);
         }
-        let dirty: Vec<u16> = self.state.exact_dirty_segment_ids().collect();
+        // Ascending, not the dirty set's hash order: which trees stay in the
+        // cache after a block over many segments is then the same in every
+        // process.
+        let mut dirty: Vec<u16> = self.state.exact_dirty_segment_ids().collect();
+        dirty.sort_unstable();
         for segment_id in dirty {
             if self.state.is_evicted(segment_id) {
                 return Err(ExactStateReadError::EvictedSegment { seg_id: segment_id });
             }
-            let root = exact_segment_root_with_updates(
-                self.state.effective_log_segment_size(),
-                self.state.try_get_segment_columns(segment_id),
-                &BTreeMap::new(),
-            );
+            let log = self.state.effective_log_segment_size();
+            let root = match self.state.shared_segment_columns(segment_id).cloned() {
+                Some(columns) => self.exact_trees.segment_root(segment_id, log, &columns),
+                None => {
+                    // Emptied: its tree would only pin the dropped columns.
+                    self.exact_trees.forget(segment_id);
+                    exact_segment_root_with_updates(log, None, &BTreeMap::new())
+                }
+            };
             self.exact_roots.set_segment_root(segment_id, root);
         }
         self.state.clear_exact_dirty();
@@ -708,10 +983,11 @@ impl ChainState {
         if usize::try_from(self.state.segment_live_count(segment_id)).ok() != Some(actual_live) {
             return Err(ExactStateReadError::SegmentRootMismatch { seg_id: segment_id });
         }
-        let actual = exact_segment_root_with_updates(
+        let columns = Arc::new(columns);
+        let actual = self.exact_trees.segment_root(
+            segment_id,
             self.state.effective_log_segment_size(),
-            Some(&columns),
-            &BTreeMap::new(),
+            &columns,
         );
         if self
             .exact_roots
@@ -720,9 +996,11 @@ impl ChainState {
             .copied()
             != Some(actual)
         {
+            self.exact_trees.forget(segment_id);
             return Err(ExactStateReadError::SegmentRootMismatch { seg_id: segment_id });
         }
-        self.state.restore_evicted_segment(segment_id, columns);
+        self.state
+            .restore_shared_evicted_segment(segment_id, columns);
         Ok(())
     }
 
@@ -1445,6 +1723,7 @@ mod tests {
             alloc_counter: 0,
             circulating_supply_micro_jtm: 0,
             exact_roots: ExactSegmentRootCache::empty(log_slots),
+            exact_trees: ExactSegmentTreeCache::default(),
         };
 
         state.expand_exact_metadata_for_replay().unwrap();
@@ -1575,4 +1854,191 @@ mod tests {
         assert_eq!(state.circulating_supply_micro_jtm, 8);
         assert_eq!(state.cached_state_root(), child_root);
     }
+    /// xorshift64: deterministic, dependency-free test randomness.
+    fn tree_rng(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn tree_slot(seed: &mut u64) -> SlotValue {
+        SlotValue::from_parts(
+            tree_rng(seed) % 1_000 + 1,
+            tree_rng(seed) % 10_000 + 1,
+            jetsam_core::Block128::from(tree_rng(seed)),
+            jetsam_core::Block128::from(tree_rng(seed)),
+        )
+    }
+
+    fn put(columns: &mut SegmentColumns, local: usize, slot: SlotValue) {
+        columns.values[local] = slot.value;
+        columns.owners_hi[local] = slot.owner_hi;
+        columns.owners_lo[local] = slot.owner_lo;
+    }
+
+    #[test]
+    fn segment_tree_root_is_the_streaming_root_through_every_version() {
+        // Dense random coverage at small depths; the production depth with a
+        // sparse fill and fewer versions keeps a debug build fast.
+        for (log, fill_one_in) in [
+            (1usize, 2u64),
+            (2, 2),
+            (3, 2),
+            (5, 2),
+            (8, 3),
+            (LOG_SEGMENT_SIZE, 4_096),
+        ] {
+            let len = 1usize << log;
+            let mut seed = 0x9E37_79B9_7F4A_7C15 ^ log as u64;
+            let mut first = SegmentColumns::new_zero(len);
+            for local in 0..len {
+                if tree_rng(&mut seed) % fill_one_in == 0 {
+                    put(&mut first, local, tree_slot(&mut seed));
+                }
+            }
+            let mut current = Arc::new(first);
+            let mut tree = ExactSegmentTree::build(7, log, Arc::clone(&current));
+            assert_eq!(tree.root(), exact_segment_root_from_columns(log, &current));
+
+            let versions = if log == LOG_SEGMENT_SIZE { 8 } else { 16 };
+            for round in 0..versions {
+                let mut next = (*current).clone();
+                let changes = match round % 4 {
+                    0 => 0,
+                    1 => 1,
+                    2 => 1 + tree_rng(&mut seed) as usize % 8,
+                    _ => (len / 3 + 1).min(64),
+                };
+                for _ in 0..changes {
+                    let local = tree_rng(&mut seed) as usize % len;
+                    let slot = if tree_rng(&mut seed) % 3 == 0 {
+                        SlotValue::EMPTY
+                    } else {
+                        tree_slot(&mut seed)
+                    };
+                    put(&mut next, local, slot);
+                }
+                current = Arc::new(next);
+                tree.refresh(&current);
+                assert_eq!(
+                    tree.root(),
+                    exact_segment_root_from_columns(log, &current),
+                    "depth {log}, version {round}"
+                );
+            }
+
+            // An identical copy is a no-op; emptying everything gives Z_log.
+            tree.refresh(&Arc::new((*current).clone()));
+            assert_eq!(tree.root(), exact_segment_root_from_columns(log, &current));
+            tree.refresh(&Arc::new(SegmentColumns::new_zero(len)));
+            assert_eq!(tree.root(), zero_slot_roots(log)[log]);
+            if log <= 8 {
+                let mut full = SegmentColumns::new_zero(len);
+                for local in 0..len {
+                    put(&mut full, local, tree_slot(&mut seed));
+                }
+                let full = Arc::new(full);
+                tree.refresh(&full);
+                assert_eq!(tree.root(), exact_segment_root_from_columns(log, &full));
+                assert_eq!(ExactSegmentTree::build(7, log, full).root(), tree.root());
+            }
+        }
+    }
+
+    #[test]
+    fn cached_trees_keep_every_clone_of_the_state_exact() {
+        let log_slots = 9;
+        let mut seed = 0x0DDB_A11u64;
+        let mut state = ChainState::with_log_slots(log_slots);
+        let mut live: BTreeMap<u32, SlotValue> = BTreeMap::new();
+        let write = |state: &mut ChainState,
+                     live: &mut BTreeMap<u32, SlotValue>,
+                     seed: &mut u64,
+                     count: usize| {
+            let mut batch = Vec::new();
+            for _ in 0..count {
+                let index = (tree_rng(seed) % (1u64 << log_slots)) as u32;
+                if batch.iter().any(|(i, _)| *i == index) {
+                    continue;
+                }
+                let slot = if live.contains_key(&index) && tree_rng(seed) % 2 == 0 {
+                    SlotValue::EMPTY
+                } else {
+                    tree_slot(seed)
+                };
+                batch.push((index, slot));
+            }
+            state.state.apply_delta_unrooted(&batch).unwrap();
+            for (index, slot) in batch {
+                if slot.is_empty() {
+                    live.remove(&index);
+                } else {
+                    live.insert(index, slot);
+                }
+            }
+        };
+        // One segment at this depth: the state root is its streaming root.
+        let reference = |live: &BTreeMap<u32, SlotValue>| {
+            let mut columns = SegmentColumns::new_zero(1 << log_slots);
+            for (index, slot) in live {
+                put(&mut columns, *index as usize, *slot);
+            }
+            exact_segment_root_from_columns(log_slots, &columns)
+        };
+
+        write(&mut state, &mut live, &mut seed, 200);
+        assert_eq!(state.try_state_root().unwrap(), reference(&live));
+        for round in 0..12 {
+            // A block works on a clone; the parent keeps its own version.
+            let parent_root = state.cached_state_root();
+            let mut child = state.clone();
+            let mut child_live = live.clone();
+            write(&mut child, &mut child_live, &mut seed, 1 + round % 5);
+            assert_eq!(child.try_state_root().unwrap(), reference(&child_live));
+            assert_eq!(state.try_state_root().unwrap(), parent_root);
+            if round % 3 == 2 {
+                // Rejected: the parent goes on, written differently.
+                write(&mut state, &mut live, &mut seed, 3);
+                assert_eq!(state.try_state_root().unwrap(), reference(&live));
+            } else {
+                state = child;
+                live = child_live;
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_an_evicted_segment_still_rejects_a_tampered_payload() {
+        let log_slots = 10;
+        let mut seed = 0x5EED_0F_5EEDu64;
+        let mut state = ChainState::with_log_slots(log_slots);
+        let batch: Vec<_> = (0..300u32).map(|i| (i * 3, tree_slot(&mut seed))).collect();
+        state.state.apply_delta_unrooted(&batch).unwrap();
+        let root = state.try_state_root().unwrap();
+        let durable = state.state.try_get_segment_columns(0).unwrap().clone();
+        state.state.clear_dirty();
+        state.state.evict_all_persisted_segments();
+        assert!(state.state.is_evicted(0));
+
+        // Same live count, one value changed: only the root check can see it,
+        // and the warm tree must not hide it.
+        let mut tampered = durable.clone();
+        put(&mut tampered, 3, tree_slot(&mut seed));
+        assert!(matches!(
+            state.restore_evicted_segment(0, tampered),
+            Err(ExactStateReadError::SegmentRootMismatch { seg_id: 0 })
+        ));
+        assert!(state.state.is_evicted(0));
+
+        state.restore_evicted_segment(0, durable).unwrap();
+        assert!(!state.state.is_evicted(0));
+        assert_eq!(state.try_state_root().unwrap(), root);
+    }
 }
+
+#[cfg(test)]
+mod segment_tree_equivalence;
+
+#[cfg(test)]
+mod segment_tree_cases;

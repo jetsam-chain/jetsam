@@ -30,7 +30,12 @@
 //! - [`genesis`]        — Genesis block / state root derivation.
 //! - [`network`]        — Network-kind parameters and per-network constants.
 //! - [`wire_limits`]    — Shared wire/memory/decode DoS caps.
+//! - [`destination`]    — v1.7 destination section (0xC2) and its objects.
+//! - [`vault`]          — v1.7 native gate of the bridge vault (V1-V7).
+//! - [`activations`]    — The activations this build applies, as one record
+//!                        (`jetsam_getActivations`, D171, D176).
 
+pub mod activations;
 pub mod checks;
 pub mod conflict;
 pub mod da_prune;
@@ -44,6 +49,9 @@ pub mod wire_limits;
 
 pub mod allocator;
 pub mod client_objects;
+pub mod destination;
+pub mod guardian;
+pub mod vault;
 pub mod development_allocation;
 pub mod difficulty;
 pub mod emission;
@@ -196,6 +204,23 @@ pub enum ConsensusError {
     /// v1.5: the block's client objects (registrations, submissions) break a
     /// rule of `client_objects`.
     ClientObject(client_objects::ClientObjectError),
+    /// v1.7: the block's destination section (0xC2) breaks a rule of
+    /// `destination`.
+    Destination(destination::DestinationError),
+    /// v1.7: the block breaks a destination rule against its branch's
+    /// destination state (light client, vault gate, V7).
+    DestinationBlock(destination::state::DestinationBlockError),
+    /// v1.7 (T3.6): the guardian rules of a block.
+    Guardian(guardian::GuardianError),
+    /// v1.7 (T7.1): a snapshot's destination state file does not open the
+    /// installed state's markers, or is missing (the sender's data).
+    DestinationSnapshot(destination::state::SnapshotDestinationError),
+}
+
+impl From<destination::DestinationError> for ConsensusError {
+    fn from(error: destination::DestinationError) -> Self {
+        Self::Destination(error)
+    }
 }
 
 impl From<client_objects::ClientObjectError> for ConsensusError {
@@ -217,6 +242,10 @@ impl std::fmt::Display for ConsensusError {
                 write!(f, "BelowMinFee: required={required} actual={actual}")
             }
             Self::ClientObject(error) => write!(f, "ClientObject({error})"),
+            Self::Destination(error) => write!(f, "Destination({error})"),
+            Self::DestinationBlock(error) => write!(f, "DestinationBlock({error})"),
+            Self::Guardian(error) => write!(f, "Guardian({error:?})"),
+            Self::DestinationSnapshot(error) => write!(f, "DestinationSnapshot({error:?})"),
             other => write!(f, "{other:?}"),
         }
     }

@@ -25,7 +25,13 @@ use std::{
 };
 
 use jetsam_chain::block_header::BlockHeader;
+use jetsam_chain::consensus::destination::advance::AdvanceBook;
+use jetsam_chain::consensus::destination::state::{
+    CommitteeKeyCache, CommitteeRef, DestinationRules, DestinationState,
+};
+use jetsam_chain::consensus::guardian::{GuardianBranch, GuardianRules, GuardianState};
 use jetsam_chain::consensus::params::HistoryStepPackGeneration;
+use jetsam_chain::consensus::vault::ReleasedSet;
 use jetsam_chain::consensus::{
     pow::block_id, previous_tx_epoch_anchor_height_for_child, tx_epoch_anchor_height_for_child,
     AcceptedEpochAnchors,
@@ -35,6 +41,71 @@ use jetsam_chain::segmented_state::SegmentedFriState;
 use jetsam_chain::storage::MdbxStore;
 
 const SEGMENT_READ_CACHE_CAPACITY: usize = 4;
+
+/// The v1.7 vault as the block after the view's tip is judged against it
+/// (T2.5): the destination state's `bridge_locked` (V8), the withdrawal
+/// indices the branch has paid (D52), the floor `alloc_counter(J − 1)`
+/// (V1-b), and the L1 committees the branch knows (which committee update is
+/// still due).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VaultView {
+    pub bridge_locked: u64,
+    pub released: ReleasedSet,
+    pub floor: u64,
+    pub committees: Vec<CommitteeRef>,
+    /// The advances the branch holds (the return over Base, D114; empty
+    /// below its height): a release pays the creditor of the advance of
+    /// exactly its burn, an advance or a transfer is judged against them.
+    pub advances: AdvanceBook,
+    /// The fast lane of the branch (the return over Base; empty below its
+    /// height): the keys it closed, the fast releases a contradiction reads.
+    pub fast: jetsam_chain::consensus::destination::fast::FastLaneState,
+}
+
+/// The [`VaultView`] of the block at `height` after a tip whose destination
+/// state is `parent` and whose header has `parent_alloc_counter`: at J a
+/// fresh vault on that floor (never a default), above J the parent's, `None`
+/// below J or under a dormant clock.
+pub fn vault_view_for_child(
+    parent: Option<&DestinationState>,
+    parent_alloc_counter: u64,
+    height: u64,
+    rules: &DestinationRules,
+) -> Option<VaultView> {
+    DestinationState::for_child(parent, parent_alloc_counter, height, rules).map(|state| {
+        VaultView {
+            bridge_locked: state.bridge_locked,
+            released: state.released,
+            floor: state.floor,
+            committees: state.committees,
+            advances: state.advances,
+            fast: state.fast,
+        }
+    })
+}
+
+/// The v1.7 states the block at `height` is judged against, after a tip
+/// whose destination and guardian states are `destination` and `guardian`
+/// and whose header has `tip_alloc_counter` (the floor of both at J): the
+/// [`VaultView`] and the guardian state. A2-m5: `None` for both when the tip
+/// header cannot be read — never a floor 0, which would admit at J what the
+/// block refuses.
+pub fn v1_7_states_for_child(
+    destination: Option<&DestinationState>,
+    guardian: Option<&GuardianState>,
+    tip_alloc_counter: Option<u64>,
+    height: u64,
+    destination_rules: &DestinationRules,
+    guardian_activation: Option<u64>,
+) -> (Option<VaultView>, Option<Arc<GuardianState>>) {
+    let Some(floor) = tip_alloc_counter else {
+        return (None, None);
+    };
+    (
+        vault_view_for_child(destination, floor, height, destination_rules),
+        GuardianState::for_child(guardian, floor, height, guardian_activation).map(Arc::new),
+    )
+}
 
 #[derive(Debug)]
 pub enum ChainViewReadError {
@@ -90,6 +161,22 @@ pub struct ChainView {
     /// Canonical tip hash paired with `tip_height` for atomic durable reads.
     pub tip_hash: [u8; 32],
 
+    /// The v1.7 vault for the next block (`None` below J): V8 and the paid
+    /// withdrawal indices at admission.
+    pub vault: Option<VaultView>,
+
+    /// The v1.7 guardian state the next block is judged against (`None`
+    /// below J; at J a fresh one on the tip's `alloc_counter`), T3.7.
+    pub guardian: Option<Arc<GuardianState>>,
+
+    /// v1.7 (A2-M1): the destination rules the next block's objects are
+    /// judged by (its L1, the anchor, the bridge contract) and the keys of the
+    /// L1 committees this node holds (D57, `MdbxChainContext::committee_keys`):
+    /// a destination intent is verified at admission as the block verifies
+    /// it, against the committees of [`Self::vault`].
+    pub destination_rules: DestinationRules,
+    pub committee_keys: Arc<CommitteeKeyCache>,
+
     /// UTXO state for slot liveness / emptiness checks.
     /// Lazy: only materialized segments are allocated.
     state: SegmentedFriState,
@@ -132,6 +219,10 @@ impl ChainView {
             user_epoch_anchor_id,
             previous_user_epoch_anchor_id,
             tip_hash,
+            vault: None,
+            guardian: None,
+            destination_rules: DestinationRules::current(),
+            committee_keys: Arc::default(),
             state,
             store: None,
             segment_cache: Arc::new(Mutex::new(SegmentReadCache::default())),
@@ -215,6 +306,25 @@ impl ChainView {
         );
         view.tip_hash = ctx.tip_hash;
         view.store = Some(ctx.store.clone());
+        let tip_alloc_counter = ctx
+            .recent_headers
+            .get(&ctx.tip_height)
+            .map(|header| header.alloc_counter)
+            .or_else(|| {
+                ctx.get_header_from_store(ctx.tip_height)
+                    .ok()
+                    .flatten()
+                    .map(|header| header.alloc_counter)
+            });
+        (view.vault, view.guardian) = v1_7_states_for_child(
+            ctx.destination_state(),
+            ctx.guardian_state(),
+            tip_alloc_counter,
+            ctx.tip_height.saturating_add(1),
+            &view.destination_rules,
+            GuardianRules::current().activation_height,
+        );
+        view.committee_keys = Arc::new(ctx.committee_keys().clone());
         let anchor_height = tx_epoch_anchor_height_for_child(ctx.tip_height + 1);
         view.user_epoch_anchor_id = ctx
             .get_header_from_store(anchor_height)
@@ -254,6 +364,35 @@ impl ChainView {
     }
 }
 
+/// The branch of the view's tip, for the rules of an attestation (T3.7):
+/// block ids from the retained headers or the store, chain work from the
+/// store, never above the tip.
+impl GuardianBranch for ChainView {
+    fn block_id(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.tip_height {
+            return None;
+        }
+        self.recent_headers
+            .get(&height)
+            .copied()
+            .or_else(|| {
+                self.store
+                    .as_ref()
+                    .and_then(|store| store.get_header(height).ok().flatten())
+            })
+            .map(|header| block_id(&header))
+    }
+
+    fn chain_work(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.tip_height {
+            return None;
+        }
+        self.store
+            .as_ref()
+            .and_then(|store| store.get_chain_work(height).ok().flatten())
+    }
+}
+
 /// The generation of the block this view is admitting transactions for — the
 /// child of the view's tip, never the tip itself.
 #[inline]
@@ -264,6 +403,69 @@ fn child_generation(tip_height: u64) -> HistoryStepPackGeneration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T2.5: the vault view of the block after the tip starts at J from the
+    /// tip header's `alloc_counter` (never a default floor), follows the
+    /// branch's destination state above J, and is absent below J.
+    #[test]
+    fn vault_view_at_j_starts_from_the_tip_alloc_counter() {
+        let rules = DestinationRules {
+            activation_height: Some(960),
+            ..DestinationRules::CONSENSUS
+        };
+        assert_eq!(vault_view_for_child(None, 77, 959, &rules), None);
+        let at_j = vault_view_for_child(None, 77, 960, &rules).expect("J");
+        assert_eq!(at_j.floor, 77);
+        assert_eq!(at_j.bridge_locked, 0);
+        let mut parent = DestinationState::at_v1_7(960, 77);
+        parent.tip = 961;
+        parent.bridge_locked = 5_000;
+        parent.released.insert(3);
+        let above = vault_view_for_child(Some(&parent), 999, 962, &rules).expect("above J");
+        assert_eq!(above.floor, 77, "the floor stays J − 1's");
+        assert_eq!(above.bridge_locked, 5_000);
+        assert!(above.released.contains(3));
+        // The production rules give a view where the production clock is
+        // active: none while dormant, one above the private J (96), none
+        // below the test chain's (8 640).
+        assert_eq!(
+            vault_view_for_child(Some(&parent), 999, 962, &DestinationRules::CONSENSUS).is_some(),
+            DestinationRules::CONSENSUS.active_at(962)
+        );
+    }
+
+    /// A2-m5: a tip whose header cannot be read gives the next block no
+    /// vault view and no guardian state (nothing destination or guardian is
+    /// admitted), at J and above; with the header, J starts from its
+    /// `alloc_counter`.
+    #[test]
+    fn missing_tip_header_gives_no_vault_and_no_guardian_view() {
+        let j = 960;
+        let rules = DestinationRules {
+            activation_height: Some(j),
+            vault: jetsam_chain::consensus::vault::VaultRules {
+                activation_height: Some(j),
+                ..jetsam_chain::consensus::vault::VaultRules::current()
+            },
+            ..DestinationRules::CONSENSUS
+        };
+        let mut parent = DestinationState::at_v1_7(j, 77);
+        parent.tip = j + 1;
+        let guardian = GuardianState::at_v1_7(77);
+        for (height, destination, parent_guardian) in
+            [(j, None, None), (j + 2, Some(&parent), Some(&guardian))]
+        {
+            let (vault, guardian) =
+                v1_7_states_for_child(destination, parent_guardian, None, height, &rules, Some(j));
+            assert_eq!(vault, None, "height {height}");
+            assert!(guardian.is_none(), "height {height}");
+        }
+        let (vault, guardian) = v1_7_states_for_child(None, None, Some(77), j, &rules, Some(j));
+        assert_eq!(vault.expect("J").floor, 77);
+        assert_eq!(guardian.expect("J").vault_floor, 77);
+        let (vault, _) = v1_7_states_for_child(None, None, Some(77), j - 1, &rules, Some(j));
+        assert_eq!(vault, None, "below J");
+    }
 
     /// JETSAM CHANGE: derived from `TX_EPOCH_BLOCKS` instead of the literal 144,
     /// which pinned the transaction epoch length in the test name and body.
@@ -305,7 +507,11 @@ mod tests {
         ] {
             let view = view(tip_height);
             let post_fork = matches!(armed, Some(activation) if tip_height + 1 >= activation);
-            let expected_previous = if post_fork { post_fork_previous } else { current };
+            let expected_previous = if post_fork {
+                post_fork_previous
+            } else {
+                current
+            };
             assert_eq!(view.user_epoch_anchor_id, current, "tip {tip_height}");
             assert_eq!(
                 view.previous_user_epoch_anchor_id, expected_previous,

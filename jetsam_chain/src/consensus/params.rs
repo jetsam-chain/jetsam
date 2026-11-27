@@ -475,7 +475,7 @@ pub const REHEARSAL_V1_5_ACTIVATION: u64 = 36;
 /// The v1.6 height of a private build (`rehearsal-v1-6`): above
 /// the private v1.5 height, on a 32-block transaction epoch boundary (v1.6
 /// moves neither the ASERT clock nor the payout cadence; the first payout
-/// after the private v1.5 height is at 516, past the private run). The v1.6
+/// after the private v1.5 height is at 480, the relation's cadence: T7.7). The v1.6
 /// pack does not depend on it (the relation is rooted at a height given at
 /// startup).
 pub const REHEARSAL_V1_6_ACTIVATION: u64 = 64;
@@ -582,6 +582,427 @@ const _: () = assert!(
     REHEARSAL_V1_6_ACTIVATION > REHEARSAL_V1_5_ACTIVATION
         && REHEARSAL_V1_6_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS),
     "the rehearsal v1.6 height sits above the rehearsal v1.5 height, on an epoch boundary"
+);
+
+/// First block height governed by the v1.7 rules: every block carries the
+/// destination section (0xC2), even empty, after its client-object section;
+/// below it a block carries none.
+///
+/// **`None` keeps every v1.7 rule dormant**: a binary validates, relays and
+/// announces byte for byte what v1.6.0 does until it, and for ever while this
+/// constant is `None` (the public network today). Armed, a block below it is
+/// still judged by the v1.6.1 rules (the test chain, below 8 160).
+///
+/// # What it switches
+///
+/// The block wire (the 0xC2 section, outside [`crate::consensus::wire_limits::MAX_BLOCK_BYTES`],
+/// under its own budget `wire_limits::MAX_DESTINATION_SECTION_BYTES`) and the
+/// rules that read it. It moves neither the header, the proof relation, the
+/// difficulty rule, the block interval nor the development schedule.
+///
+/// # Constraints
+///
+/// Armed only after v1.6 ([`V1_6_ACTIVATION_HEIGHT`] armed, and strictly
+/// below it), on a multiple of [`V1_7_ACTIVATION_ALIGNMENT`]: 960 on the
+/// public network, 32 on the test chain (D78). Checked at compile time by
+/// [`v1_7_schedule_is_valid_on`].
+///
+/// # Arming (operator decision, never a routine edit)
+///
+/// `wire_limits::tests::arming_v1_7_takes_two_deliberate_edits` fails the moment
+/// this value disagrees with the declaration beside it.
+///
+/// The public network's: 61 440 = 64 × 960, decided with the operator on
+/// 25 November 2026 and confirmed on 26 November 2026 (tip 59 509, ≈ 180 s a
+/// block: ≈ 30 November 2026, 22:10-23:00 UTC).
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(61_440);
+
+/// The test chain's v1.7 height: 8 160 = 255 × 32, decided with the operator
+/// against the tip of the day (D78, 8 November 2026, tip ≈ 8 095), brought
+/// forward from 8 640 (D75): the test chain has a single miner, its operator,
+/// and every node it runs is redeployed before it. On a 32-block transaction
+/// epoch ([`V1_7_ACTIVATION_ALIGNMENT`]) and on the guardians' 480-block
+/// reward period (17 × 480). A release of this profile needs no v1.7 pack
+/// (v1.7 is not a HistoryStep generation). Declared per profile, like
+/// [`V1_6_ACTIVATION_HEIGHT`], so that arming one can never arm the other.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(8160);
+
+/// **Private builds only** (`rehearsal-v1-7`): v1.7 armed at
+/// [`REHEARSAL_V1_7_ACTIVATION`], above the private v1.6 height. The public
+/// network's constant above is not affected by it.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(REHEARSAL_V1_7_ACTIVATION);
+
+/// The v1.7 height of a private build (`rehearsal-v1-7`): above the private
+/// v1.6 height, on a 32-block transaction epoch boundary.
+pub const REHEARSAL_V1_7_ACTIVATION: u64 = 96;
+
+/// v1.7, the return over Base (D94, D101, D107, SPEC retour Base): from this
+/// height on, the vault's releases are proven on Base (V7 reads a dispute game
+/// Base holds valid under a finalized L1 root, its output root, then the
+/// bridge under the Base state root), a block carrying a Base game proof
+/// carries no committee update, and the advance (`JTMADV01`) and its claim's
+/// transfer (`JTMADT01`) are rules.
+///
+/// **`None` on the public network and the private rehearsal builds**, armed
+/// on the test chain (update n°2): the operator chooses it at deployment. While it
+/// is `None` a node judges every block exactly as a node without this code
+/// (the Base objects do not even decode). Armed, it sits strictly above an
+/// armed [`V1_7_ACTIVATION_HEIGHT`] ([`base_return_schedule_is_valid`]).
+/// Declared per profile, like [`V1_7_ACTIVATION_HEIGHT`], so that arming the
+/// test chain's can never arm another's.
+///
+/// The public network's: 62 880 = J + 1 440, the bridge's opening (D44).
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = Some(62_880);
+/// The test chain's: the only one an operator arms (update n°2 of the test
+/// chain, `FAST_ARMING.txt`): 8982.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = Some(8_982);
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_BASE_RETURN_HEIGHT: Option<u64> = None;
+
+/// FIXRC (AUDIT-FINAL2 ET-1, ET-2, 13 November 2026): from this height on,
+/// the advance of the return over Base takes its second format — its marker
+/// `JTMADV03` commits with 128 bits (`JTMADV02`, 64 bits, is refused: a
+/// snapshot could open it with another burn), a block makes at most 4
+/// advances, and an advance not consumed 14 400 blocks after it was made
+/// (one made before this height: after this height) is consumed, lost by its
+/// author (else junk advances make every snapshot unservable for ever).
+/// Below it every block is judged exactly as by a node without the fix
+/// (`4efe6c7`), and every state keeps its bytes.
+///
+/// **`None` on the public network and the private rehearsal** (their return
+/// over Base is dormant; arming it needs this height too, at or below it:
+/// [`return_fix_schedule_is_valid`]). On the test chain: a height the
+/// operator chooses at deployment, above the tip of the day by at least two
+/// days of blocks, every node redeployed before it (proposed 11 520: tip
+/// 10 351 on 13/11 ≈ 17:30 UTC, ≈ 290 to 480 blocks a day). **Easy to move:
+/// this constant only.**
+///
+/// FIXEXT I-3 / F-6: on the public network the return-over-Base height
+/// itself (its return starts fixed: no `JTMADV02` advance, no burst of
+/// expiries at `fix + lifetime`), never apart from it.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = V1_7_BASE_RETURN_HEIGHT;
+/// The test chain's (proposed; the operator fixes it at deployment).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = Some(11_520);
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_RETURN_FIX_HEIGHT: Option<u64> = None;
+
+/// Whether a fix height may sit beside a return-over-Base height: both
+/// dormant, or both armed with the fix at or above the return.
+pub const fn return_fix_schedule_is_valid(
+    base_return_activation: Option<u64>,
+    fix_activation: Option<u64>,
+) -> bool {
+    match (base_return_activation, fix_activation) {
+        (None, None) => true,
+        (Some(base_return), Some(fix)) => fix >= base_return,
+        _ => false,
+    }
+}
+
+const _: () = assert!(
+    return_fix_schedule_is_valid(V1_7_BASE_RETURN_HEIGHT, V1_7_RETURN_FIX_HEIGHT),
+    "V1_7_RETURN_FIX_HEIGHT must be None with a dormant V1_7_BASE_RETURN_HEIGHT, else armed at or above it"
+);
+
+#[cfg(not(feature = "testnet"))]
+const _: () = assert!(
+    matches!(
+        (V1_7_BASE_RETURN_HEIGHT, V1_7_RETURN_FIX_HEIGHT),
+        (None, None)
+    ) || matches!(
+        (V1_7_BASE_RETURN_HEIGHT, V1_7_RETURN_FIX_HEIGHT),
+        (Some(h), Some(f)) if h == f
+    ),
+    "FIXEXT I-3: on the public network V1_7_RETURN_FIX_HEIGHT is V1_7_BASE_RETURN_HEIGHT"
+);
+
+/// FIXEXT (external audit of the chain, E-1): from this height on, a block
+/// that reads Base (a release, a fast release, a contradiction) reads it under
+/// an L1 block at most [`BASE_READ_MAX_AGE_SECONDS`] older than its own
+/// timestamp — `isGameClaimValid` judged (about) at present, as Base's portal
+/// judges it when a withdrawal is finalized, so that a blacklist, a
+/// retirement or a pause of Base's guardian binds the return within that age
+/// instead of the ≈ 54 h two known committees span. Below it every block is
+/// judged exactly as before.
+///
+/// **On the public network: the return-over-Base height itself** (its return
+/// is dormant: these rules are part of it from its first block, no height of
+/// their own: [`fixext_schedule_is_valid`] holds them equal). **On the test
+/// chain: 13 500** (BRIDGE3, 19/11), a height the operator chose above the tip
+/// of the day, every node redeployed before it (a node without it accepts a
+/// stale read the others refuse: a hard fork of the test chain at that
+/// height), below its third bridge's height (13 600). **Easy to move: this
+/// constant only.**
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_FIXEXT_HEIGHT: Option<u64> = V1_7_BASE_RETURN_HEIGHT;
+/// The test chain's (BRIDGE3: chosen, 13 500).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_FIXEXT_HEIGHT: Option<u64> = Some(13_500);
+/// The private rehearsal's: dormant (its return is).
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_FIXEXT_HEIGHT: Option<u64> = None;
+
+/// FIXEXT E-1: the oldest L1 block (by its execution timestamp) a block may
+/// read Base under, behind its own timestamp: 6 h. Well above the relayer's
+/// own rebuild of a pending intent (2 h, `jetsam_guardian::slow_release`) and
+/// the L1's finality lag (≈ 13-19 min); far below the two committees' span.
+pub const BASE_READ_MAX_AGE_SECONDS: u64 = 6 * 3_600;
+
+/// Whether a FIXEXT height may sit beside a return-over-Base height: on the
+/// public network equal to it (the rules come with the return); elsewhere
+/// dormant, or at or above an armed return.
+pub const fn fixext_schedule_is_valid(
+    base_return_activation: Option<u64>,
+    fixext: Option<u64>,
+    public: bool,
+) -> bool {
+    match (base_return_activation, fixext) {
+        (None, None) => true,
+        (Some(base_return), Some(h)) => {
+            if public {
+                h == base_return
+            } else {
+                h >= base_return
+            }
+        }
+        (Some(_), None) => !public,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    fixext_schedule_is_valid(
+        V1_7_BASE_RETURN_HEIGHT,
+        V1_7_FIXEXT_HEIGHT,
+        cfg!(not(feature = "testnet"))
+    ),
+    "V1_7_FIXEXT_HEIGHT must equal V1_7_BASE_RETURN_HEIGHT on the public network, else be None or at or above it"
+);
+
+/// BRIDGE2 (D208, 14 November 2026): from this height on, the return over
+/// Base reads the test chain's second bridge (`v3-mn5-bridge2`, MN-5 without
+/// a dead end) instead of TN1's, abandoned: the bridge table of
+/// `destination::state` (`BASE_RETURN_BRIDGE_ROTATIONS`). Below it every
+/// block is judged exactly as before (the same bridge, the same pins), so the
+/// history replays; from it on, no release, fast release or contradiction is
+/// judged under the abandoned bridge, and a fast release that bridge paid is
+/// never contradicted under the new one (its record expires at its horizon).
+///
+/// **`None` on the public network and the private rehearsal** (their first
+/// bridge is still to deploy). On the test chain: a height the operator
+/// chooses, every node and every robot redeployed before it (first proposed
+/// 12 480, passed on 18/11 without a switch; now 13 440 = 14 × 960: tip
+/// 12 623 on 18/11 ≈ 10:20 UTC, ≈ 3 min a block, ≈ 20/11 03:30 UTC).
+/// **Easy to move: this constant and the bridge it reads** (the new bridge's
+/// genesis window ends at it: `depositsFromHeight` of its deployment, a
+/// constructor argument, hence its address).
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = None;
+/// The test chain's (proposed; the operator fixes it at deployment).
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = Some(13_440);
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_BRIDGE2_HEIGHT: Option<u64> = None;
+
+/// Whether a second-bridge height may sit beside a return-over-Base height:
+/// dormant, or strictly above an armed return (the first bridge is read at
+/// least one block).
+pub const fn bridge2_schedule_is_valid(base_return_activation: Option<u64>, bridge2: Option<u64>) -> bool {
+    match (base_return_activation, bridge2) {
+        (_, None) => true,
+        (Some(base_return), Some(h)) => h > base_return,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    bridge2_schedule_is_valid(V1_7_BASE_RETURN_HEIGHT, V1_7_BRIDGE2_HEIGHT),
+    "V1_7_BRIDGE2_HEIGHT must be None, or strictly above an armed V1_7_BASE_RETURN_HEIGHT"
+);
+
+/// BRIDGE3 (19/11): from this height on, the return over Base reads the test
+/// chain's third bridge (`v3-fixext` 9aac4fc: the external audit's fixes, no
+/// outstanding ceiling C-6) instead of the second one (BRIDGE2B), abandoned:
+/// the second entry of the bridge table of `destination::state`
+/// (`BASE_RETURN_BRIDGE_ROTATIONS`), with V8 lifted from it on. Below it every
+/// block is judged exactly as before.
+///
+/// **`None` on the public network and the private rehearsal.** On the test
+/// chain: 13 600, the new bridge's `depositsFromHeight` (its genesis window
+/// [13 200 ; 13 600] ends at it: a constructor argument, hence its address),
+/// every node and every robot redeployed before it.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_BRIDGE3_HEIGHT: Option<u64> = None;
+/// The test chain's.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_BRIDGE3_HEIGHT: Option<u64> = Some(13_600);
+/// The private rehearsal's: dormant.
+#[cfg(feature = "rehearsal-v1-7")]
+pub const V1_7_BRIDGE3_HEIGHT: Option<u64> = None;
+
+/// Whether a third-bridge height may sit beside the second-bridge height:
+/// dormant, or strictly above an armed second bridge (the second bridge is
+/// read at least one block).
+pub const fn bridge3_schedule_is_valid(bridge2: Option<u64>, bridge3: Option<u64>) -> bool {
+    match (bridge2, bridge3) {
+        (_, None) => true,
+        (Some(h2), Some(h3)) => h3 > h2,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    bridge3_schedule_is_valid(V1_7_BRIDGE2_HEIGHT, V1_7_BRIDGE3_HEIGHT),
+    "V1_7_BRIDGE3_HEIGHT must be None, or strictly above an armed V1_7_BRIDGE2_HEIGHT"
+);
+
+/// Whether the return over Base governs the block at `height`.
+#[inline]
+pub const fn v1_7_base_return_active(height: u64) -> bool {
+    v1_7_base_return_active_with(height, V1_7_BASE_RETURN_HEIGHT)
+}
+
+/// Testable twin of [`v1_7_base_return_active`].
+#[inline]
+pub const fn v1_7_base_return_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
+/// Whether a return-over-Base height may sit beside a v1.7 height: dormant,
+/// or strictly above an armed v1.7 height.
+pub const fn base_return_schedule_is_valid(
+    v1_7_activation: Option<u64>,
+    base_return_activation: Option<u64>,
+) -> bool {
+    match (v1_7_activation, base_return_activation) {
+        (_, None) => true,
+        (Some(v1_7), Some(base_return)) => base_return > v1_7,
+        (None, Some(_)) => false,
+    }
+}
+
+const _: () = assert!(
+    base_return_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, V1_7_BASE_RETURN_HEIGHT),
+    "V1_7_BASE_RETURN_HEIGHT must be None, or strictly above an armed V1_7_ACTIVATION_HEIGHT"
+);
+
+/// v1.7, D123 (10 November 2026): the bridge's caps are the operator's bond,
+/// 50 000 JTM — a deposit (`MAX_DEPOSIT`, V4-c), the release window (V6) and
+/// the vault (V8), as the contract's C-4, C-5, C-6, B-2, A-13 and A-14. The
+/// public network and the private rehearsal have them from their v1.7 height
+/// on: no height of their own.
+///
+/// The test chain ran v1.7 from 8 160 under the caps of before (1 000 JTM a
+/// deposit, 2 500 a release window, 10 000 in the vault,
+/// `vault::TESTNET_LEGACY_VAULT_CAPS`): there D123's caps are a **hard fork at
+/// this height** — a block at or above it is judged under D123's caps, a block
+/// below it under the old ones (more is valid from it on: a node without this
+/// height refuses those blocks).
+///
+/// **`None` until the operator chooses it at deployment**: while it is `None`
+/// a test node judges every block exactly as before. Its value is
+/// `jetsam_vault_rule::TESTNET_CAPS_HEIGHT` (the test chain's proof program
+/// reads that one too); `tests::the_test_chain_caps_height_is_not_chosen` pins
+/// it, the second deliberate edit of an arming. Armed, it sits strictly above
+/// the test chain's v1.7 height ([`testnet_caps_schedule_is_valid`]) and every
+/// node of the test chain, its relayer, its robot and the test bridge's
+/// programs are rebuilt with it.
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+pub const V1_7_TESTNET_CAPS_HEIGHT: Option<u64> = jetsam_vault_rule::TESTNET_CAPS_HEIGHT;
+
+/// Whether a caps height may sit beside a v1.7 height: dormant, or strictly
+/// above an armed v1.7 height.
+pub const fn testnet_caps_schedule_is_valid(v1_7_activation: Option<u64>, caps: Option<u64>) -> bool {
+    match (v1_7_activation, caps) {
+        (_, None) => true,
+        (Some(v1_7), Some(caps)) => caps > v1_7,
+        (None, Some(_)) => false,
+    }
+}
+
+#[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+const _: () = assert!(
+    testnet_caps_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, V1_7_TESTNET_CAPS_HEIGHT),
+    "V1_7_TESTNET_CAPS_HEIGHT must be None, or strictly above V1_7_ACTIVATION_HEIGHT"
+);
+
+/// Whether one candidate block height is governed by the v1.7 rules.
+#[inline]
+pub const fn v1_7_active(height: u64) -> bool {
+    v1_7_active_with(height, V1_7_ACTIVATION_HEIGHT)
+}
+
+/// Testable twin of [`v1_7_active`] with the activation height injected.
+///
+/// Public so that the transport caps of another crate can be tested across
+/// the boundary while the real schedule stays dormant; it grants nothing: what
+/// a node accepts is decided by [`V1_7_ACTIVATION_HEIGHT`].
+#[inline]
+pub const fn v1_7_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation) if height >= activation)
+}
+
+/// Whether a v1.7 height may sit beside a v1.6 height: dormant, or armed
+/// strictly after an armed v1.6, on a multiple of 960 (the public network's
+/// rule).
+pub const fn v1_7_schedule_is_valid(
+    v1_6_activation: Option<u64>,
+    v1_7_activation: Option<u64>,
+) -> bool {
+    v1_7_schedule_is_valid_on(v1_6_activation, v1_7_activation, 960)
+}
+
+/// [`v1_7_schedule_is_valid`] with the alignment injected: dormant, or armed
+/// strictly after an armed v1.6, on a multiple of `alignment`.
+pub const fn v1_7_schedule_is_valid_on(
+    v1_6_activation: Option<u64>,
+    v1_7_activation: Option<u64>,
+    alignment: u64,
+) -> bool {
+    match (v1_6_activation, v1_7_activation) {
+        (_, None) => true,
+        (Some(v1_6), Some(v1_7)) => {
+            alignment > 0 && v1_7 > v1_6 && v1_7.is_multiple_of(alignment)
+        }
+        (None, Some(_)) => false,
+    }
+}
+
+/// The multiple a v1.7 height of this profile must sit on: 960 on the public
+/// network.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_ACTIVATION_ALIGNMENT: u64 = 960;
+
+/// The multiple a v1.7 height of the test chain must sit on: a 32-block
+/// transaction epoch, as the rehearsal's (D78).
+#[cfg(feature = "testnet")]
+pub const V1_7_ACTIVATION_ALIGNMENT: u64 = TX_EPOCH_BLOCKS;
+
+#[cfg(not(feature = "rehearsal-v1-7"))]
+const _: () = assert!(
+    v1_7_schedule_is_valid_on(
+        V1_6_ACTIVATION_HEIGHT,
+        V1_7_ACTIVATION_HEIGHT,
+        V1_7_ACTIVATION_ALIGNMENT
+    ),
+    "V1_7_ACTIVATION_HEIGHT must be None, or a multiple of V1_7_ACTIVATION_ALIGNMENT strictly above an armed V1_6_ACTIVATION_HEIGHT"
+);
+
+#[cfg(feature = "rehearsal-v1-7")]
+const _: () = assert!(
+    REHEARSAL_V1_7_ACTIVATION > REHEARSAL_V1_6_ACTIVATION
+        && REHEARSAL_V1_7_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS),
+    "the rehearsal v1.7 height sits above the rehearsal v1.6 height, on an epoch boundary"
 );
 
 /// The ASERT anchor target the first post-v1.4 block carries, verbatim.
@@ -902,8 +1323,11 @@ const _: () = assert!(
 /// refused here by its id at 46 080. Read back from the four mainnet seeds
 /// (`jetsam_getBlockHash` and `jetsam_getHeaderByHeight`, 2026-10-30, identical
 /// on all four); each is the `prev_block_hash` of the next one.
+///
+/// H-2 (audit 2026-11-10): the public network's pins through its v1.6 crossing;
+/// its v1.7 crossing joins them when declared ([`V1_7_CROSSING_PINS`]).
 #[cfg(not(feature = "testnet"))]
-pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
+pub(crate) const PINS_THROUGH_V1_6: [(u64, [u8; 32]); 5] = [
     (
         24846,
         [
@@ -945,6 +1369,91 @@ pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &[
         ],
     ),
 ];
+
+/// H-2 (audit 2026-11-10): the public network's v1.7 crossing, the ids of
+/// blocks J − 1 and J (in that order). They exist only once mined, so they
+/// ship in the release that follows the crossing (`MAINFIX_RAPPORT.md`, H-2:
+/// read back from the four seeds within hours of J, the seeds updated first);
+/// `None` until then. Set together with [`V1_7_CROSSING_SEED_HEADERS`]: they
+/// then join [`HARD_CHECKPOINTS`] at J − 1 and J, on every acceptance path, so
+/// the branch of the nodes left on the old rules is refused by its id at J
+/// whatever its height or its work. Until then a node of this profile that
+/// already holds a chain reaching J does not start
+/// ([`V1_7_CROSSING_PIN_REQUIRED`]).
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_CROSSING_PINS: Option<([u8; 32], [u8; 32])> = None;
+
+/// H-2: the raw wire headers J − 1, J and J + 1 (hex, `jetsam_getHeaderByHeight`,
+/// identical on the four seeds), the source of [`V1_7_CROSSING_PINS`]: the
+/// test `h2_the_public_network_pins_its_v1_7_crossing_exactly_as_declared`
+/// hashes and links them. `None` with the pins.
+#[cfg(not(feature = "testnet"))]
+pub const V1_7_CROSSING_SEED_HEADERS: Option<[&str; 3]> = None;
+
+#[cfg(not(feature = "testnet"))]
+const MAINNET_PIN_COUNT: usize =
+    PINS_THROUGH_V1_6.len() + if V1_7_CROSSING_PINS.is_some() { 2 } else { 0 };
+
+#[cfg(not(feature = "testnet"))]
+const MAINNET_PINS: [(u64, [u8; 32]); MAINNET_PIN_COUNT] =
+    with_v1_7_crossing(&PINS_THROUGH_V1_6, V1_7_ACTIVATION_HEIGHT, V1_7_CROSSING_PINS);
+
+/// The public network's pins: [`PINS_THROUGH_V1_6`], then its v1.7 crossing
+/// once declared ([`V1_7_CROSSING_PINS`]).
+#[cfg(not(feature = "testnet"))]
+pub const HARD_CHECKPOINTS: &[(u64, [u8; 32])] = &MAINNET_PINS;
+
+/// H-2: `base`, then a declared v1.7 crossing at `j`: `(j − 1, before)` and
+/// `(j, at)`; `base` alone without one. `N` is the length of the result,
+/// checked when a constant is built with it.
+pub(crate) const fn with_v1_7_crossing<const N: usize>(
+    base: &[(u64, [u8; 32])],
+    j: Option<u64>,
+    crossing: Option<([u8; 32], [u8; 32])>,
+) -> [(u64, [u8; 32]); N] {
+    let mut out = [(0u64, [0u8; 32]); N];
+    let mut i = 0;
+    while i < base.len() {
+        out[i] = base[i];
+        i += 1;
+    }
+    match (j, crossing) {
+        (_, None) => assert!(N == base.len(), "no crossing declared: the pins before it only"),
+        (Some(j), Some((before, at))) => {
+            assert!(N == base.len() + 2, "a declared crossing adds J - 1 and J");
+            out[i] = (j - 1, before);
+            out[i + 1] = (j, at);
+        }
+        (None, Some(_)) => panic!("a v1.7 crossing is pinned only with V1_7_ACTIVATION_HEIGHT armed"),
+    }
+    out
+}
+
+/// H-2: whether `pins` hold both blocks of the v1.7 crossing at `j` (J − 1 and
+/// J); a profile without J has nothing to pin.
+pub const fn v1_7_crossing_pinned_in(pins: &[(u64, [u8; 32])], j: Option<u64>) -> bool {
+    let Some(j) = j else {
+        return true;
+    };
+    let (mut before, mut at) = (false, false);
+    let mut i = 0;
+    while i < pins.len() {
+        if pins[i].0 + 1 == j {
+            before = true;
+        }
+        if pins[i].0 == j {
+            at = true;
+        }
+        i += 1;
+    }
+    before && at
+}
+
+/// H-2: whether a node of this profile needs its v1.7 crossing pinned once its
+/// stored chain reaches J: the public network's. The test chain crossed 8 160
+/// unpinned (one operator, every node redeployed before it, D78) and a private
+/// build starts a new chain.
+pub const V1_7_CROSSING_PIN_REQUIRED: bool = cfg!(not(feature = "testnet"));
 
 /// The test chain was reset on 2026-10-07 (walked from block 6). It crossed
 /// v1.6 at 4 800 on 2026-10-21: 4 799 and 4 800 read
@@ -1023,6 +1532,80 @@ pub(crate) mod hard_checkpoint_tests {
             "the genesis moved: clear HARD_CHECKPOINTS, and pin again only once \
              the new chain has crossed its own fork"
         );
+    }
+
+    /// H-2 (audit 2026-11-10): a v1.7 crossing is pinned when both J − 1 and J are; a profile without J has
+    /// nothing to pin.
+    #[test]
+    fn h2_a_crossing_is_pinned_with_both_of_its_blocks_only() {
+        let pins = [(10, [1; 32]), (95, [2; 32]), (96, [3; 32])];
+        assert!(v1_7_crossing_pinned_in(&pins, Some(96)));
+        assert!(!v1_7_crossing_pinned_in(&pins[..2], Some(96)), "J − 1 alone");
+        assert!(!v1_7_crossing_pinned_in(&[(10, [1; 32]), (96, [3; 32])], Some(96)), "J alone");
+        assert!(!v1_7_crossing_pinned_in(&pins, Some(128)), "another J");
+        assert!(v1_7_crossing_pinned_in(&[], None));
+    }
+
+    /// H-2: the declared crossing joins the pinned list at J − 1 and J, after the pins before it; without a
+    /// declaration the list is the same, entry for entry.
+    #[test]
+    fn h2_the_declared_crossing_joins_the_pinned_list() {
+        let base = [(5, [5; 32]), (9, [9; 32])];
+        let with: [(u64, [u8; 32]); 4] = with_v1_7_crossing(&base, Some(96), Some(([7; 32], [8; 32])));
+        assert_eq!(with, [(5, [5; 32]), (9, [9; 32]), (95, [7; 32]), (96, [8; 32])]);
+        assert_eq!(hard_checkpoint_in(&with, 96), Some([8; 32]));
+        assert_eq!(hard_checkpoint_in(&with, 95), Some([7; 32]));
+        assert!(v1_7_crossing_pinned_in(&with, Some(96)));
+        let without: [(u64, [u8; 32]); 2] = with_v1_7_crossing(&base, Some(96), None);
+        assert_eq!(without, base);
+        assert!(!v1_7_crossing_pinned_in(&without, Some(96)));
+        let unarmed: [(u64, [u8; 32]); 2] = with_v1_7_crossing(&base, None, None);
+        assert_eq!(unarmed, base);
+    }
+
+    /// H-2, the freeze: the public network's crossing is pinned exactly when it is declared — `None` until the
+    /// release that follows it, then J − 1 and J at the end of HARD_CHECKPOINTS, the ids of the raw headers the
+    /// four seeds serve (J − 1, J, J + 1, each the `prev_block_hash` of the next); and its nodes need it once past J.
+    #[cfg(not(feature = "testnet"))]
+    #[test]
+    fn h2_the_public_network_pins_its_v1_7_crossing_exactly_as_declared() {
+        assert!(V1_7_CROSSING_PIN_REQUIRED, "the public network's nodes need the crossing pinned past J");
+        match (V1_7_CROSSING_PINS, V1_7_CROSSING_SEED_HEADERS) {
+            (None, None) => {
+                assert_eq!(HARD_CHECKPOINTS, &PINS_THROUGH_V1_6[..], "nothing pinned beyond v1.6");
+                if let Some(j) = V1_7_ACTIVATION_HEIGHT {
+                    assert!(!v1_7_crossing_pinned_in(HARD_CHECKPOINTS, Some(j)));
+                }
+            }
+            (Some((before, at)), Some(raw)) => {
+                use crate::block_header::BlockHeader;
+                let j = V1_7_ACTIVATION_HEIGHT.expect("a crossing is pinned only with J armed");
+                let n = HARD_CHECKPOINTS.len();
+                assert_eq!(&HARD_CHECKPOINTS[..n - 2], &PINS_THROUGH_V1_6[..]);
+                assert_eq!(HARD_CHECKPOINTS[n - 2..], [(j - 1, before), (j, at)]);
+                let h: Vec<BlockHeader> = raw
+                    .iter()
+                    .map(|hex| {
+                        let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+                        BlockHeader::from_bytes(&bytes).expect("a wire header")
+                    })
+                    .collect();
+                assert_eq!((h[0].height, h[1].height, h[2].height), (j - 1, j, j + 1));
+                assert_eq!((block_id(&h[0]), block_id(&h[1])), (before, at));
+                assert_eq!(h[1].prev_block_hash, block_id(&h[0]));
+                assert_eq!(h[2].prev_block_hash, block_id(&h[1]));
+                assert!(v1_7_crossing_pinned_in(HARD_CHECKPOINTS, Some(j)));
+            }
+            _ => panic!("the crossing's pins and the seeds' headers they come from are set together"),
+        }
+    }
+
+    /// H-2: the test chain crossed v1.7 unpinned (one operator, every node redeployed, D78) and a private build
+    /// starts a new chain: neither needs the crossing pinned.
+    #[cfg(feature = "testnet")]
+    #[test]
+    fn h2_only_the_public_network_needs_its_crossing_pinned() {
+        assert!(!V1_7_CROSSING_PIN_REQUIRED);
     }
 
     #[test]
@@ -1853,6 +2436,29 @@ pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
 pub const RETAINED_BLOCK_SERVING_DEPTH: u64 =
     CONSENSUS_FINALITY_DEPTH + RECENT_BLOCK_RETENTION_DEPTH + 6;
 
+/// A5-7: how many blocks a node keeps the body of a bridge **deposit block**
+/// (one with a group V4 classifies as a deposit, above
+/// `BRIDGE_DEPOSITS_FROM_HEIGHT`), served by `getDepositBlock` long after
+/// `RETAINED_BLOCK_SERVING_DEPTH` and the body objects' window: 14 days of
+/// 180-second blocks.
+///
+/// A deposit is proven from its whole block (the relayer's checkpoint, the
+/// claim program), and its root may become claimable late: 24 h of the
+/// contract's slow path (`D_SLOW`) after its checkpoint, plus the contract's
+/// pauses (at most 48 h each and 96 h per 30 days), i.e. up to five days;
+/// the nine further days leave an operator the time to bring a stopped
+/// relayer back, re-prove a branch, or claim a deposit directly.
+///
+/// Operational, not consensus: it never decides a block's validity, and it
+/// may be raised without a fork. Bounded: at most one body per block, so
+/// 6 720 bodies of at most `MAX_V1_7_BLOCK_BYTES` (about 0.9 GB) in the
+/// worst case of every block being a full deposit block for 14 days.
+pub const BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH: u64 = 14 * 24 * 60 * 60 / BLOCK_TIME_V1_5;
+
+// At least D_SLOW and one longest pause, and more than every other window.
+const _: () = assert!(BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH * BLOCK_TIME_V1_5 >= (24 + 48) * 3_600);
+const _: () = assert!(BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH > RETAINED_BLOCK_SERVING_DEPTH);
+
 /// Number of hard-finalized block headers used for the state-expansion trigger.
 ///
 /// Expansion requires a strict majority of this complete window to be at or
@@ -2353,6 +2959,233 @@ mod tests {
             V1_5_ACTIVATION_HEIGHT,
             V1_6_ACTIVATION_HEIGHT
         ));
+    }
+
+    /// The v1.7 clock counts from its own height, and a dormant clock governs
+    /// no height at all.
+    #[test]
+    fn the_v1_7_clock_counts_from_its_own_height() {
+        assert!(!v1_7_active_with(69_119, Some(69_120)));
+        assert!(v1_7_active_with(69_120, Some(69_120)));
+        assert!(v1_7_active_with(69_121, Some(69_120)));
+        assert!(v1_7_active_with(u64::MAX, Some(69_120)));
+        for height in [0, 1, 46_080, 69_120, 700_800, u64::MAX] {
+            assert!(!v1_7_active_with(height, None));
+        }
+        // Production reads the profile's clock and nothing else.
+        for height in [0, 1, 960, 46_080, 69_120, u64::MAX] {
+            assert_eq!(
+                v1_7_active(height),
+                v1_7_active_with(height, V1_7_ACTIVATION_HEIGHT)
+            );
+        }
+    }
+
+    /// v1.7 comes after an armed v1.6, strictly, on a multiple of 960;
+    /// dormant is always allowed.
+    #[test]
+    fn v1_7_schedule_is_valid_multiple_of_960() {
+        for v1_6 in [None, Some(4_800), Some(46_080)] {
+            assert!(v1_7_schedule_is_valid(v1_6, None));
+        }
+        assert!(v1_7_schedule_is_valid(Some(46_080), Some(69_120)));
+        assert!(v1_7_schedule_is_valid(Some(46_080), Some(84_480)));
+        assert!(v1_7_schedule_is_valid(Some(46_080), Some(47_040)));
+        // Not after v1.6: before it, at it, or with v1.6 dormant.
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(45_120)));
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(46_080)));
+        assert!(!v1_7_schedule_is_valid(None, Some(69_120)));
+        // Off the 960 cadence, including a multiple of 480 only.
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(69_600)));
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(69_121)));
+        assert!(!v1_7_schedule_is_valid(Some(46_080), Some(0)));
+        // The schedule this build carries, under its profile's alignment (a
+        // private build has its own rule, checked at compile time beside its
+        // height).
+        #[cfg(not(feature = "rehearsal-v1-7"))]
+        assert!(v1_7_schedule_is_valid_on(
+            V1_6_ACTIVATION_HEIGHT,
+            V1_7_ACTIVATION_HEIGHT,
+            V1_7_ACTIVATION_ALIGNMENT
+        ));
+    }
+
+    /// D78: the public network keeps the 960 rule for its v1.7 height; the
+    /// test chain's sits on a 32-block transaction epoch, as the rehearsal's
+    /// does. The public rule refuses the test chain's 8 160.
+    #[test]
+    fn the_v1_7_alignment_of_each_profile() {
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(V1_7_ACTIVATION_ALIGNMENT, 960);
+            for (v1_6, v1_7) in [
+                (Some(46_080), Some(69_120)),
+                (Some(46_080), Some(69_600)),
+                (Some(46_080), Some(46_112)),
+                (Some(4_800), Some(8_160)),
+                (Some(4_800), Some(8_640)),
+                (None, Some(69_120)),
+                (Some(46_080), None),
+            ] {
+                assert_eq!(
+                    v1_7_schedule_is_valid_on(v1_6, v1_7, V1_7_ACTIVATION_ALIGNMENT),
+                    v1_7_schedule_is_valid(v1_6, v1_7),
+                    "{v1_6:?} {v1_7:?}"
+                );
+            }
+        }
+        #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+        {
+            assert_eq!(V1_7_ACTIVATION_ALIGNMENT, TX_EPOCH_BLOCKS);
+            assert!(v1_7_schedule_is_valid_on(Some(4_800), Some(8_160), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(v1_7_schedule_is_valid_on(Some(4_800), Some(4_832), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(!v1_7_schedule_is_valid_on(Some(4_800), Some(8_150), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(!v1_7_schedule_is_valid_on(Some(4_800), Some(4_800), V1_7_ACTIVATION_ALIGNMENT));
+            assert!(!v1_7_schedule_is_valid_on(None, Some(8_160), V1_7_ACTIVATION_ALIGNMENT));
+        }
+        // The public rule itself never moves: 960, whatever the profile.
+        assert!(!v1_7_schedule_is_valid(Some(4_800), Some(8_160)));
+        assert!(v1_7_schedule_is_valid(Some(4_800), Some(8_640)));
+        assert!(!v1_7_schedule_is_valid_on(Some(4_800), Some(8_160), 0));
+    }
+
+    /// The public network carries no v1.7 height until it is armed with the
+    /// operator; the test chain carries 8 160 (D78); a private build its own.
+    #[test]
+    fn the_v1_7_height_of_each_profile() {
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(61_440));
+            assert!(61_440_u64.is_multiple_of(V1_7_ACTIVATION_ALIGNMENT));
+        }
+        #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+        assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(8_160));
+        #[cfg(feature = "rehearsal-v1-7")]
+        {
+            assert_eq!(V1_7_ACTIVATION_HEIGHT, Some(REHEARSAL_V1_7_ACTIVATION));
+            assert!(REHEARSAL_V1_7_ACTIVATION > REHEARSAL_V1_6_ACTIVATION);
+            assert!(REHEARSAL_V1_7_ACTIVATION.is_multiple_of(TX_EPOCH_BLOCKS));
+        }
+    }
+
+    /// The return over Base (D94, D101, D107) has its own height, dormant on
+    /// every profile until the operator chooses it at deployment: the public
+    /// network, the test chain and the private rehearsal builds alike (a test
+    /// arms it on its own thread through injected rules only).
+    /// D123: the test chain's caps height is not chosen (`None`) until the
+    /// operator arms it at deployment, in `jetsam_vault_rule::TESTNET_CAPS_HEIGHT`
+    /// (the proof program reads it too); this test is the second, deliberate
+    /// edit of an arming. Armed, it sits strictly above the test chain's J.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    #[test]
+    fn the_test_chain_caps_height_is_not_chosen() {
+        assert_eq!(V1_7_TESTNET_CAPS_HEIGHT, Some(8_910));
+        assert_eq!(V1_7_TESTNET_CAPS_HEIGHT, jetsam_vault_rule::TESTNET_CAPS_HEIGHT);
+        assert!(testnet_caps_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, V1_7_TESTNET_CAPS_HEIGHT));
+    }
+
+    /// D123: a caps height is dormant, or strictly above an armed v1.7 height
+    /// (the test chain ran v1.7 under its caps of before from J on).
+    #[test]
+    fn the_caps_height_sits_strictly_above_v1_7() {
+        assert!(testnet_caps_schedule_is_valid(None, None));
+        assert!(testnet_caps_schedule_is_valid(Some(8_160), None));
+        assert!(testnet_caps_schedule_is_valid(Some(8_160), Some(8_161)));
+        assert!(testnet_caps_schedule_is_valid(Some(8_160), Some(9_600)));
+        assert!(!testnet_caps_schedule_is_valid(Some(8_160), Some(8_160)));
+        assert!(!testnet_caps_schedule_is_valid(Some(8_160), Some(8_000)));
+        assert!(!testnet_caps_schedule_is_valid(None, Some(9_600)));
+    }
+
+    #[test]
+    fn the_base_return_height_of_each_profile() {
+        assert!(base_return_schedule_is_valid(V1_7_ACTIVATION_HEIGHT, None));
+        assert!(base_return_schedule_is_valid(
+            V1_7_ACTIVATION_HEIGHT,
+            V1_7_BASE_RETURN_HEIGHT
+        ));
+        #[cfg(feature = "rehearsal-v1-7")]
+        {
+            assert_eq!(V1_7_BASE_RETURN_HEIGHT, None);
+            assert!(!v1_7_base_return_active(u64::MAX));
+        }
+        // The public network's: from F = J + 1 440 = 62 880 on, not one block earlier.
+        #[cfg(not(feature = "testnet"))]
+        {
+            assert_eq!(V1_7_BASE_RETURN_HEIGHT, Some(62_880));
+            assert!(!v1_7_base_return_active(62_880 - 1));
+            assert!(v1_7_base_return_active(62_880));
+        }
+        // The test chain's, armed by update n°2: from 8982 on, not one block earlier.
+        #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+        {
+            assert_eq!(V1_7_BASE_RETURN_HEIGHT, Some(8_982));
+            assert!(!v1_7_base_return_active(8_982 - 1));
+            assert!(v1_7_base_return_active(8_982));
+            assert!(v1_7_base_return_active(8_982 + 1));
+            assert!(v1_7_base_return_active(u64::MAX));
+        }
+    }
+
+    /// Armed, the return over Base sits strictly above an armed v1.7 height
+    /// (its destination state exists before it); never without v1.7.
+    #[test]
+    fn the_base_return_height_sits_strictly_above_v1_7() {
+        assert!(base_return_schedule_is_valid(None, None));
+        assert!(base_return_schedule_is_valid(Some(8_160), None));
+        assert!(base_return_schedule_is_valid(Some(8_160), Some(8_161)));
+        assert!(base_return_schedule_is_valid(Some(8_160), Some(20_000)));
+        assert!(!base_return_schedule_is_valid(Some(8_160), Some(8_160)));
+        assert!(!base_return_schedule_is_valid(Some(8_160), Some(8_000)));
+        assert!(!base_return_schedule_is_valid(None, Some(8_161)));
+        assert!(v1_7_base_return_active_with(9_000, Some(9_000)));
+        assert!(!v1_7_base_return_active_with(8_999, Some(9_000)));
+        assert!(!v1_7_base_return_active_with(9_000, None));
+    }
+
+    /// D78: the test chain crosses v1.7 at block 8 160 and not one block
+    /// earlier. J − 1 keeps every clock of the 1.6.1 test build (v1.4 at 6,
+    /// v1.5 at 960, v1.6 at 4 800, the v1.6 body cap, the v1.6 relation);
+    /// J and J + 1 are v1.7 blocks. The clocks that hang off J follow it:
+    /// deposits from F = 8 704 (J + 544, D104), delegation from J_D = 23 520.
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    #[test]
+    fn the_test_chain_crosses_v1_7_at_8160() {
+        use crate::consensus::wire_limits::{
+            block_bytes_limit, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES,
+        };
+        assert_eq!(V1_4_ACTIVATION_HEIGHT, Some(6));
+        assert_eq!(V1_5_ACTIVATION_HEIGHT, Some(960));
+        assert_eq!(V1_6_ACTIVATION_HEIGHT, Some(4_800));
+        assert!(!v1_7_active(8_159));
+        assert!(v1_7_active(8_160));
+        assert!(v1_7_active(8_161));
+        assert_eq!(block_bytes_limit(8_159), MAX_BLOCK_BYTES);
+        assert_eq!(block_bytes_limit(8_160), MAX_V1_7_BLOCK_BYTES);
+        assert_eq!(block_bytes_limit(8_161), MAX_V1_7_BLOCK_BYTES);
+        // An armed build bounds the transport by the largest v1.7 body and
+        // judges each block by the cap of its own height (above).
+        assert_eq!(MAX_BLOCK_TRANSPORT_BYTES, MAX_V1_7_BLOCK_BYTES);
+        // v1.7 is not a HistoryStep generation: the relation stays v1.6's.
+        for height in [8_159, 8_160, 8_161] {
+            assert!(v1_6_active(height));
+            assert_eq!(
+                HistoryStepPackGeneration::at_height(height),
+                HistoryStepPackGeneration::V1_6,
+                "height {height}"
+            );
+        }
+        assert_eq!(
+            crate::consensus::vault::bridge_deposits_from_height(V1_7_ACTIVATION_HEIGHT),
+            Some(8_704)
+        );
+        assert_eq!(
+            crate::consensus::guardian::DELEGATION_ACTIVATION_HEIGHT,
+            Some(23_520)
+        );
+        // J and J_D sit on the guardians' 480-block reward period (checked at
+        // compile time in guardian/mod.rs).
+        assert!(8_160_u64.is_multiple_of(crate::consensus::guardian::REWARD_PERIOD_BLOCKS));
     }
 
     /// v1.6 is the fourth relation. It is chosen by its own clock, at the

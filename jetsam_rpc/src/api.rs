@@ -88,6 +88,13 @@ pub trait JetsamApi {
     #[method(name = "getBlock")]
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>>;
 
+    /// A5-7: the full canonical block at `height`, as hex (as `getBlock`):
+    /// served while it is in the `getBlock` window, or, far longer
+    /// (`BRIDGE_DEPOSIT_BODY_RETENTION_DEPTH`), when it is a bridge deposit
+    /// block. Never a block of another branch. Null otherwise.
+    #[method(name = "getDepositBlock")]
+    async fn get_deposit_block(&self, height: u64) -> RpcResult<Option<String>>;
+
     /// Permanent header plus full body detail when the block remains retained.
     #[method(name = "getBlockDetails")]
     async fn get_block_details(&self, height: u64) -> RpcResult<Option<BlockDetailsInfo>>;
@@ -121,6 +128,15 @@ pub trait JetsamApi {
     /// only.
     #[method(name = "getPeerVersions")]
     async fn get_peer_versions(&self) -> RpcResult<crate::types::PeerVersionsInfo>;
+
+    /// The branches this node refused (T3.10): those seen since `since_unix`,
+    /// with their headers and the work recomputed from them, the heaviest
+    /// first, bounded.
+    #[method(name = "getObservedBranches")]
+    async fn get_observed_branches(
+        &self,
+        since_unix: u64,
+    ) -> RpcResult<crate::observed_branches::ObservedBranchesResponse>;
 
     /// Daemon sync, mining, CPU backend and worker-pool status.
     #[method(name = "getNodeStatus")]
@@ -259,6 +275,162 @@ pub trait JetsamApi {
     /// The chain's client registry at the tip, and what this node holds.
     #[method(name = "listClients")]
     async fn list_clients(&self) -> RpcResult<crate::client_objects::ClientListResponse>;
+
+    /// v1.7: hand a destination intent (hex of `DestinationIntent::encode`:
+    /// a committee update with the transaction paying it, or a release with
+    /// its finality update, account proof and release group) to this node's
+    /// mempool, for its miners. Refused below J.
+    #[method(name = "submitDestinationObject")]
+    async fn submit_destination_object(
+        &self,
+        intent_hex: String,
+    ) -> RpcResult<crate::destination::SubmitDestinationObjectResponse>;
+
+    /// v1.7: the bridge vault at the tip — `bridge_locked`, ceiling, room
+    /// (V8), floor, opening `F`, paid indices and V6 window, deposits per
+    /// height over the last 1 024 heights, releases held.
+    #[method(name = "getVaultState")]
+    async fn get_vault_state(&self) -> RpcResult<crate::destination::VaultStateResponse>;
+
+    /// v1.7: the L1 sync committees the branch knows, whether this node holds
+    /// their keys, the build's anchor and bridge.
+    #[method(name = "getDestinationCommittee")]
+    async fn get_destination_committee(
+        &self,
+    ) -> RpcResult<crate::destination::DestinationCommitteeResponse>;
+
+    /// v1.7, the return over Base (D107, D114): the advances the branch holds
+    /// for withdrawal index `n` and, given the burn (`owner` bech32m and
+    /// `amount` µJTM), whom its release group must pay at the tip's child
+    /// (V2). Nothing is read while the return over Base is dormant.
+    /// v1.7, the fast lane of the return over Base (D127, D130): the relay
+    /// key of this build and whether the branch closed it, the keys closed,
+    /// the deficit, the fast releases the branch still remembers (what a
+    /// contradiction's marker commits to). Nothing while the return is
+    /// dormant.
+    #[method(name = "getFastLane")]
+    async fn get_fast_lane(&self) -> RpcResult<crate::destination::FastLaneResponse>;
+
+    /// v1.7 (D171, D176): the activations this node applies, read from the
+    /// rules its validation reads (never a copy): its network (genesis
+    /// block id), the v1.5 height, `J`, `F`, the vault and D123's caps
+    /// height, the return over Base (`H`, its bridge, the fast lane's keys),
+    /// the guardian rules' heights and group key. A guardian program compares
+    /// them with its own build's before it uses the node. A read: no cookie.
+    #[method(name = "getActivations")]
+    async fn get_activations(&self)
+        -> RpcResult<jetsam_chain::consensus::activations::Activations>;
+
+    #[method(name = "getAdvances")]
+    async fn get_advances(
+        &self,
+        n: u64,
+        owner: Option<String>,
+        amount: Option<u64>,
+    ) -> RpcResult<crate::destination::AdvancesResponse>;
+
+    /// v1.7 (T3.7): hand a guardian intent (hex of `GuardianIntent::encode`:
+    /// an object with the transaction paying its marker) to this node's
+    /// mempool, for its miners. Attestations and equivocations: at most four
+    /// per second per client address (A3-5: the local host has its own
+    /// quota). Refused below J.
+    #[method(name = "submitGuardianObject", with_extensions)]
+    async fn submit_guardian_object(
+        &self,
+        intent_hex: String,
+    ) -> RpcResult<crate::guardian::SubmitGuardianObjectResponse>;
+
+    /// v1.7: the guardian state the tip's child is judged against — key,
+    /// revocation, attestations, `J`, `J_D`, the latch, the reward ledger —
+    /// and the two pools' payable balances.
+    #[method(name = "getGuardianState")]
+    async fn get_guardian_state(&self) -> RpcResult<crate::guardian::GuardianStateResponse>;
+
+    /// v1.7: an owner's stake (active, activating), its stake entries, and
+    /// `max_payable_entry` (the largest entry one payout can pay now).
+    #[method(name = "getStakeInfo")]
+    async fn get_stake_info(&self, owner: String) -> RpcResult<crate::guardian::StakeInfoResponse>;
+
+    /// v1.7: an owner's reward balance and entries, and a projected rate
+    /// (display only).
+    #[method(name = "getRewardInfo")]
+    async fn get_reward_info(&self, owner: String)
+        -> RpcResult<crate::guardian::RewardInfoResponse>;
+
+    /// v1.7 (A1 m10): build and prove, with the active wallet, the
+    /// transaction paying a guardian object owned by the active address (its
+    /// marker; the lock to the stake vault, the funding to the reward pool;
+    /// change back). Not submitted: pass `intent_hex` to
+    /// `submitGuardianObject`. Its inputs stay reserved until mined.
+    #[method(name = "walletBuildGuardianPayment")]
+    async fn wallet_build_guardian_payment(
+        &self,
+        object: crate::guardian::GuardianPaymentObject,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::guardian::GuardianPaymentResponse>;
+
+    /// v1.7 (fast lane): build and prove, with the active wallet, the
+    /// transaction carrying the marker of a destination object a relay pays
+    /// for — a committee update (`JTMLCU01`), a contradiction (`JTMFCT01`) or
+    /// a revocation (`JTMFRV01`): the marker (value 0), then the change. Not
+    /// submitted: the caller assembles the intent for
+    /// `submitDestinationObject`. Its inputs stay reserved until mined.
+    #[method(name = "walletBuildDestinationPayment")]
+    async fn wallet_build_destination_payment(
+        &self,
+        marker: String,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse>;
+
+    /// v1.7 (return over Base): build and prove, with the active wallet, the
+    /// advance of the burn `(n, owner, amount)`: `owner` paid `paid` µJTM
+    /// (the least the rule allows when none is given), the `JTMADV02` marker,
+    /// the change. Not submitted: pass `payment_hex` to `submitTxIntent`. The
+    /// vault repays the active address when the burn is released.
+    #[method(name = "walletBuildAdvance")]
+    async fn wallet_build_advance(
+        &self,
+        n: u64,
+        owner: String,
+        amount_micro_jtm: u64,
+        paid_micro_jtm: Option<u64>,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::destination::DestinationPaymentResponse>;
+
+    /// v1.7 (F4): the deposit `walletBridgeDeposit` would build now, from the
+    /// active address to the bridge vault for the Base/EVM `recipient` (`0x`
+    /// and 40 hex digits; mixed case must match its checksum): fee
+    /// (automatic when none is given), total, spendable balance, the next
+    /// block and `F`. Refused while the build carries no v1.7 height, until
+    /// the block after `F`, and outside the limits of one deposit (V4).
+    /// Nothing is built, reserved or sent.
+    #[method(name = "walletPlanBridgeDeposit")]
+    async fn wallet_plan_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: Option<u64>,
+    ) -> RpcResult<crate::bridge::BridgeDepositPlan>;
+
+    /// v1.7 (F4): build, prove and submit, with the active wallet, a deposit
+    /// to the bridge vault for the Base/EVM `recipient`: the vault output,
+    /// the `JTMBRDG1` marker naming the recipient, the change. Same refusals
+    /// as `walletPlanBridgeDeposit`; the fee is the one its plan gave (never
+    /// chosen here); the mempool admits it under V4 and V8 at the next block,
+    /// or its inputs are released. One-way: it cannot be cancelled.
+    #[method(name = "walletBridgeDeposit")]
+    async fn wallet_bridge_deposit(
+        &self,
+        recipient: String,
+        amount_micro_jtm: u64,
+        fee_micro_jtm: u64,
+    ) -> RpcResult<crate::bridge::BridgeDepositResult>;
+
+    /// v1.7: the payout of a due entry from its pool (inputs, outputs, fee);
+    /// no key is needed to pay it, the pools' secrets being published.
+    #[method(name = "planGuardianPayout")]
+    async fn plan_guardian_payout(&self, entry_id: u64)
+        -> RpcResult<crate::guardian::PayoutPlan>;
 
     /// Assemble a client proof bundle (hex) from its parts: the submission
     /// (`D`, IO commitment), its payment (hex intent) and the proof (hex,

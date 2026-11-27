@@ -12,6 +12,7 @@ testnet = ["jetsam_chain/testnet"]
 # PRIVATE BUILDS ONLY: see the feature of the
 # same name in jetsam_chain. Never a release build.
 rehearsal-v1-6 = ["testnet", "jetsam_chain/rehearsal-v1-6"]
+rehearsal-v1-7 = ["rehearsal-v1-6", "jetsam_chain/rehearsal-v1-7"]
 
 # --- Daemon ---
 [[bin]]
@@ -22,6 +23,13 @@ path = "src/main.rs"
 [[bin]]
 name = "jetsam-cli"
 path = "src/bin/jetsam_cli.rs"
+
+# --- PRIVATE rehearsal tool (T7.2): built only with `rehearsal-v1-7`, never
+# distributed. Synthetic L1 objects and test-key attestations as intents.
+[[bin]]
+name = "jetsam-rehearsal"
+path = "src/bin/jetsam_rehearsal.rs"
+required-features = ["rehearsal-v1-7"]
 
 [dependencies]
 jetsam_chain      = { path = "../jetsam_chain" }
@@ -61,7 +69,7 @@ hex     = "0.4"
 blake3  = "1"
 
 # Networking
-libp2p  = { version = "0.55", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
+libp2p  = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

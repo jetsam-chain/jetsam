@@ -28,6 +28,48 @@ pub const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BLOCK_BYTES: usize =
     1 + crate::wire::BLOCK_HEADER_WIRE_SIZE + 4 + 256 * jetsam_tx::TX_BODY_WIRE_SIZE;
 
+/// v1.7: budget of a block's destination section (0xC2), marker and count
+/// included, **outside** [`MAX_BLOCK_BYTES`]. The largest section measured
+/// (one committee update, one finality update, the bridge account proof and
+/// four releases) is 44 645 bytes of objects; 47 559 with the storage proof
+/// of the contract's `genesisId` the account proof carries since A5-8
+/// (counted at a release's measured storage proof).
+pub const MAX_DESTINATION_SECTION_BYTES: usize = 48 * 1024;
+
+/// Largest v1.7 block: everything [`MAX_BLOCK_BYTES`] bounds, then a
+/// destination section at its budget.
+pub const MAX_V1_7_BLOCK_BYTES: usize = MAX_BLOCK_BYTES + MAX_DESTINATION_SECTION_BYTES;
+
+/// Allocation, storage and transport bound of one block body understood by
+/// this binary, before any decode: [`MAX_V1_7_BLOCK_BYTES`] once the v1.7
+/// clock is armed, [`MAX_BLOCK_BYTES`] while it is dormant (byte for byte the
+/// v1.6 bound). Consensus still judges each block by the cap of its own
+/// height ([`block_bytes_limit`]): bound first, judge second.
+pub const MAX_BLOCK_TRANSPORT_BYTES: usize =
+    match crate::consensus::params::V1_7_ACTIVATION_HEIGHT {
+        Some(_) => MAX_V1_7_BLOCK_BYTES,
+        None => MAX_BLOCK_BYTES,
+    };
+
+/// Active cap for the body of a block at `height`.
+#[inline]
+pub const fn block_bytes_limit(height: u64) -> usize {
+    block_bytes_limit_at_activation(height, crate::consensus::params::V1_7_ACTIVATION_HEIGHT)
+}
+
+/// Twin of [`block_bytes_limit`] with the v1.7 schedule injected: a pure
+/// arithmetic answer, public so that the transport guards of other crates can
+/// be tested across the boundary while the real schedule stays dormant. It
+/// grants no admission capability.
+#[inline]
+pub const fn block_bytes_limit_at_activation(height: u64, v1_7_activation: Option<u64>) -> usize {
+    if crate::consensus::params::v1_7_active_with(height, v1_7_activation) {
+        MAX_V1_7_BLOCK_BYTES
+    } else {
+        MAX_BLOCK_BYTES
+    }
+}
+
 /// Maximum block resource weight accepted before expensive proof verification.
 ///
 /// This is an admission/DoS guard, not the consensus semantic throughput
@@ -441,6 +483,50 @@ mod tests {
             assert_ne!(V1_6_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT);
             assert_ne!(V1_6_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT);
             assert_ne!(V1_6_ACTIVATION_HEIGHT, V1_5_ACTIVATION_HEIGHT);
+        }
+    }
+
+    /// The public network's v1.7 height: 61 440, decided with the operator
+    /// against the tip of the day (25-26 November 2026, tip 59 509).
+    #[cfg(not(feature = "testnet"))]
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(61_440);
+
+    /// The test chain's v1.7 height: 8 160, decided with the operator (D78).
+    #[cfg(all(feature = "testnet", not(feature = "rehearsal-v1-7")))]
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> = Some(8160);
+
+    /// A private build's v1.7 height (`rehearsal-v1-7`, never a release).
+    #[cfg(feature = "rehearsal-v1-7")]
+    const DECLARED_V1_7_ACTIVATION_HEIGHT: Option<u64> =
+        Some(crate::consensus::params::REHEARSAL_V1_7_ACTIVATION);
+
+    /// The same two-edit rule, for the sixth clock.
+    ///
+    /// Crossing it makes the destination section (0xC2) mandatory in every
+    /// block: an unannounced height is a fork on the first block after it.
+    #[test]
+    fn arming_v1_7_takes_two_deliberate_edits() {
+        assert_eq!(
+            crate::consensus::params::V1_7_ACTIVATION_HEIGHT,
+            DECLARED_V1_7_ACTIVATION_HEIGHT,
+            "arming v1.7 is decided with the network operator: change this \
+             declaration and params::V1_7_ACTIVATION_HEIGHT in one commit, or neither"
+        );
+    }
+
+    /// Hanging v1.7 off an earlier clock would arm it retroactively.
+    #[test]
+    fn the_v1_7_clock_is_not_one_of_the_earlier_clocks() {
+        use crate::consensus::params::{
+            V1_2_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT,
+            V1_5_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT, V1_7_ACTIVATION_HEIGHT,
+        };
+        if V1_7_ACTIVATION_HEIGHT.is_some() {
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_2_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_3_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_4_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_5_ACTIVATION_HEIGHT);
+            assert_ne!(V1_7_ACTIVATION_HEIGHT, V1_6_ACTIVATION_HEIGHT);
         }
     }
 

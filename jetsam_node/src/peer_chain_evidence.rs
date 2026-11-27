@@ -20,12 +20,26 @@
 //! to the connection, the lowest height at which a header it served was
 //! refused by a rule only a fork explains, and the highest pinned block it has
 //! shown. A disconnect forgets only the probe in flight.
+//!
+//! v1.7 gate 1 (private rehearsal, 2026-10-31). A v1.6 branch that did not
+//! upgrade, heavier and forked inside the reorg window, has headers and
+//! terminals that v1.7 still accepts: only its bodies are refused, for the
+//! destination section they lack at and above the v1.7 height. That refusal
+//! condemns no header (a relay can strip a section), so every v1.7 node kept
+//! selecting the branch, refused its body peer after peer, and three of them
+//! froze for half an hour. The exact bytes of a body refused that way are
+//! remembered here too ([`PeerChainEvidence::refuse_body`]): a peer that
+//! advertises those very bytes follows that branch — an honest v1.7 node never
+//! holds them — while a peer offering another body for the same block is left
+//! alone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use jetsam_chain::block_header::BlockHeader;
+use jetsam_p2p::header_protocol::HeaderInventoryRecord;
+use jetsam_p2p::object_protocol::BlockBodyObjectId;
 use libp2p::PeerId;
 
 /// How long a verdict about a peer's chain is kept. It outlives any
@@ -39,6 +53,32 @@ pub(crate) const PEER_CHAIN_EVIDENCE_CAPACITY: usize = 4_096;
 
 /// A pin probe that has not been answered after this long may be sent again.
 pub(crate) const PIN_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bound on the refused bodies kept (one per refused branch, in practice).
+pub(crate) const REFUSED_BODY_CAPACITY: usize = 1_024;
+
+/// S-1 (audit 2026-11-10): how many points of a header chain this node
+/// validated itself (snapshot header staging) it keeps once the plan that
+/// staged them has ended: the highest ones. A real snapshot boundary is a
+/// finalized one, at most `CONSENSUS_FINALITY_DEPTH` plus one boundary
+/// interval below the tip of the chain it was staged on; 64 covers that with
+/// room for the chain to move on meanwhile.
+pub(crate) const VALIDATED_POINT_CAPACITY: usize = 64;
+
+/// S-1: bound on the snapshot boundaries (height and block id) kept because a
+/// plan toward them went unserved or was refuted by validated headers.
+pub(crate) const UNSERVED_BOUNDARY_CAPACITY: usize = 1_024;
+
+/// S-1: how long a node without tip authority takes no unverified snapshot
+/// boundary above the height where the last one went unserved, when that
+/// height was within direct reach of its tip. Long enough for a restarted
+/// seed to import the few blocks it lacks and get its tip confirmed; short
+/// enough that a node which really fell behind meanwhile is not held long.
+pub(crate) const UNSERVED_CEILING_TTL: Duration = Duration::from_secs(600);
+
+/// A point of a header chain this node validated against its own rules:
+/// height, block id, cumulative work.
+pub(crate) type ValidatedPoint = (u64, [u8; 32], [u8; 32]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Verdict {
@@ -86,7 +126,26 @@ pub(crate) struct PeerChainEvidence<H = ()> {
     /// Boundary of a snapshot plan the peer offered that then made no
     /// progress: a claim nobody served.
     unserved: HashMap<PeerId, Verdict>,
-    /// A divergence verdict was taken or ended since [`Self::take_changed`].
+    /// Bodies (their exact bytes, by object id) refused at or above the v1.7
+    /// height because they carry no destination section, with their expiry.
+    refused_bodies: HashMap<BlockBodyObjectId, Instant>,
+    /// S-1: the highest points of the header chains this node staged and
+    /// validated itself, by height: block id, cumulative work, expiry.
+    validated_points: BTreeMap<u64, ([u8; 32], [u8; 32], Instant)>,
+    /// S-1: snapshot boundaries (height, block id) whose plan went unserved
+    /// or was refuted by validated headers, with their expiry, whoever
+    /// offers them.
+    unserved_boundaries: HashMap<(u64, [u8; 32]), Instant>,
+    /// S-1: the height at which the last unverified snapshot plan went
+    /// unserved, when it was within direct reach of the local tip.
+    unserved_ceiling: Option<Verdict>,
+    /// H-2 (audit 2026-11-10): the providers in the node's object quarantine
+    /// (their exact object bytes failed its checks), with the expiry of the
+    /// record from the first time it was noted: saved with the verdicts so
+    /// that a restart keeps them out of the object inventory.
+    object_quarantine: HashMap<PeerId, Instant>,
+    /// A divergence verdict was taken or ended, or a body refused, since
+    /// [`Self::take_changed`].
     changed: bool,
 }
 
@@ -96,6 +155,11 @@ impl<H> Default for PeerChainEvidence<H> {
             divergent: HashMap::new(),
             pinned: HashMap::new(),
             unserved: HashMap::new(),
+            refused_bodies: HashMap::new(),
+            validated_points: BTreeMap::new(),
+            unserved_boundaries: HashMap::new(),
+            unserved_ceiling: None,
+            object_quarantine: HashMap::new(),
             changed: false,
             probe_wanted: HashMap::new(),
             probe_inflight: HashMap::new(),
@@ -126,6 +190,61 @@ impl<H> PeerChainEvidence<H> {
         self.divergence_height(peer, now).is_some()
     }
 
+    /// The body `body` (these exact bytes) was refused at or above the v1.7
+    /// height for carrying no destination section: kept for
+    /// [`PEER_CHAIN_EVIDENCE_TTL`], restarts included.
+    pub(crate) fn refuse_body(&mut self, body: BlockBodyObjectId, now: Instant) {
+        self.refused_bodies
+            .insert(body, now + PEER_CHAIN_EVIDENCE_TTL);
+        self.changed = true;
+        self.bound_refused_bodies(now);
+    }
+
+    /// The lowest height at which `records` advertise a body this node
+    /// refused ([`Self::refuse_body`]), while that refusal holds. A record of
+    /// the same block that offers other bytes, or no body, says nothing.
+    pub(crate) fn refused_body_advertised<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a HeaderInventoryRecord>,
+        now: Instant,
+    ) -> Option<u64> {
+        records
+            .into_iter()
+            .filter_map(|record| record.body)
+            .filter(|body| {
+                self.refused_bodies
+                    .get(body)
+                    .is_some_and(|expires| *expires > now)
+            })
+            .map(|body| body.claim.height)
+            .min()
+    }
+
+    /// H-2: the providers of the node's object quarantine, noted: a new one is
+    /// kept for [`PEER_CHAIN_EVIDENCE_TTL`] from now and marks the verdicts to
+    /// be saved; one already noted keeps its expiry.
+    pub(crate) fn note_object_quarantine<'a>(&mut self, peers: impl IntoIterator<Item = &'a PeerId>, now: Instant) {
+        for peer in peers {
+            if !self.object_quarantine.contains_key(peer) {
+                self.object_quarantine.insert(*peer, now + PEER_CHAIN_EVIDENCE_TTL);
+                self.changed = true;
+            }
+        }
+        if self.object_quarantine.len() > PEER_CHAIN_EVIDENCE_CAPACITY {
+            self.object_quarantine.retain(|_, expires| *expires > now);
+        }
+    }
+
+    /// H-2: the providers whose quarantine record holds at `now` (those
+    /// restored from the last run included).
+    pub(crate) fn object_quarantined_peers(&self, now: Instant) -> HashSet<PeerId> {
+        self.object_quarantine
+            .iter()
+            .filter(|(_, expires)| **expires > now)
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
     /// Whether a divergence verdict was taken or ended since the last call.
     pub(crate) fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
@@ -150,6 +269,37 @@ impl<H> PeerChainEvidence<H> {
                 .unwrap_or_default()
                 .as_secs();
             lines.push_str(&format!("{peer} {} {expires}\n", verdict.height));
+        }
+        // v1.7 gate 1: `body <height> <block id> <byte digest> <length> <expiry>`;
+        // the reader of a release before it skips these lines (no peer id).
+        for (body, expires) in &self.refused_bodies {
+            let left = expires.saturating_duration_since(now);
+            if left.is_zero() {
+                continue;
+            }
+            let expires = (wall_now + left)
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            lines.push_str(&format!(
+                "body {} {} {} {} {expires}\n",
+                body.claim.height,
+                hex::encode(body.claim.block_hash),
+                hex::encode(body.byte_digest),
+                body.encoded_len,
+            ));
+        }
+        // H-2: `objects <peer id> <expiry>`; the reader of a release before it skips these lines (no peer id first).
+        for (peer, expires) in &self.object_quarantine {
+            let left = expires.saturating_duration_since(now);
+            if left.is_zero() {
+                continue;
+            }
+            let expires = (wall_now + left)
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            lines.push_str(&format!("objects {peer} {expires}\n"));
         }
         let written = path.with_extension("new");
         std::fs::write(&written, lines)?;
@@ -176,6 +326,38 @@ impl<H> PeerChainEvidence<H> {
             .as_secs();
         let mut loaded = 0;
         for line in lines.lines() {
+            if let Some(rest) = line.strip_prefix("objects ") {
+                let mut fields = rest.split_whitespace();
+                let (Some(Ok(peer)), Some(Ok(expires))) =
+                    (fields.next().map(str::parse::<PeerId>), fields.next().map(str::parse::<u64>))
+                else {
+                    continue;
+                };
+                let left = expires
+                    .saturating_sub(wall_now)
+                    .min(PEER_CHAIN_EVIDENCE_TTL.as_secs());
+                if left == 0 {
+                    continue;
+                }
+                self.object_quarantine.insert(peer, now + Duration::from_secs(left));
+                loaded += 1;
+                continue;
+            }
+            if let Some(body) = line.strip_prefix("body ") {
+                let Some((body, expires)) = parse_refused_body(body) else {
+                    continue;
+                };
+                let left = expires
+                    .saturating_sub(wall_now)
+                    .min(PEER_CHAIN_EVIDENCE_TTL.as_secs());
+                if left == 0 {
+                    continue;
+                }
+                self.refused_bodies
+                    .insert(body, now + Duration::from_secs(left));
+                loaded += 1;
+                continue;
+            }
             let mut fields = line.split_whitespace();
             let (Some(Ok(peer)), Some(Ok(height)), Some(Ok(expires))) = (
                 fields.next().map(str::parse::<PeerId>),
@@ -201,6 +383,7 @@ impl<H> PeerChainEvidence<H> {
             loaded += 1;
         }
         self.bound(now);
+        self.bound_refused_bodies(now);
         Ok(loaded)
     }
 
@@ -228,6 +411,104 @@ impl<H> PeerChainEvidence<H> {
             .get(peer)
             .filter(|record| record.expires > now)
             .map(|record| record.height)
+    }
+
+    /// S-1: `points` belong to a header chain this node staged and validated
+    /// against its own rules. Kept for [`PEER_CHAIN_EVIDENCE_TTL`], the
+    /// [`VALIDATED_POINT_CAPACITY`] highest ones, whatever peer served them:
+    /// a snapshot boundary at one of these heights is checked against them,
+    /// not against its sender's word.
+    pub(crate) fn learn_validated_points(
+        &mut self,
+        points: impl IntoIterator<Item = ValidatedPoint>,
+        now: Instant,
+    ) {
+        let expires = now + PEER_CHAIN_EVIDENCE_TTL;
+        for (height, hash, work) in points {
+            self.validated_points.insert(height, (hash, work, expires));
+        }
+        self.validated_points
+            .retain(|_, (_, _, expires)| *expires > now);
+        while self.validated_points.len() > VALIDATED_POINT_CAPACITY {
+            self.validated_points.pop_first();
+        }
+    }
+
+    /// S-1: the validated point at `height` (block id, cumulative work), while
+    /// it holds.
+    pub(crate) fn validated_point(&self, height: u64, now: Instant) -> Option<([u8; 32], [u8; 32])> {
+        self.validated_points
+            .get(&height)
+            .filter(|(_, _, expires)| *expires > now)
+            .map(|(hash, work, _)| (*hash, *work))
+    }
+
+    /// S-1: the height of the highest validated point kept, while it holds.
+    pub(crate) fn highest_validated_point(&self, now: Instant) -> Option<u64> {
+        self.validated_points
+            .iter()
+            .rev()
+            .find(|(_, (_, _, expires))| *expires > now)
+            .map(|(height, _)| *height)
+    }
+
+    /// S-1: a snapshot plan toward the boundary `(height, hash)` went unserved,
+    /// or the headers this node validated reached `height` with another block.
+    /// Kept for [`PEER_CHAIN_EVIDENCE_TTL`], whoever offers it next.
+    pub(crate) fn mark_unserved_boundary(&mut self, height: u64, hash: [u8; 32], now: Instant) {
+        self.unserved_boundaries
+            .insert((height, hash), now + PEER_CHAIN_EVIDENCE_TTL);
+        if self.unserved_boundaries.len() > UNSERVED_BOUNDARY_CAPACITY {
+            self.unserved_boundaries.retain(|_, expires| *expires > now);
+        }
+        if self.unserved_boundaries.len() > UNSERVED_BOUNDARY_CAPACITY {
+            let mut by_expiry = self
+                .unserved_boundaries
+                .iter()
+                .map(|(boundary, expires)| (*expires, *boundary))
+                .collect::<Vec<_>>();
+            by_expiry.sort();
+            let excess = self.unserved_boundaries.len() - UNSERVED_BOUNDARY_CAPACITY * 3 / 4;
+            for (_, boundary) in by_expiry.into_iter().take(excess) {
+                self.unserved_boundaries.remove(&boundary);
+            }
+        }
+    }
+
+    /// S-1: whether the boundary `(height, hash)` went unserved, while that
+    /// record holds.
+    pub(crate) fn boundary_unserved(&self, height: u64, hash: [u8; 32], now: Instant) -> bool {
+        self.unserved_boundaries
+            .get(&(height, hash))
+            .is_some_and(|expires| *expires > now)
+    }
+
+    /// S-1: an unverified snapshot plan went unserved once the headers this
+    /// node validated reached `height`, within direct reach of its tip: no
+    /// connected peer served a header past it. Kept for
+    /// [`UNSERVED_CEILING_TTL`].
+    pub(crate) fn mark_unserved_ceiling(&mut self, height: u64, now: Instant) {
+        self.unserved_ceiling = Some(Verdict {
+            height,
+            expires: now + UNSERVED_CEILING_TTL,
+        });
+    }
+
+    /// S-1: the height of [`Self::mark_unserved_ceiling`], while it holds.
+    pub(crate) fn unserved_ceiling(&self, now: Instant) -> Option<u64> {
+        self.unserved_ceiling
+            .filter(|ceiling| ceiling.expires > now)
+            .map(|ceiling| ceiling.height)
+    }
+
+    /// Every peer whose divergence verdict holds, with its divergence height
+    /// (the branch observer's probes start there, T3.10b).
+    pub(crate) fn divergence_heights(&self, now: Instant) -> Vec<(PeerId, u64)> {
+        self.divergent
+            .iter()
+            .filter(|(_, verdict)| verdict.expires > now)
+            .map(|(peer, verdict)| (*peer, verdict.height))
+            .collect()
     }
 
     /// Every peer whose divergence verdict holds.
@@ -403,6 +684,26 @@ impl<H> PeerChainEvidence<H> {
         self.probe_wanted.remove(peer);
     }
 
+    /// Past [`REFUSED_BODY_CAPACITY`], the expired refused bodies go, then
+    /// those closest to expiry, down to three quarters of it.
+    fn bound_refused_bodies(&mut self, now: Instant) {
+        if self.refused_bodies.len() > REFUSED_BODY_CAPACITY {
+            self.refused_bodies.retain(|_, expires| *expires > now);
+        }
+        if self.refused_bodies.len() > REFUSED_BODY_CAPACITY {
+            let mut by_expiry = self
+                .refused_bodies
+                .iter()
+                .map(|(body, expires)| (*expires, *body))
+                .collect::<Vec<_>>();
+            by_expiry.sort_by_key(|(expires, _)| *expires);
+            let excess = self.refused_bodies.len() - REFUSED_BODY_CAPACITY * 3 / 4;
+            for (_, body) in by_expiry.into_iter().take(excess) {
+                self.refused_bodies.remove(&body);
+            }
+        }
+    }
+
     /// Past [`PEER_CHAIN_EVIDENCE_CAPACITY`], the expired records go, then
     /// those closest to expiry, down to three quarters of it: the sort runs
     /// once per quarter of new identities, not once per identity.
@@ -427,6 +728,27 @@ impl<H> PeerChainEvidence<H> {
     }
 }
 
+/// A refused body line of the verdicts' file, after its `body ` prefix:
+/// the body and its wall-clock expiry.
+fn parse_refused_body(line: &str) -> Option<(BlockBodyObjectId, u64)> {
+    let mut fields = line.split_whitespace();
+    let height = fields.next()?.parse::<u64>().ok()?;
+    let hash32 =
+        |field: Option<&str>| -> Option<[u8; 32]> { hex::decode(field?).ok()?.try_into().ok() };
+    let block_hash = hash32(fields.next())?;
+    let byte_digest = hash32(fields.next())?;
+    let encoded_len = fields.next()?.parse::<u32>().ok()?;
+    let expires = fields.next()?.parse::<u64>().ok()?;
+    Some((
+        BlockBodyObjectId {
+            claim: jetsam_p2p::object_protocol::BlockBodyClaimId { height, block_hash },
+            byte_digest,
+            encoded_len,
+        },
+        expires,
+    ))
+}
+
 /// The pinned block a snapshot boundary at `boundary_height` must descend
 /// from and that the manifest itself does not show: the highest pin strictly
 /// below the boundary. (A pin AT the boundary is compared with the manifest's
@@ -449,6 +771,24 @@ mod tests {
         header
     }
 
+    /// A header at `height` and the object id of `bytes` as its body.
+    fn body_of(height: u64, salt: u8, bytes: &[u8]) -> (BlockHeader, BlockBodyObjectId) {
+        let header = header_at(height, salt);
+        let claim = jetsam_p2p::object_protocol::BlockBodyClaimId {
+            height,
+            block_hash: jetsam_chain::block_id(&header),
+        };
+        (header, BlockBodyObjectId::from_bytes(claim, bytes).unwrap())
+    }
+
+    fn record(header: BlockHeader, body: Option<BlockBodyObjectId>) -> HeaderInventoryRecord {
+        HeaderInventoryRecord {
+            header,
+            body,
+            terminal: None,
+        }
+    }
+
     fn pins_for(headers: &[&BlockHeader]) -> Vec<(u64, [u8; 32])> {
         headers
             .iter()
@@ -461,6 +801,29 @@ mod tests {
     /// still there on every reconnection; before v1.5.1 it was wiped by each
     /// disconnect, and the peer's next (higher) manifest became the snapshot
     /// candidate.
+    /// T3.10b: the verdicts that hold, each with its divergence height (the
+    /// lowest refused), for the branch observer; an expired one is not listed.
+    #[test]
+    fn divergence_heights_are_the_verdicts_that_hold() {
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let mut peers = [PeerId::random(), PeerId::random()];
+        peers.sort_by_key(|peer| peer.to_bytes());
+        let [a, b] = peers;
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        evidence.mark_divergent(b, 7, now);
+        evidence.mark_divergent(a, 40, later);
+        evidence.mark_divergent(a, 38, later);
+        let mut held = evidence.divergence_heights(later);
+        held.sort_by_key(|(peer, _)| peer.to_bytes());
+        assert_eq!(held, [(a, 38), (b, 7)]);
+        assert_eq!(
+            evidence.divergence_heights(now + PEER_CHAIN_EVIDENCE_TTL),
+            [(a, 38)],
+            "b's verdict expired"
+        );
+    }
+
     #[test]
     fn a_refused_peer_stays_divergent_across_reconnections() {
         let mut evidence = PeerChainEvidence::<()>::default();
@@ -582,6 +945,108 @@ mod tests {
         assert_eq!(evidence.unserved_claim(&peer, now + PEER_CHAIN_EVIDENCE_TTL), None);
     }
 
+    /// Audit 2026-11-10, S-1: the record of an unserved plan was its
+    /// provider's identity, and a fresh identity offering the very same
+    /// boundary was a clean candidate. The boundary itself is remembered now.
+    #[test]
+    fn a_boundary_that_went_unserved_is_remembered_whatever_identity_offers_it() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        evidence.mark_unserved_boundary(50_000, [0xF0; 32], now);
+        let later = now + Duration::from_secs(60);
+        assert!(evidence.boundary_unserved(50_000, [0xF0; 32], later));
+        assert!(!evidence.boundary_unserved(50_000, [0xF1; 32], later), "another block");
+        assert!(!evidence.boundary_unserved(50_006, [0xF0; 32], later), "another height");
+        assert!(!evidence.boundary_unserved(50_000, [0xF0; 32], now + PEER_CHAIN_EVIDENCE_TTL));
+        for height in 0..(UNSERVED_BOUNDARY_CAPACITY as u64 * 2) {
+            evidence.mark_unserved_boundary(height, [0xF2; 32], later);
+        }
+        assert!(evidence.unserved_boundaries.len() <= UNSERVED_BOUNDARY_CAPACITY, "bounded");
+    }
+
+    /// S-1: what this node validated itself outlives the plan that staged
+    /// it — the highest points, for the TTL, the newest staging winning a
+    /// height.
+    #[test]
+    fn the_validated_points_kept_are_the_highest_and_expire() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let point = |height: u64, salt: u8| (height, [salt; 32], [height as u8; 32]);
+        evidence.learn_validated_points((1..=200).map(|height| point(height, 1)), now);
+        let top = 200 - VALIDATED_POINT_CAPACITY as u64 + 1;
+        assert_eq!(evidence.validated_point(200, now), Some(([1; 32], [200; 32])));
+        assert_eq!(evidence.validated_point(top, now), Some(([1; 32], [top as u8; 32])));
+        assert_eq!(evidence.validated_point(top - 1, now), None, "below the highest kept");
+        assert_eq!(evidence.validated_point(201, now), None);
+        assert_eq!(evidence.highest_validated_point(now), Some(200));
+        evidence.learn_validated_points([point(200, 2)], now);
+        assert_eq!(evidence.validated_point(200, now), Some(([2; 32], [200; 32])));
+        assert_eq!(evidence.validated_point(200, now + PEER_CHAIN_EVIDENCE_TTL), None);
+        assert_eq!(evidence.highest_validated_point(now + PEER_CHAIN_EVIDENCE_TTL), None);
+    }
+
+    /// S-1: the height where an unverified plan went unserved, within reach
+    /// of the tip, holds for its own TTL only.
+    #[test]
+    fn an_unserved_ceiling_holds_for_its_ttl() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        assert_eq!(evidence.unserved_ceiling(now), None);
+        evidence.mark_unserved_ceiling(46_100, now);
+        assert_eq!(evidence.unserved_ceiling(now + UNSERVED_CEILING_TTL / 2), Some(46_100));
+        assert_eq!(evidence.unserved_ceiling(now + UNSERVED_CEILING_TTL), None);
+        assert!(UNSERVED_CEILING_TTL <= PEER_CHAIN_EVIDENCE_TTL);
+    }
+
+    /// H-2 (audit 2026-11-10): the object quarantine (a provider whose exact
+    /// object bytes failed the transaction/state or terminal checks) lived in
+    /// the process only: a restarted node used that provider's inventory
+    /// again. Noted here, it is saved with the verdicts and comes back with
+    /// what is left of its TTL from the first time it was noted (noting again
+    /// never extends it); the previous release's reader of the file skips its
+    /// lines (they do not start with a peer id).
+    #[test]
+    fn h2_the_object_quarantine_outlives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peer-verdicts");
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let mut before = PeerChainEvidence::<()>::default();
+        let (bad, divergent) = (PeerId::random(), PeerId::random());
+        before.mark_divergent(divergent, 96, now);
+        assert!(before.take_changed());
+        before.note_object_quarantine([&bad], now);
+        assert!(before.take_changed(), "a new provider in quarantine is saved");
+        before.note_object_quarantine([&bad], now + Duration::from_secs(300));
+        assert!(!before.take_changed(), "noted again: nothing new");
+        before.save_verdicts(&path, now, wall).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let peer_lines = text
+            .lines()
+            .filter(|line| line.split_whitespace().next().is_some_and(|first| first.parse::<PeerId>().is_ok()))
+            .count();
+        assert_eq!((text.lines().count(), peer_lines), (2, 1), "{text}");
+
+        let restarted = Instant::now();
+        let ten_minutes = Duration::from_secs(600);
+        let mut after = PeerChainEvidence::<()>::default();
+        assert_eq!(after.load_verdicts(&path, restarted, wall + ten_minutes).unwrap(), 2);
+        assert_eq!(after.object_quarantined_peers(restarted), [bad].into_iter().collect());
+        assert!(after.is_divergent(&divergent, restarted));
+        let left = PEER_CHAIN_EVIDENCE_TTL - ten_minutes;
+        assert!(after.object_quarantined_peers(restarted + left - Duration::from_secs(2)).contains(&bad));
+        assert!(after.object_quarantined_peers(restarted + left + Duration::from_secs(1)).is_empty());
+        // saved again after the restart: what is left, never a fresh TTL
+        after.note_object_quarantine([&bad], restarted);
+        after.save_verdicts(&path, restarted, wall + ten_minutes).unwrap();
+        let mut again = PeerChainEvidence::<()>::default();
+        assert_eq!(again.load_verdicts(&path, restarted, wall + ten_minutes).unwrap(), 2);
+        assert!(again.object_quarantined_peers(restarted + left + Duration::from_secs(1)).is_empty());
+        // past the TTL it does not come back
+        let mut late = PeerChainEvidence::<()>::default();
+        late.load_verdicts(&path, restarted, wall + Duration::from_secs(7_200)).unwrap();
+        assert!(late.object_quarantined_peers(restarted).is_empty());
+    }
+
     /// The verdicts lived in memory only. A
     /// restarted node took the old branch's manifest for a candidate before
     /// refusing it again. They now come back from the data directory with
@@ -616,6 +1081,178 @@ mod tests {
         assert_eq!(late.load_verdicts(&path, restarted, wall + two_hours).unwrap(), 0);
         let mut fresh = PeerChainEvidence::<()>::default();
         assert_eq!(fresh.load_verdicts(&directory.path().join("absent"), now, wall).unwrap(), 0);
+    }
+
+    /// v1.7 gate 1 (private rehearsal, 2026-10-31): the body of the v1.6
+    /// branch's 96' was refused for its missing destination section. Those
+    /// exact bytes now name whoever advertises them; another body of the same
+    /// block (an honest one a relay may have stripped) or a header without
+    /// body proves nothing. The record is evidence, not a peer verdict, and it
+    /// is kept for the verdicts' TTL, renewed when the body is refused again.
+    #[test]
+    fn the_exact_bytes_of_a_refused_body_name_the_peers_that_advertise_them() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let (h96, refused) = body_of(96, 1, b"the v1.6 body of 96', no section");
+        let (_, honest) = body_of(96, 1, b"a body of the same block, with a section");
+        assert_eq!(honest.claim, refused.claim);
+        let (h97, child) = body_of(97, 2, b"97'");
+        let (h95, below) = body_of(95, 3, b"95");
+        let batch = [
+            record(h95, Some(below)),
+            record(h96, Some(refused)),
+            record(h97, Some(child)),
+        ];
+        assert_eq!(
+            evidence.refused_body_advertised(batch.iter(), now),
+            None,
+            "nothing refused yet"
+        );
+        assert!(!evidence.take_changed());
+
+        evidence.refuse_body(refused, now);
+        assert!(evidence.take_changed(), "written by the next heartbeat");
+        assert_eq!(
+            evidence.refused_body_advertised(batch.iter(), now),
+            Some(96)
+        );
+        assert_eq!(
+            evidence.refused_body_advertised([&record(h96, Some(honest)), &record(h96, None)], now),
+            None,
+            "other bytes of the same block, or none, prove nothing"
+        );
+        assert!(
+            evidence.divergent_peers(now).is_empty(),
+            "no peer verdict by itself"
+        );
+
+        let (h100, refused_100) = body_of(100, 4, b"100'");
+        evidence.refuse_body(refused_100, now);
+        let both = [record(h100, Some(refused_100)), record(h96, Some(refused))];
+        assert_eq!(
+            evidence.refused_body_advertised(both.iter(), now),
+            Some(96),
+            "the lowest"
+        );
+        assert_eq!(
+            evidence.refused_body_advertised(both[..1].iter(), now),
+            Some(100)
+        );
+
+        let ttl = PEER_CHAIN_EVIDENCE_TTL;
+        assert_eq!(
+            evidence.refused_body_advertised(batch.iter(), now + ttl - Duration::from_secs(1)),
+            Some(96)
+        );
+        assert_eq!(
+            evidence.refused_body_advertised(batch.iter(), now + ttl),
+            None,
+            "expired"
+        );
+        // Refused again half-way: renewed from then.
+        let half = now + ttl / 2;
+        evidence.refuse_body(refused, half);
+        assert_eq!(
+            evidence.refused_body_advertised(batch.iter(), now + ttl),
+            Some(96)
+        );
+        assert_eq!(
+            evidence.refused_body_advertised(batch.iter(), half + ttl),
+            None
+        );
+    }
+
+    #[test]
+    fn the_refused_bodies_are_bounded() {
+        let now = Instant::now();
+        let mut evidence = PeerChainEvidence::<()>::default();
+        let refused = |i: usize| body_of(96 + i as u64, 1, &i.to_le_bytes());
+        for i in 0..REFUSED_BODY_CAPACITY + 10 {
+            evidence.refuse_body(refused(i).1, now + Duration::from_millis(i as u64));
+        }
+        assert!(evidence.refused_bodies.len() <= REFUSED_BODY_CAPACITY);
+        let known = |i: usize| {
+            let (header, body) = refused(i);
+            evidence
+                .refused_body_advertised([&record(header, Some(body))], now)
+                .is_some()
+        };
+        // Past the bound, those closest to expiry go first: the oldest.
+        assert!(!known(0), "the oldest is evicted");
+        assert!(
+            known(REFUSED_BODY_CAPACITY),
+            "the one that crossed the bound is kept"
+        );
+        assert!(known(REFUSED_BODY_CAPACITY + 9), "the newest is kept");
+    }
+
+    /// The refused bodies come back after a restart with what is left of
+    /// their TTL, in the verdicts' file. The previous release's reader of
+    /// that file skips their lines (they do not start with a peer id), and
+    /// a file it wrote still loads.
+    #[test]
+    fn the_refused_bodies_outlive_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peer-verdicts");
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let mut before = PeerChainEvidence::<()>::default();
+        let (h96, refused) = body_of(96, 1, b"the v1.6 body of 96', no section");
+        let peer = PeerId::random();
+        before.mark_divergent(peer, 96, now);
+        before.refuse_body(refused, now);
+        before.save_verdicts(&path, now, wall).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let peer_lines = text
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|first| first.parse::<PeerId>().is_ok())
+            })
+            .count();
+        assert_eq!((text.lines().count(), peer_lines), (2, 1), "{text}");
+
+        let restarted = Instant::now();
+        let ten_minutes = Duration::from_secs(600);
+        let mut after = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            after
+                .load_verdicts(&path, restarted, wall + ten_minutes)
+                .unwrap(),
+            2
+        );
+        assert_eq!(after.divergence_height(&peer, restarted), Some(96));
+        let batch = [record(h96, Some(refused))];
+        assert_eq!(
+            after.refused_body_advertised(batch.iter(), restarted),
+            Some(96)
+        );
+        let left = PEER_CHAIN_EVIDENCE_TTL - ten_minutes;
+        assert_eq!(
+            after.refused_body_advertised(batch.iter(), restarted + left - Duration::from_secs(2)),
+            Some(96)
+        );
+        assert_eq!(
+            after.refused_body_advertised(batch.iter(), restarted + left + Duration::from_secs(1)),
+            None
+        );
+        let mut late = PeerChainEvidence::<()>::default();
+        assert_eq!(
+            late.load_verdicts(&path, restarted, wall + Duration::from_secs(7_200))
+                .unwrap(),
+            0
+        );
+
+        // The previous release's file: verdict lines only.
+        let previous = directory.path().join("previous");
+        let expires = (wall + ten_minutes)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(&previous, format!("{peer} 96 {expires}\n")).unwrap();
+        let mut old = PeerChainEvidence::<()>::default();
+        assert_eq!(old.load_verdicts(&previous, now, wall).unwrap(), 1);
+        assert!(old.is_divergent(&peer, now));
     }
 
     #[test]

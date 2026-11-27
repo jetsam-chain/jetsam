@@ -152,6 +152,9 @@ pub enum MinerEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MiningMempoolRefresh {
     TransactionAdmitted,
+    /// v1.7: a destination object (a release, a committee update) was
+    /// admitted; the template is rebuilt even when it carries transactions.
+    DestinationObjectAdmitted,
     ReceiverLagged(u64),
 }
 
@@ -159,27 +162,61 @@ enum MiningMempoolRefresh {
 /// template. Confirmations and evictions emitted while applying our own block
 /// belong to the previous height and must not cancel fresh PoW on the next
 /// height.
+#[cfg(test)]
 async fn next_mining_mempool_refresh(
     receiver: &mut broadcast::Receiver<MempoolEvent>,
 ) -> MiningMempoolRefresh {
+    next_mining_mempool_refresh_with(receiver, true, true).await
+}
+
+/// [`next_mining_mempool_refresh`] for a template that is coinbase-only or
+/// not: a plain admission refreshes only a coinbase-only template; the
+/// admission of a destination object refreshes any (SPEC retour §1.3: a
+/// release waits for one block less at the p90) while
+/// `destination_may_cancel` (NO-2: once per parent, [`destination_may_cancel`]).
+async fn next_mining_mempool_refresh_with(
+    receiver: &mut broadcast::Receiver<MempoolEvent>,
+    coinbase_only: bool,
+    destination_may_cancel: bool,
+) -> MiningMempoolRefresh {
     loop {
         match receiver.recv().await {
-            Ok(MempoolEvent::TxAdmitted { .. }) => {
+            Ok(MempoolEvent::TxAdmitted { .. }) if coinbase_only => {
                 return MiningMempoolRefresh::TransactionAdmitted;
             }
+            Ok(MempoolEvent::DestinationObjectAdmitted { .. }) if destination_may_cancel => {
+                return MiningMempoolRefresh::DestinationObjectAdmitted;
+            }
             Ok(
-                MempoolEvent::TxConfirmed { .. }
+                MempoolEvent::TxAdmitted { .. }
+                | MempoolEvent::DestinationObjectAdmitted { .. }
+                | MempoolEvent::TxConfirmed { .. }
                 | MempoolEvent::TxEvicted { .. }
-                | MempoolEvent::TxAuthorizationVerified { .. },
+                | MempoolEvent::TxAuthorizationVerified { .. }
+                | MempoolEvent::BridgeIntentAdmitted { .. },
             ) => {}
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            // With user pages, a missed destination admission is all the lag
+            // may hide: the same budget (NO-2).
+            Err(broadcast::error::RecvError::Lagged(skipped))
+                if coinbase_only || destination_may_cancel =>
+            {
                 return MiningMempoolRefresh::ReceiverLagged(skipped);
             }
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
             Err(broadcast::error::RecvError::Closed) => {
                 return std::future::pending().await;
             }
         }
     }
+}
+
+/// NO-2 (audit 13/11): whether a destination admission may still cancel the
+/// search on `parent`, the one it cancelled last being `spent_on`: once per
+/// parent. An intent renewed every few seconds otherwise cancelled every
+/// search (and every one prepared meanwhile) before a second of proof of
+/// work; what a later admission brings waits for the next template.
+fn destination_may_cancel(spent_on: Option<[u8; 32]>, parent: [u8; 32]) -> bool {
+    spent_on != Some(parent)
 }
 
 /// What a prepared, proof-valid attempt is still good for.
@@ -504,6 +541,8 @@ impl BlockMiner {
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
+        // NO-2: the parent a destination admission last cancelled the search on.
+        let mut destination_cancel_spent_on: Option<[u8; 32]> = None;
         // Measured once, from this node's own frozen bank: a class whose
         // terminal exceeds the consensus cap can never be published, and a
         // template built in it wastes the proof of work that found it.
@@ -1035,7 +1074,11 @@ impl BlockMiner {
                         tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
                     }
 
-                    refresh = next_mining_mempool_refresh(&mut mempool_events), if user_pages == 0 => {
+                    refresh = next_mining_mempool_refresh_with(
+                        &mut mempool_events,
+                        user_pages == 0,
+                        destination_may_cancel(destination_cancel_spent_on, expected_parent_hash),
+                    ) => {
                         // No blocking PoW task may escape this select branch. A
                         // new transaction must be included immediately. Lag is
                         // conservative because the missed range may contain an
@@ -1047,7 +1090,14 @@ impl BlockMiner {
                             MiningMempoolRefresh::TransactionAdmitted => {
                                 tracing::debug!("coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
                             }
+                            MiningMempoolRefresh::DestinationObjectAdmitted => {
+                                destination_cancel_spent_on = Some(expected_parent_hash);
+                                tracing::info!("destination object admitted: cancelling PoW to rebuild the template with it");
+                            }
                             MiningMempoolRefresh::ReceiverLagged(skipped) => {
+                                if user_pages > 0 {
+                                    destination_cancel_spent_on = Some(expected_parent_hash);
+                                }
                                 tracing::debug!(skipped, "coinbase-only template: mempool receiver lagged, rebuilding after PoW drain");
                             }
                         }
@@ -1237,6 +1287,121 @@ mod tests {
             .await
             .unwrap(),
             MiningMempoolRefresh::TransactionAdmitted,
+        );
+    }
+
+    /// NO-2 (audit 13/11): once a destination admission has cancelled the
+    /// search on a parent, the next ones on that parent do not: an intent
+    /// replayed or renewed every few seconds no longer leaves the miner
+    /// without a second of proof of work. What they bring waits for the next
+    /// template (a new tip, the heartbeat, or a plain admission while
+    /// coinbase-only); the lag of the receiver still refreshes.
+    #[tokio::test]
+    async fn a_destination_admission_cancels_the_search_once_per_parent() {
+        let (sender, mut receiver) = broadcast::channel(8);
+        for user_pages in [false, true] {
+            sender
+                .send(MempoolEvent::DestinationObjectAdmitted { release: Some(7) })
+                .unwrap();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    next_mining_mempool_refresh_with(&mut receiver, !user_pages, false),
+                )
+                .await
+                .is_err(),
+                "after the first, no destination admission cancels on this parent \
+                 (user pages: {user_pages})",
+            );
+        }
+        // A receiver that lagged may have missed a destination admission:
+        // with user pages, that is all it could have missed — the same
+        // budget, spent already.
+        for _ in 0..12 {
+            sender
+                .send(MempoolEvent::DestinationObjectAdmitted { release: Some(8) })
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                next_mining_mempool_refresh_with(&mut receiver, false, false),
+            )
+            .await
+            .is_err(),
+            "a flood that lags the receiver does not cancel either",
+        );
+        // A coinbase-only template still takes a plain transaction.
+        sender
+            .send(MempoolEvent::TxAdmitted {
+                hash: jetsam_poseidon2b::primitives::TxBodyHash([0x23; 32]),
+                fee: 1,
+                intent_bytes: Arc::from(Vec::<u8>::new().into_boxed_slice()),
+            })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                next_mining_mempool_refresh_with(&mut receiver, true, false),
+            )
+            .await
+            .unwrap(),
+            MiningMempoolRefresh::TransactionAdmitted,
+        );
+    }
+
+    /// The parent a destination admission may still cancel the search on:
+    /// any, until one did; then none but a new one.
+    #[test]
+    fn the_destination_cancel_is_spent_per_parent() {
+        let mut spent: Option<[u8; 32]> = None;
+        assert!(destination_may_cancel(spent, [1; 32]));
+        spent = Some([1; 32]);
+        assert!(!destination_may_cancel(spent, [1; 32]));
+        assert!(destination_may_cancel(spent, [2; 32]));
+    }
+
+    /// T2.5 (SPEC retour §1.3, §6.2): the admission of a destination object
+    /// wakes the miner even while its template already carries transactions
+    /// (a plain admission does not, then), and it is not mistaken for one.
+    #[tokio::test]
+    async fn miner_rebuilds_template_on_release_admission_with_user_pages() {
+        let (sender, mut receiver) = broadcast::channel(8);
+        sender
+            .send(MempoolEvent::TxAdmitted {
+                hash: jetsam_poseidon2b::primitives::TxBodyHash([0x22; 32]),
+                fee: 1,
+                intent_bytes: Arc::from(Vec::<u8>::new().into_boxed_slice()),
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                next_mining_mempool_refresh_with(&mut receiver, false, true),
+            )
+            .await
+            .is_err(),
+            "with user pages, a plain admission does not cancel the PoW",
+        );
+        sender
+            .send(MempoolEvent::DestinationObjectAdmitted { release: Some(7) })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                next_mining_mempool_refresh_with(&mut receiver, false, true),
+            )
+            .await
+            .unwrap(),
+            MiningMempoolRefresh::DestinationObjectAdmitted,
+        );
+        // Coinbase-only: both wake it, each for what it is.
+        sender
+            .send(MempoolEvent::DestinationObjectAdmitted { release: None })
+            .unwrap();
+        assert_eq!(
+            next_mining_mempool_refresh_with(&mut receiver, true, true).await,
+            MiningMempoolRefresh::DestinationObjectAdmitted,
         );
     }
 
