@@ -220,25 +220,25 @@ fn every_deposit_is_refused_while_the_v1_7_height_is_none() {
             Err(DepositRefusal::NotArmed)
         );
     }
-    // Armed today: the private rehearsal build, and the test chain at 8 160
-    // (D78), where the armed rules decide (`a_deposit_waits_for_the_block_after_f`).
-    // The public network is not armed.
+    // Armed today: the private rehearsal build, the test chain at 8 160 (D78)
+    // and the public network at 61 440 (26/11/2026), where the armed rules
+    // decide (`a_deposit_waits_for_the_block_after_f`).
     if !jetsam_vault_rule::REHEARSAL_CLOCK {
         let expected = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
             Some(8_160)
         } else {
-            None
+            Some(61_440)
         };
         assert_eq!(
             jetsam_chain::consensus::params::V1_7_ACTIVATION_HEIGHT,
             expected,
             "a public profile's v1.7 height moved: the refusal above no longer covers it as it did"
         );
-        // ... and its bridge opening: F = 8 704 on the test chain (J + 544, D104), none on the public network.
+        // ... and its bridge opening: F = 8 704 on the test chain (J + 544, D104), 62 880 on the public network (J + 1 440).
         let expected_f = if jetsam_chain::consensus::identity::IS_TEST_CHAIN {
             Some(8_704)
         } else {
-            None
+            Some(62_880)
         };
         assert_eq!(
             current.deposits_from_height, expected_f,
